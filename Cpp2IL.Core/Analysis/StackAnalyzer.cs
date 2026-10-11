@@ -48,6 +48,7 @@ public class StackAnalyzer
         analyzer.CorrectOffsets(graph);
         NativeHelperRecovery.RunEarly(method, graph);
         InlinedIsInstRecovery.Run(method, graph);
+        InlinedInterfaceLookupRemoval.Run(method, graph);
         InlineMemcpyRecovery.Run(method, graph);
         VectorLaneRecovery.Run(method, graph);
         StackStructRecovery.Run(method, graph);
