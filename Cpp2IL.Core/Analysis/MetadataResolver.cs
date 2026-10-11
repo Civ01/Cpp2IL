@@ -213,9 +213,12 @@ public static class MetadataResolver
 
                 if (genericOwner != null && staticOwner == null)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
+                    // metadata has all-0 offsets for generic definitions, so recompute layout. That's only the shared
+                    // reference type layout if no field holds a type argument by value (List<T> keeps its Ts in a
+                    // T[], so List<int> is laid out the same as List<object>).
+                    // TODO support fields of value type argument type
+                    if (genericOwner.GenericArguments.Any(a => a.IsValueType)
+                        && genericOwner.GenericType.Fields.Any(f => !f.IsStatic && f.FieldType is GenericParameterTypeAnalysisContext or GenericInstanceTypeAnalysisContext { IsValueType: true }))
                         continue;
 
                     field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
@@ -700,6 +703,25 @@ public static class MetadataResolver
         {
             if (!instruction.IsCall)
                 continue;
+
+            if (instruction.Operands[0] is MethodAnalysisContext alreadyResolved)
+            {
+                // Shared generic code (List<object>.Add standing in for List<Foo>.Add) is told which instantiation
+                // it's running as by the MethodInfo it's passed, so use that to get the real types
+                if (GetMethodInfoArgument(instruction) is { RepresentedMethod: { } concrete }
+                    && !ReferenceEquals(concrete, alreadyResolved)
+                    && concrete is ConcreteGenericMethodAnalysisContext
+                    && ReferenceEquals(BaseMethodOf(concrete), BaseMethodOf(alreadyResolved))
+                    && concrete.Parameters.Count == alreadyResolved.Parameters.Count
+                    && concrete.IsStatic == alreadyResolved.IsStatic
+                    && concrete.ToString() != alreadyResolved.ToString())
+                {
+                    instruction.SetOperand(0, concrete);
+                    changed = true;
+                }
+
+                continue;
+            }
 
             if (instruction.Operands[0] is not Immediate target)
                 //Already resolved
