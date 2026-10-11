@@ -27,10 +27,18 @@ public static class DelegateInvokeRecovery
             if (memory.Addend != invokeImplOffset || memory.Index != null || memory.Scale != 0)
                 continue;
 
-            if (memory.Base is not LocalVariable delegateLocal || delegateLocal.Type is not { IsDelegate: true } delegateType)
+            if (memory.Base is not LocalVariable delegateLocal
+                || delegateLocal.Type is not ({ IsDelegate: true } or GenericInstanceTypeAnalysisContext { GenericType.IsDelegate: true }) 
+                || delegateLocal.Type is not { } delegateType)
                 continue;
 
-            if (delegateType.Methods.FirstOrDefault(m => m.Name == "Invoke") is not { } invoke)
+            var invoke = delegateType is GenericInstanceTypeAnalysisContext genericDelegate
+                ? genericDelegate.GenericType.Methods.FirstOrDefault(m => m.Name == "Invoke") is { } openInvoke
+                    ? new ConcreteGenericMethodAnalysisContext(openInvoke, genericDelegate.GenericArguments, [])
+                    : null
+                : delegateType.Methods.FirstOrDefault(m => m.Name == "Invoke");
+
+            if (invoke == null)
                 continue;
 
             RewriteAsInvoke(instruction, delegateLocal, invoke);

@@ -222,6 +222,10 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         {
             var call = Add(source.IP, ISIL.OpCode.IndirectCall, ConvertOperand(source, 0), new ISIL.Register(null, "rax") /* return value */);
             call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, source.IP));
+
+            // We don't know yet whether the callee returns in rax or xmm0. Whichever it turns out to be, the call's
+            // result is what's read afterwards, so let xmm0 carry it too (if it's an integer return, nothing reads xmm0).
+            Add(source.IP, ISIL.OpCode.Move, new ISIL.Register(null, "xmm0"), new ISIL.Register(null, "rax"));
         }
         
         // Preserve all the argument registers as we don't know which ones are used
@@ -750,6 +754,10 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
                     var call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), new ISIL.Register(null, "rax") /* return value */);
                     call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
+
+                    // as for indirect calls, the result may really be in xmm0
+                    if (!callNoReturn && context != null)
+                        Add(instruction.IP, ISIL.OpCode.Move, new ISIL.Register(null, "xmm0"), new ISIL.Register(null, "rax"));
                 }
 
                 if (callNoReturn)
@@ -1007,8 +1015,20 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 }
                 if (instruction.Op0Kind == OpKind.Register) // ex: jmp rax
                 {
-                    AddIndirectJmp(instruction);
-                    break;
+                    // A switch's jump table dispatch (jmp to an address read out of a table indexed by the case) stays a jump
+                    var isJumpTable = instructions.Skip(Math.Max(0, instructions.Count - 8))
+                        .Any(i => i.Operands.Any(o => o is ISIL.MemoryOperand { Index: not null, Scale: 4 }));
+
+                    if (isJumpTable || context == null)
+                    {
+                        AddIndirectJmp(instruction);
+                        break;
+                    }
+
+                    // Otherwise it's a tail call (typically a delegate's invoke or a virtual method), so make it a call
+                    // and return what it returns, which the call resolution passes understand
+                    AddIndirectCall(instruction);
+                    goto case Mnemonic.Ret;
                 }
 
                 goto default;
