@@ -12,6 +12,12 @@ public class LocalVariable(string name, Register register, TypeAnalysisContext? 
     /// </summary>
     public TypeAnalysisContext? Type = type;
 
+    /// <summary>
+    /// How many times type inference replaced an already known type (refinement from a definition). Bounded so
+    /// inference always terminates.
+    /// </summary>
+    internal int TypeReplacements;
+
     public bool IsThis = false;
     public bool IsReturn = false;
     public bool IsMethodInfo = false;

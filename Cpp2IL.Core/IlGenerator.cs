@@ -96,6 +96,9 @@ public static class IlGenerator
             if (operand is AddressOf { Target: LocalVariable addressed })
                 local = addressed;
 
+            if (operand is AddressOf { Target: FieldReference addressedField })
+                local = addressedField.Local;
+
             if (local != null && !context.Locals.Contains(local))
                 context.Locals.Add(local);
         }
@@ -425,6 +428,12 @@ public static class IlGenerator
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
                         // A value type's instance method takes 'this' as a managed pointer
+                        if (targetMethod.DeclaringType is { IsValueType: true } && instruction.Operands[thisParamIndex] is AddressOf { Target: FieldReference receiverField })
+                        {
+                            LoadFieldAddress(receiverField, method, locals);
+                            goto receiverLoaded;
+                        }
+
                         var receiverLocal = instruction.Operands[thisParamIndex] switch
                         {
                             AddressOf { Target: LocalVariable addressedReceiver } => addressedReceiver,
@@ -436,6 +445,8 @@ public static class IlGenerator
                             LoadLocalAddress(receiverLocal, method, locals);
                         else
                             LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
+
+                        receiverLoaded: ;
                     }
                     else
                     {
@@ -704,6 +715,14 @@ public static class IlGenerator
                 break;
             case AddressOf { Target: LocalVariable addressed }:
                 LoadLocalAddress(addressed, method, locals);
+                break;
+            // Likewise the address of a struct field, passed by value
+            case AddressOf { Target: FieldReference addressedFieldValue } when expectedType is { IsValueType: true } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+                                                                               && addressedFieldValue.Field.FieldType.FullName == expectedType.FullName:
+                LoadOperand(addressedFieldValue, method, locals, writeLine);
+                break;
+            case AddressOf { Target: FieldReference addressedField }:
+                LoadFieldAddress(addressedField, method, locals);
                 break;
             case DefaultValue defaultValue:
             {
@@ -997,6 +1016,28 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Starg, parameter);
         else
             instructions.Add(CilOpCodes.Stloc, locals[local]);
+    }
+
+    // The address of a (possibly nested) field: ldflda/ldsflda down the chain
+    private static void LoadFieldAddress(FieldReference field, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var chain = field.Chain.ToList();
+
+        if (chain[0].IsStatic)
+            instructions.Add(CilOpCodes.Ldsflda, chain[0].ToFieldDescriptor());
+        else
+        {
+            if (field.Local.Type is { IsValueType: true } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
+                LoadLocalAddress(field.Local, method, locals);
+            else
+                LoadLocal(field.Local, method, locals);
+
+            instructions.Add(CilOpCodes.Ldflda, chain[0].ToFieldDescriptor());
+        }
+
+        for (var i = 1; i < chain.Count; i++)
+            instructions.Add(CilOpCodes.Ldflda, chain[i].ToFieldDescriptor());
     }
 
     private static void LoadLocalAddress(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)

@@ -528,7 +528,7 @@ public static class MetadataResolver
         return changed;
     }
 
-    private static bool IsInHierarchy(TypeAnalysisContext type, TypeAnalysisContext? candidateOwner)
+    internal static bool IsInHierarchy(TypeAnalysisContext type, TypeAnalysisContext? candidateOwner)
     {
         if (candidateOwner == null)
             return false;

@@ -411,6 +411,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DebugPassCallback?.Invoke(this, "MetadataResolver.ResolveAll");
 
         WideLoadSplitter.Run(this);
+        VectorConstantRecovery.Run(this);
 
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
@@ -495,6 +496,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DebugPassCallback?.Invoke(this, "LocalVariables.TypeAddressedLocals");
 
         ConstantBranchFolder.Run(this);
+
+        // Late, as few passes know about addresses of fields
+        LocalVariables.ResolveFieldAddresses(this);
         DebugPassCallback?.Invoke(this, "ConstantBranchFolder.Run");
 
         // Near-last, as it depends on the final block layout

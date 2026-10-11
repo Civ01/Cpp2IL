@@ -97,6 +97,9 @@ public static class DeadCodeEliminator
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;
+                case AddressOf { Target: FieldReference { RootField.IsStatic: false, Local: { } addressedFieldOwner } }:
+                    yield return addressedFieldOwner;
+                    break;
                 case AddressOf { Target: ArrayAccess addressedElement }:
                     foreach (var used in ArrayAccessLocals(addressedElement))
                         yield return used;

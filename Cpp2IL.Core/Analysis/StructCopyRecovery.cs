@@ -78,6 +78,175 @@ public static class StructCopyRecovery
             foreach (var group in groups)
                 TryCombine(method, block, group.OrderBy(c => c.Destination.Offset).ToList(), pointerSize);
         }
+
+        ExpandConstantChunks(method, definitions, pointerSize);
+    }
+
+    /// <summary>
+    /// A chunk store of a constant (zero, or a vector out of .rdata) that isn't a whole struct still sets each field
+    /// it covers to a known value, e.g. the 16 byte store that initialises a Rect field to (0, 0, 1, 1). Expand those
+    /// into one store per field.
+    /// </summary>
+    private static void ExpandConstantChunks(MethodAnalysisContext method, Dictionary<LocalVariable, Instruction> definitions, int pointerSize)
+    {
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var store = block.Instructions[i];
+                if (store is not { OpCode: OpCode.Move, Operands: [var target, var value] })
+                    continue;
+
+                // What's being written: a sized chunk of something, or a whole struct-typed field
+                LocalVariable baseLocal;
+                TypeAnalysisContext owner;
+                bool isStatic;
+                long rangeStart, leafBase;
+                int rangeSize;
+                List<FieldAnalysisContext> prefix;
+
+                switch (target)
+                {
+                    case MemoryOperand { Index: null, Scale: 0, Base: LocalVariable { Type: { } baseType } chunkBase, Size: > 4 } chunk:
+                    {
+                        var pointee = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element : baseType;
+                        baseLocal = chunkBase;
+                        isStatic = pointee is StaticFieldStorageTypeAnalysisContext;
+                        owner = (pointee as StaticFieldStorageTypeAnalysisContext)?.OwnerType ?? pointee;
+                        rangeStart = chunk.Addend;
+                        rangeSize = chunk.Size;
+                        leafBase = 0;
+                        prefix = [];
+                        break;
+                    }
+                    case FieldReference { Field.FieldType: var fieldType } wholeField when StackStructRecovery.IsStruct(fieldType)
+                                                                                         && TypeSizes.StorageSize(fieldType, pointerSize) is > 4 and < 0x1000 and var fieldSize:
+                        baseLocal = wholeField.Local;
+                        owner = fieldType;
+                        isStatic = false;
+                        rangeStart = 0;
+                        rangeSize = (int)fieldSize;
+                        leafBase = wholeField.Offset;
+                        prefix = wholeField.Chain.ToList();
+                        break;
+                    default:
+                        continue;
+                }
+
+                byte[]? bytes;
+                if (IsZero(value, definitions))
+                    bytes = new byte[rangeSize];
+                else if (value is LocalVariable temporary && definitions.TryGetValue(temporary, out var load)
+                         && load is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null } constant] } && constant.Size == rangeSize)
+                    bytes = ReadConstant(method.AppContext, (ulong)constant.Addend, rangeSize);
+                else
+                    continue;
+
+                if (bytes == null)
+                    continue;
+
+                if (owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count > 0 || owner is RuntimeClassTypeAnalysisContext)
+                    continue;
+
+                var leaves = new List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>();
+                CollectLeaves(owner, isStatic, 0, [], leaves, pointerSize, prefix.Count > 0 ? 1 : 0);
+
+                var covered = leaves.Where(l => l.Offset >= rangeStart && l.Offset + l.Size <= rangeStart + rangeSize).ToList();
+                if (covered.Count == 0)
+                    continue;
+
+                // The covered fields must account for every non-zero byte, and none may stick out of the chunk
+                if (leaves.Any(l => l.Offset < rangeStart + rangeSize && l.Offset + l.Size > rangeStart && !covered.Contains(l)))
+                    continue;
+
+                var accounted = new bool[rangeSize];
+                foreach (var leaf in covered)
+                    for (var b = 0; b < leaf.Size; b++)
+                        accounted[leaf.Offset - rangeStart + b] = true;
+
+                if (Enumerable.Range(0, rangeSize).Any(b => !accounted[b] && bytes[b] != 0))
+                    continue;
+
+                var replacements = new List<Instruction>();
+                foreach (var leaf in covered.OrderBy(l => l.Offset))
+                {
+                    var literal = Literal(leaf.Chain[^1].FieldType, bytes, (int)(leaf.Offset - rangeStart), (int)leaf.Size);
+                    if (literal == null)
+                    {
+                        replacements = null;
+                        break;
+                    }
+
+                    var chain = prefix.Concat(leaf.Chain).ToList();
+                    var reference = new FieldReference(chain[^1], baseLocal, (int)(leafBase + leaf.Offset)) { Path = chain.GetRange(0, chain.Count - 1) };
+                    replacements.Add(new Instruction(store.Index, OpCode.Move, reference, literal));
+                }
+
+                if (replacements == null)
+                    continue;
+
+                block.Instructions.RemoveAt(i);
+                block.Instructions.InsertRange(i, replacements);
+                i += replacements.Count - 1;
+            }
+        }
+    }
+
+    // Every primitive (non-struct) field of a type, with its offset, looking inside struct fields
+    private static void CollectLeaves(TypeAnalysisContext type, bool isStatic, long baseOffset, List<FieldAnalysisContext> path,
+        List<(List<FieldAnalysisContext> Chain, long Offset, long Size)> leaves, int pointerSize, int depth)
+    {
+        if (depth > 6)
+            return;
+
+        for (var current = type; current != null; current = isStatic || depth > 0 ? null : current.BaseType)
+        {
+            foreach (var field in current.Fields)
+            {
+                if (field.IsStatic != isStatic || (field.Attributes & System.Reflection.FieldAttributes.Literal) != 0 || field.BackingData?.FieldOffset is not { } offset)
+                    continue;
+
+                var chain = new List<FieldAnalysisContext>(path) { field };
+
+                if (StackStructRecovery.IsStruct(field.FieldType))
+                    CollectLeaves(field.FieldType, false, baseOffset + offset, chain, leaves, pointerSize, depth + 1);
+                else if (TypeSizes.StorageSize(field.FieldType, pointerSize) is > 0 and var size)
+                    leaves.Add((chain, baseOffset + offset, size));
+            }
+        }
+    }
+
+    private static IOperand? Literal(TypeAnalysisContext type, byte[] bytes, int offset, int size)
+    {
+        var target = type.IsEnumType ? type.Fields.FirstOrDefault(f => !f.IsStatic)?.FieldType ?? type : type;
+
+        return target.FullName switch
+        {
+            "System.Single" when size == 4 => new FloatLiteral(System.BitConverter.ToSingle(bytes, offset)),
+            "System.Double" when size == 8 => new DoubleLiteral(System.BitConverter.ToDouble(bytes, offset)),
+            "System.Boolean" or "System.Byte" when size == 1 => new Immediate(bytes[offset]),
+            "System.SByte" when size == 1 => new Immediate((sbyte)bytes[offset]),
+            "System.Int16" when size == 2 => new Immediate(System.BitConverter.ToInt16(bytes, offset)),
+            "System.UInt16" or "System.Char" when size == 2 => new Immediate(System.BitConverter.ToUInt16(bytes, offset)),
+            "System.Int32" when size == 4 => new Immediate(System.BitConverter.ToInt32(bytes, offset)),
+            "System.UInt32" when size == 4 => new Immediate(System.BitConverter.ToUInt32(bytes, offset)),
+            "System.Int64" or "System.UInt64" when size == 8 => new Immediate(System.BitConverter.ToInt64(bytes, offset)),
+            // a reference (or pointer) can only be set to null like this
+            _ when !target.IsValueType && bytes.Skip(offset).Take(size).All(b => b == 0) => new Immediate(0),
+            _ => null
+        };
+    }
+
+    private static byte[]? ReadConstant(ApplicationAnalysisContext app, ulong address, int size)
+    {
+        if (!app.Binary.TryMapVirtualAddressToRaw(address, out var raw))
+            return null;
+
+        var content = app.Binary.GetRawBinaryContent();
+        if (raw < 0 || raw + size > content.Length)
+            return null;
+
+        return content.Slice((int)raw, size).ToArray();
     }
 
     private static void TryCombine(MethodAnalysisContext method, Block block, List<Chunk> group, int pointerSize)
