@@ -251,7 +251,66 @@ public static class LocalVariables
         // Calls to folded duplicate bodies that nothing could tell apart get a best guess, which in turn types more
         if (MetadataResolver.GuessAmbiguousCalls(method))
             RunTypeAndFieldFixpoint(method);
+
+        // Whatever's still untyped gets the integer type its definition suggests, rather than object, and that can
+        // in turn type what it flows into
+        if (DefaultUntypedLocals(method))
+            RunTypeAndFieldFixpoint(method);
     }
+
+    private static bool DefaultUntypedLocals(MethodAnalysisContext method)
+    {
+        var types = method.AppContext.SystemTypes;
+        var changed = false;
+
+        // Anything used as a pointer is better left alone than called an integer
+        var pointers = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is MemoryOperand { Base: LocalVariable pointer })
+                    pointers.Add(pointer);
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.Destination is not LocalVariable { Type: null } local || pointers.Contains(local))
+                continue;
+
+            if (local.Register.Name is "CF" or "OF" or "SF" or "ZF" or "PF")
+            {
+                local.Type = types.SystemBooleanType;
+                changed = true;
+                continue;
+            }
+
+            TypeAnalysisContext? guess = instruction switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, Immediate { Value: >= int.MinValue and <= int.MaxValue }] } => types.SystemInt32Type,
+                { OpCode: OpCode.Move, Operands: [_, Immediate] } => types.SystemInt64Type,
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Size: var size }] } => SizedInteger(size, method),
+                { OpCode: OpCode.Move, Operands: [_, StackOffset { Size: var size }] } => SizedInteger(size, method),
+                { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+                    or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.Not or OpCode.Negate } => types.SystemInt64Type,
+                _ => null
+            };
+
+            if (guess == null)
+                continue;
+
+            local.Type = guess;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static TypeAnalysisContext? SizedInteger(int size, MethodAnalysisContext method) => size switch
+    {
+        1 => method.AppContext.SystemTypes.SystemByteType,
+        2 => method.AppContext.SystemTypes.SystemInt16Type,
+        4 => method.AppContext.SystemTypes.SystemInt32Type,
+        8 => method.AppContext.SystemTypes.SystemInt64Type,
+        _ => null
+    };
 
     private static void RunTypeAndFieldFixpoint(MethodAnalysisContext method)
     {
