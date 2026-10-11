@@ -181,11 +181,16 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         var dataReferences = new List<ulong>();
         var callTargets = new List<ulong>();
 
+        var bodyEnd = body.Count > 0 ? body[^1].NextIP : address;
+
         foreach (var insn in body)
         {
             if (insn.Mnemonic == Mnemonic.Lea && insn.IsIPRelativeMemoryOperand)
                 dataReferences.Add(insn.IPRelativeMemoryAddress);
             else if (insn.Mnemonic == Mnemonic.Call && insn.Op0Kind == OpKind.NearBranch64)
+                callTargets.Add(insn.NearBranchTarget);
+            // a tail call (or a thunk's only instruction) leaves the function
+            else if (insn.Mnemonic == Mnemonic.Jmp && insn.Op0Kind == OpKind.NearBranch64 && (insn.NearBranchTarget < address || insn.NearBranchTarget >= bodyEnd))
                 callTargets.Add(insn.NearBranchTarget);
         }
 

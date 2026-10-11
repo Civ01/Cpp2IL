@@ -179,7 +179,7 @@ public static class InterfaceDispatchRecovery
         return null;
     }
 
-    private static MethodAnalysisContext? ResolveInterfaceSlot(TypeAnalysisContext declaringInterface, int slot)
+    internal static MethodAnalysisContext? ResolveInterfaceSlot(TypeAnalysisContext declaringInterface, int slot)
     {
         if (declaringInterface is GenericInstanceTypeAnalysisContext genericInstance)
         {

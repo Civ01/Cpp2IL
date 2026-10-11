@@ -27,6 +27,12 @@ public enum NativeHelperKind
 
     /// <summary>Raises an InvalidCastException for casting the object to klass. The failure path of castclass.</summary>
     RaiseInvalidCast,
+
+    /// <summary>
+    /// An interface method invoker: (slot, declaringInterface, obj, args...) - looks the method up in obj's class and
+    /// tail-calls it with (obj, args..., methodInfo).
+    /// </summary>
+    InterfaceInvoker,
 }
 
 /// <summary>
@@ -86,6 +92,12 @@ public static class NativeHelpers
         // A thunk to vm::Object::IsInst, which null-checks the object then reads its klass
         if (first.Mnemonic == Mnemonic.Jmp && first.Op0Kind is OpKind.NearBranch64 && LooksLikeIsInst(app, first.NearBranchTarget))
             return NativeHelperKind.IsInst;
+
+        // Interface invokers scan klass->interfaceOffsets (count at 0x12E) and finish with a register tail-jump
+        if (body.Take(16).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Memory, MemoryDisplacement64: 0x12E, MemorySize: MemorySize.UInt16 })
+            && body.Take(8).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })
+            && body.Any(i => i is { Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.Register }))
+            return NativeHelperKind.InterfaceInvoker;
 
         // RaiseInvalidCastException(obj, klass): reads the object's klass for the message, then raises
         if (body.Take(4).Any(i => i is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RDX, Op1Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryDisplacement64: 0 })

@@ -19,6 +19,58 @@ public static class MetadataResolver
         ResolveCalls(method);
         ResolveGetter(method);
         ResolveMetadataUsages(method);
+        ResolveInterfaceInvokers(method);
+    }
+
+    /// <summary>
+    /// Calls to an out-of-line interface invoker, (slot, declaringInterface, obj, args...), become calls to the
+    /// interface method itself.
+    /// </summary>
+    private static void ResolveInterfaceInvokers(MethodAnalysisContext method)
+    {
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable defined)
+                definitions[defined] = instruction;
+
+        IOperand? Chase(IOperand operand)
+        {
+            for (var depth = 0; depth < 8 && operand is LocalVariable local && definitions.TryGetValue(local, out var definition) && definition.OpCode == OpCode.Move; depth++)
+                operand = definition.Operands[1];
+
+            return operand;
+        }
+
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            // Unmanaged calls carry [target, rax, rcx, rdx, r8, r9, xmm0, xmm1, xmm2, xmm3]
+            if (instruction.OpCode != OpCode.Call || instruction.Operands.Count < 10 || instruction.Operands[0] is not Immediate target)
+                continue;
+
+            if (NativeHelpers.Classify(method.AppContext, target.UnsignedValue) != NativeHelperKind.InterfaceInvoker)
+                continue;
+
+            if (Chase(instruction.Operands[2]) is not Immediate { Value: >= 0 and <= ushort.MaxValue } slot)
+                continue;
+
+            var declaringInterface = Chase(instruction.Operands[3]) switch
+            {
+                RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+                TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => type,
+                _ => null
+            };
+
+            if (declaringInterface == null || InterfaceDispatchRecovery.ResolveInterfaceSlot(declaringInterface, (int)slot.Value) is not { } resolved)
+                continue;
+
+            var operands = new List<IOperand> { resolved, instruction.Operands[1], instruction.Operands[4] };
+
+            // The invoker takes (slot, interface, obj, p1, ...): the first parameter is the fourth argument slot
+            if (resolved.Parameters.Count > 0)
+                operands.Add(BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[0].ParameterType) ? instruction.Operands[9] : instruction.Operands[5]);
+
+            instruction.SetOperands(operands);
+        }
     }
 
     private static void ResolveStringLiteralAccessors(MethodAnalysisContext method)
