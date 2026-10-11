@@ -72,6 +72,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public static int MaxMethodSizeBytes = 30000; // 30KB
 
+    /// <summary>
+    /// Debugging aid: if set, invoked after each analysis pass with the name of the pass that just ran.
+    /// </summary>
+    public static Action<MethodAnalysisContext, string>? DebugPassCallback;
+
     public List<ParameterAnalysisContext> Parameters = [];
 
     public List<LocalVariable> ParameterLocals = [];
@@ -367,11 +372,13 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         if (ConvertedIsil.Count == 0)
             return; //Nothing to do, empty function
 
+        DebugPassCallback?.Invoke(this, "Isil");
         ControlFlowGraph = new ISILControlFlowGraph(ConvertedIsil);
 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
         StackAnalyzer.Analyze(this);
+        DebugPassCallback?.Invoke(this, "StackAnalyzer.Analyze");
 
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
         // blocks and would otherwise leave the dominator tree out of sync with the graph SSA sees.
@@ -379,85 +386,116 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Create locals
         SsaForm.Build(this);
+        DebugPassCallback?.Invoke(this, "SsaForm.Build");
         LocalVariables.CreateAll(this);
+        DebugPassCallback?.Invoke(this, "LocalVariables.CreateAll");
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
         // then eliminate the now-dead flag computations. Both run in SSA form, where each
         // flag/temporary has a single, version-stable definition.
         FlagConditionRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "FlagConditionRecovery.Run");
         DeadCodeEliminator.Run(this);
+        DebugPassCallback?.Invoke(this, "DeadCodeEliminator.Run");
 
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
         MetadataResolver.ResolveAll(this);
+        DebugPassCallback?.Invoke(this, "MetadataResolver.ResolveAll");
 
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "KeyFunctionRecovery.Run");
         DeadCodeEliminator.Run(this);
+        DebugPassCallback?.Invoke(this, "DeadCodeEliminator.Run");
 
         // Delete any il2cpp_codegen_initialize_runtime_metadata/il2cpp_codegen_initialize_method
         MetadataInitGuardRemover.Run(this);
+        DebugPassCallback?.Invoke(this, "MetadataInitGuardRemover.Run");
 
         // Delete inlined GC write barriers
         WriteBarrierRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "WriteBarrierRecovery.Run");
 
         InjectedCheckRemover.Run(this);
+        DebugPassCallback?.Invoke(this, "InjectedCheckRemover.Run");
 
         InterfaceDispatchRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "InterfaceDispatchRecovery.Run");
 
         LocalVariables.ResolveTypesAndFields(this);
+        DebugPassCallback?.Invoke(this, "LocalVariables.ResolveTypesAndFields");
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);
+        DebugPassCallback?.Invoke(this, "MetadataInitGuardRemover.RunRgctx");
 
         MetadataInitGuardRemover.RewriteUnguardedInits(this);
+        DebugPassCallback?.Invoke(this, "MetadataInitGuardRemover.RewriteUnguardedInits");
 
         // Needs type resolved for delegate locals
         DelegateInvokeRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "DelegateInvokeRecovery.Run");
         BooleanFlagSimplifier.Run(this);
+        DebugPassCallback?.Invoke(this, "BooleanFlagSimplifier.Run");
         DeadCodeEliminator.Run(this);
+        DebugPassCallback?.Invoke(this, "DeadCodeEliminator.Run");
 
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);
+        DebugPassCallback?.Invoke(this, "SsaSimplifier.Run");
 
         // Folding a constant exposes more to propagate
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
             SsaSimplifier.Run(this);
 
         InternalCallGuardRemover.Run(this);
+        DebugPassCallback?.Invoke(this, "InternalCallGuardRemover.Run");
         KeyFunctionRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "KeyFunctionRecovery.Run");
 
         SsaForm.Remove(this);
+        DebugPassCallback?.Invoke(this, "SsaForm.Remove");
 
         // Phi removal leaves a copy per merged version, most of which can share one local
         CopyCoalescer.Run(this);
+        DebugPassCallback?.Invoke(this, "CopyCoalescer.Run");
 
         // Now out of SSA: clean up the per-edge copies that phi removal introduced (a local can have
         // several definitions merging at a join here, so this pass propagates conservatively), then
         // drop dead locals.
         Simplifier.Simplify(this);
+        DebugPassCallback?.Invoke(this, "Simplifier.Simplify");
 
         // Fix float literals
         FloatLiteralRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "FloatLiteralRecovery.Run");
 
         // Runs late so the array type and length reach the allocation call as operands after copy propagation has inlined them
         ArrayRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "ArrayRecovery.Run");
 
         LocalVariables.TypeAddressedLocals(this);
+        DebugPassCallback?.Invoke(this, "LocalVariables.TypeAddressedLocals");
 
         ConstantBranchFolder.Run(this);
+        DebugPassCallback?.Invoke(this, "ConstantBranchFolder.Run");
 
         // Near-last, as it depends on the final block layout
         EqualityBranchInverter.Run(this);
+        DebugPassCallback?.Invoke(this, "EqualityBranchInverter.Run");
 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
+        DebugPassCallback?.Invoke(this, "CallArgumentTrimmer.Run");
         DeadCodeEliminator.Run(this);
+        DebugPassCallback?.Invoke(this, "DeadCodeEliminator.Run");
 
         LocalVariables.RemoveUnused(this);
+        DebugPassCallback?.Invoke(this, "LocalVariables.RemoveUnused");
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
