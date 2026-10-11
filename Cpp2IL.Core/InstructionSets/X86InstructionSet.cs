@@ -98,6 +98,11 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         return instructions;
     }
 
+    // The calling convention gives stack arguments relative to rsp on entry to the callee, which is one return address
+    // further on than at the call site
+    private static IEnumerable<ISIL.IOperand> AtCallSite(IEnumerable<ISIL.IOperand> arguments)
+        => arguments.Select(a => a is ISIL.StackOffset slot ? new ISIL.StackOffset(slot.Offset - 8) : a);
+
     private static ISIL.Register? ReturnRegisterClobberedBy(MethodAnalysisContext callee)
         => callee.IsVoid ? CallingConventions.ReturnRegister(callee) : null;
 
@@ -712,7 +717,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                         else
                             call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), CallingConventions.ReturnRegister(possibleMethods[0]));
 
-                        call.AddOperands(CallingConventions.ResolveForManaged(possibleMethods[0]));
+                        call.AddOperands(AtCallSite(CallingConventions.ResolveForManaged(possibleMethods[0])));
                         call.ImplicitDefinition = ReturnRegisterClobberedBy(possibleMethods[0]);
                     }
                     else
@@ -742,7 +747,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                         else
                             call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
 
-                        call.AddOperands(CallingConventions.ResolveForManaged(ctx));
+                        call.AddOperands(AtCallSite(CallingConventions.ResolveForManaged(ctx)));
                         call.ImplicitDefinition = ReturnRegisterClobberedBy(ctx);
                     }
                 }

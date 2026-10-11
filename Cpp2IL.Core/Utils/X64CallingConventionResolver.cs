@@ -174,7 +174,8 @@ public class X64CallingConventionResolver : BaseCallingConventionResolver
                 }
                 else
                 {
-                    args.Add(new StackOffset((i - 4) * ptrSize));
+                    // Relative to rsp on entry: the return address, then the 4 register args' home space, then the rest
+                    args.Add(new StackOffset(ptrSize + 4 * ptrSize + (i - 4) * ptrSize));
                 }
 
                 i++;
@@ -223,7 +224,7 @@ public class X64CallingConventionResolver : BaseCallingConventionResolver
 
             LinuxNormalRegister nreg = 0;
             LinuxFloatingRegister freg = 0;
-            var stack = 0;
+            var stack = ptrSize; // past the return address
 
             void AddParameter(ParameterAnalysisContext? par)
             {

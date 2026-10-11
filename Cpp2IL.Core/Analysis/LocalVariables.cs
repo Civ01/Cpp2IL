@@ -525,6 +525,10 @@ public static class LocalVariables
             _ => null,
         };
 
+        // flags arithmetic on an enum stays that enum
+        if (type is { IsEnumType: true } and not GenericParameterTypeAnalysisContext)
+            return type;
+
         return type?.FullName switch
         {
             "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16"

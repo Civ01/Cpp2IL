@@ -410,6 +410,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         MetadataResolver.ResolveAll(this);
         DebugPassCallback?.Invoke(this, "MetadataResolver.ResolveAll");
 
+        WideLoadSplitter.Run(this);
+
         // Resolve KeyFunctionAddress calls, then collect what removing the write barriers left dead.
         KeyFunctionRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "KeyFunctionRecovery.Run");

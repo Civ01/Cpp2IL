@@ -163,7 +163,7 @@ public static class InlineMemcpyRecovery
         if (preheaders is not [{ } preheader] || exits is not [{ } tail] || tail.Predecessors.Distinct().Count() != 1)
             { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 5"); return false; }
 
-        if ((FindConstant(preheader, counter) ?? MethodWideConstant(graph, counter, loop)) is not { } iterations || iterations <= 0)
+        if ((FindConstant(preheader, counter) ?? ReachingConstant(graph, preheader, preheader.Instructions.Count, counter, 0) ?? MethodWideConstant(graph, counter, loop)) is not { } iterations || iterations <= 0)
             { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 6 (counter {counter}, preheader B{preheader.ID}: {string.Join(" | ", preheader.Instructions.TakeLast(4))}; preds {string.Join(",", preheader.Predecessors.Select(b => b.ID))})"); return false; }
 
         // The tail carries on with the same pointers, from where the loop left them. The compiler interleaves
@@ -270,6 +270,72 @@ public static class InlineMemcpyRecovery
     // The value a register holds at the end of the block, if it's (a copy of) a constant set in this block or, failing
     // that, in the chain of single predecessors leading to it
     private static long? FindConstant(Block block, string register) => FindConstant(block, block.Instructions.Count, register, 0);
+
+    // The constant a register holds at a point if every definition reaching it (along any path) sets it to the same
+    // constant, directly or through register copies
+    private static long? ReachingConstant(ISILControlFlowGraph graph, Block block, int before, string register, int depth)
+    {
+        if (depth > 4)
+            return null;
+
+        long? value = null;
+        var visited = new HashSet<Block>();
+        var pending = new Stack<(Block Block, int Before)>();
+        pending.Push((block, before));
+
+        while (pending.Count > 0)
+        {
+            var (current, end) = pending.Pop();
+            var found = false;
+
+            for (var i = end - 1; i >= 0; i--)
+            {
+                var instruction = current.Instructions[i];
+
+                if ((instruction.IsCall || instruction.OpCode == OpCode.IndirectCall) && VolatileRegisters.Contains(register))
+                    return null;
+
+                if (instruction.Destination is not Register written || written.Name != register)
+                    continue;
+
+                long? here = instruction switch
+                {
+                    { OpCode: OpCode.Move, Operands: [_, Immediate constant] } => constant.Value,
+                    { OpCode: OpCode.Move, Operands: [_, Register copied] } => ReachingConstant(graph, current, i, copied.Name, depth + 1),
+                    _ => null
+                };
+
+                // a copy loop counting this register down is followed by a fresh count before it's used again
+                if (here == null && instruction is { OpCode: OpCode.Subtract, Operands: [_, _, Immediate { Value: 1 }] } && current.Successors.Contains(current))
+                {
+                    found = true;
+                    break;
+                }
+
+                if (here == null || value != null && value != here)
+                    return null;
+
+                value = here;
+                found = true;
+                break;
+            }
+
+            if (found)
+                continue;
+
+            if (current == graph.EntryBlock || current.Predecessors.Count == 0)
+                return null; // reaches the method entry without being set
+
+            foreach (var predecessor in current.Predecessors)
+                if (visited.Add(predecessor))
+                    pending.Push((predecessor, predecessor.Instructions.Count));
+
+            if (visited.Count > 512)
+                return null;
+        }
+
+        return value;
+    }
 
     // A callee-saved register that's only ever set to one constant (bar the epilogue restoring it) holds that
     // constant wherever it's read. MSVC hoists repeated copy-loop counts into one like this.
