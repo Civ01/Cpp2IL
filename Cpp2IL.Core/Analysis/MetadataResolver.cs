@@ -319,7 +319,9 @@ public static class MetadataResolver
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
+                    if (callInstruction.Destination is LocalVariable produced
+                        && !NativeHelpers.NeverReturns(method.AppContext, target)
+                        && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
                     {
                         callInstruction.OpCode = OpCode.Newobj;
                         callInstruction.SetOperands(produced, thrown);
@@ -426,6 +428,66 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// Last resort for calls whose address is shared by several methods (identical bodies folded together by the
+    /// linker) that nothing else could tell apart: as the machine code is literally the same, any of them behaves
+    /// the same, so pick the most plausible rather than leave the call unresolved. Prefers, in order, candidates
+    /// whose declaring type fits the receiver, whose parameter count fits the arguments, that share the calling
+    /// method's name (base.Foo() from an override of Foo), then metadata order. Returns whether anything changed.
+    /// </summary>
+    public static bool GuessAmbiguousCalls(MethodAnalysisContext method)
+    {
+        var changed = false;
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (!instruction.IsCall || instruction.Operands[0] is not Immediate target)
+                continue;
+
+            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+                continue;
+
+            IEnumerable<MethodAnalysisContext> pool = candidates;
+
+            if (GetReceiver(instruction) is { Type: { } receiverType })
+            {
+                var fitting = candidates.Where(c => !c.IsStatic && IsInHierarchy(receiverType, c.DeclaringType)).ToList();
+                if (fitting.Count > 0)
+                    pool = fitting;
+            }
+
+            var argumentCount = instruction.Operands.Count - (instruction.OpCode == OpCode.CallVoid ? 1 : 2);
+            var plausible = pool.Where(c => (c.IsStatic ? 0 : 1) + c.Parameters.Count <= argumentCount).ToList();
+            if (plausible.Count > 0)
+                pool = plausible;
+
+            var choice = pool.FirstOrDefault(c => c.Name == method.Name) ?? pool.First();
+
+            instruction.SetOperand(0, choice);
+            choice.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, choice);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static bool IsInHierarchy(TypeAnalysisContext type, TypeAnalysisContext? candidateOwner)
+    {
+        if (candidateOwner == null)
+            return false;
+
+        for (var current = type; current != null; current = current.BaseType)
+        {
+            if (IsSameType(current, candidateOwner))
+                return true;
+
+            if (current is GenericInstanceTypeAnalysisContext instance && ReferenceEquals(instance.GenericType, candidateOwner))
+                return true;
+        }
+
+        return false;
     }
 
     private static bool AreInterchangeable(List<MethodAnalysisContext> candidates)

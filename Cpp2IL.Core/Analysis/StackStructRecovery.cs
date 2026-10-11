@@ -54,8 +54,6 @@ public static class StackStructRecovery
             roots[offset] = type;
         }
 
-        RecoverMemsets(app, graph);
-
         foreach (var block in graph.Blocks)
         {
             if (block.Instructions.Count == 0)
@@ -196,79 +194,6 @@ public static class StackStructRecovery
                 new MemoryOperand(structSlot, size: size),
                 new MemoryOperand(returned, size: size)));
         }
-    }
-
-    // memset(&slot, 0, n) - the inlined struct zeroing for anything too big to do with a few stores - as a zero store
-    private static void RecoverMemsets(ApplicationAnalysisContext app, ISILControlFlowGraph graph)
-    {
-        foreach (var block in graph.Blocks)
-        {
-            if (block.Instructions.Count == 0)
-                continue;
-
-            var call = block.Instructions[^1];
-            if (!call.IsCall || call.Operands.Count == 0 || call.Operands[0] is not Immediate target || !IsMemset(app, target.UnsignedValue))
-                continue;
-
-            var callIndex = block.Instructions.Count - 1;
-            if (AddressedSlot(block, callIndex, "rcx") is not { } slot
-                || RegisterConstant(block, callIndex, "rdx") is not 0
-                || RegisterConstant(block, callIndex, "r8") is not { } length
-                || length is <= 0 or >= 0x10000)
-                continue;
-
-            // memset hands back its destination
-            call.OpCode = OpCode.Move;
-            call.SetOperands(new StackOffset(slot, (int)length), new Immediate(0));
-            block.Instructions.Add(new Instruction(call.Index, OpCode.Move, new Register(null, "rax"), new AddressOf(new StackOffset(slot))));
-            block.BlockType = BlockType.Fall;
-        }
-    }
-
-    private static long? RegisterConstant(Block block, int beforeIndex, string registerName)
-    {
-        for (var i = beforeIndex - 1; i >= 0; i--)
-        {
-            var instruction = block.Instructions[i];
-            if (instruction.Destination is not Register written || written.Name != registerName)
-                continue;
-
-            return instruction is { OpCode: OpCode.Move, Operands: [_, Immediate value] } ? value.Value : null;
-        }
-
-        return null;
-    }
-
-    // The MSVC CRT memset: replicates the fill byte across a register with a 0x0101010101010101 multiply up front
-    private static bool IsMemset(ApplicationAnalysisContext app, ulong address)
-    {
-        if (app.MethodsByAddress.ContainsKey(address))
-            return false;
-
-        return app.MemsetByAddress.GetOrAdd(address, a =>
-        {
-            try
-            {
-                var instructions = X86Utils.GetMethodBodyAtVirtAddressNew(a, true, app, 64);
-                var sawByteSpread = false;
-                var count = 0;
-
-                foreach (var instruction in instructions)
-                {
-                    if (count++ > 10)
-                        break;
-
-                    if (instruction.Mnemonic == Iced.Intel.Mnemonic.Mov && instruction.Op1Kind == Iced.Intel.OpKind.Immediate64 && instruction.Immediate64 == 0x0101010101010101UL)
-                        sawByteSpread = true;
-                }
-
-                return sawByteSpread;
-            }
-            catch
-            {
-                return false;
-            }
-        });
     }
 
     private static readonly HashSet<string> PrimitiveNames =

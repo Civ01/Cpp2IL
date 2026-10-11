@@ -367,6 +367,23 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.IsInst:
+            {
+                var checkedType = instruction.Operands[1] switch
+                {
+                    LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } } => represented,
+                    RuntimeClassTypeAnalysisContext { RepresentedType: var represented } => represented,
+                    TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => type,
+                    _ => null
+                };
+
+                LoadOperand(instruction.Operands[2], method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
+                if (checkedType != null)
+                    instructions.Add(CilOpCodes.Isinst, checkedType.ToTypeSignature().ToTypeDefOrRef());
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+            }
+
             case OpCode.Throw:
                 if (instruction.Operands is [TypeAnalysisContext exceptionType]
                     && exceptionType.Methods.FirstOrDefault(m => m.Name == ".ctor" && m.Parameters.Count == 0) is { } exceptionCtor)

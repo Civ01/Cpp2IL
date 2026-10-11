@@ -433,6 +433,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveTypesAndFields(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.ResolveTypesAndFields");
 
+        NativeHelperRecovery.RunLate(this);
+
         // Chunked struct copies/zeroing (e.g. a Vector3 moved as x+y then z) back into whole struct moves
         StructCopyRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "StructCopyRecovery.Run");

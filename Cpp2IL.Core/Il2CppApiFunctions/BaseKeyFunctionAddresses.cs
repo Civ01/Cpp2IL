@@ -262,6 +262,10 @@ public abstract class BaseKeyFunctionAddresses
         {
             Logger.Verbose("\tLooking for il2cpp_codegen_initialize_runtime_metadata_inline as a thunk of the metadata init...");
             il2cpp_codegen_initialize_runtime_metadata_inline = FindAllThunkFunctions(il2cpp_codegen_initialize_runtime_metadata).FirstOrDefault();
+
+            // Newer versions have both wrap the same worker instead: the barriered one calls it, the inline one is a jmp to it
+            if (il2cpp_codegen_initialize_runtime_metadata_inline == 0 && FindFirstCallTargetInMethod(il2cpp_codegen_initialize_runtime_metadata) is var worker and not 0)
+                il2cpp_codegen_initialize_runtime_metadata_inline = FindAllThunkFunctions(worker, 0, il2cpp_codegen_initialize_runtime_metadata).FirstOrDefault();
             Logger.VerboseNewline($"Found at 0x{il2cpp_codegen_initialize_runtime_metadata_inline:X}");
         }
 

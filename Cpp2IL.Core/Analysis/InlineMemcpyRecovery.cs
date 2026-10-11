@@ -132,7 +132,7 @@ public static class InlineMemcpyRecovery
         {
             var instruction = loop.Instructions[i];
 
-            if (body.TryConsumeCopy(instruction))
+            if (body.TryConsumeCopy(instruction) || instruction.OpCode == OpCode.Nop)
                 continue;
 
             switch (instruction)
@@ -163,8 +163,8 @@ public static class InlineMemcpyRecovery
         if (preheaders is not [{ } preheader] || exits is not [{ } tail] || tail.Predecessors.Distinct().Count() != 1)
             { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 5"); return false; }
 
-        if (FindConstant(preheader, counter) is not { } iterations || iterations <= 0)
-            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 6"); return false; }
+        if ((FindConstant(preheader, counter) ?? MethodWideConstant(graph, counter, loop)) is not { } iterations || iterations <= 0)
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 6 (counter {counter}, preheader B{preheader.ID}: {string.Join(" | ", preheader.Instructions.TakeLast(4))}; preds {string.Join(",", preheader.Predecessors.Select(b => b.ID))})"); return false; }
 
         // The tail carries on with the same pointers, from where the loop left them. The compiler interleaves
         // unrelated setup for whatever comes next into it, which is fine as long as it stays clear of the copy.
@@ -270,6 +270,54 @@ public static class InlineMemcpyRecovery
     // The value a register holds at the end of the block, if it's (a copy of) a constant set in this block or, failing
     // that, in the chain of single predecessors leading to it
     private static long? FindConstant(Block block, string register) => FindConstant(block, block.Instructions.Count, register, 0);
+
+    // A callee-saved register that's only ever set to one constant (bar the epilogue restoring it) holds that
+    // constant wherever it's read. MSVC hoists repeated copy-loop counts into one like this.
+    private static long? MethodWideConstant(ISILControlFlowGraph graph, string register, Block loop)
+    {
+        // The loop's own counter register is decremented in the loop - follow the copy that feeds it
+        var preheader = loop.Predecessors.First(p => p != loop);
+        for (var i = preheader.Instructions.Count - 1; i >= 0; i--)
+        {
+            var instruction = preheader.Instructions[i];
+            if (instruction.Destination is not Register written || written.Name != register)
+                continue;
+
+            if (instruction is { OpCode: OpCode.Move, Operands: [_, Register copied] })
+                register = copied.Name;
+            break;
+        }
+
+        if (VolatileRegisters.Contains(register))
+            return null;
+
+        // Copy loops that count down this register directly (sub reg,1 in a self-looping block) leave it at zero,
+        // but nothing reads it after that without resetting it, or the next copy would be of nothing.
+        var countingLoops = graph.Blocks.Where(b => b.Successors.Contains(b)).SelectMany(b => b.Instructions).ToHashSet();
+
+        long? value = null;
+        foreach (var instruction in graph.Instructions)
+        {
+            if (instruction.Destination is not Register written || written.Name != register)
+                continue;
+
+            if (countingLoops.Contains(instruction) && instruction is { OpCode: OpCode.Subtract, Operands: [_, _, Immediate { Value: 1 }] })
+                continue;
+
+            switch (instruction)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, StackOffset] }:
+                    continue; // epilogue restore
+                case { OpCode: OpCode.Move, Operands: [_, Immediate constant] } when value == null || value == constant.Value:
+                    value = constant.Value;
+                    continue;
+                default:
+                    return null;
+            }
+        }
+
+        return value;
+    }
 
     private static long? FindConstant(Block block, int before, string register, int depth)
     {

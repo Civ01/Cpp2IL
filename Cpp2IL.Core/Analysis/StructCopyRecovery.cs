@@ -17,7 +17,12 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class StructCopyRecovery
 {
-    private readonly record struct Access(LocalVariable Base, long Offset, int Size);
+    private readonly record struct Access(LocalVariable Base, long Offset, int Size)
+    {
+        // Static storage is reached through a fresh local per load of the class's static fields pointer, but it's
+        // all the same storage, so compare those by the type they belong to
+        public object Key => Base.Type is StaticFieldStorageTypeAnalysisContext storage ? storage.OwnerType : Base;
+    }
 
     private sealed class Chunk
     {
@@ -68,7 +73,7 @@ public static class StructCopyRecovery
                 continue;
 
             // Group by destination object and, for copies, by source object and relative displacement
-            var groups = chunks.GroupBy(c => (c.Destination.Base, SourceBase: c.Source?.Base, Delta: c.Source is { } s ? s.Offset - c.Destination.Offset : long.MinValue));
+            var groups = chunks.GroupBy(c => (c.Destination.Key, SourceKey: c.Source?.Key, Delta: c.Source is { } s ? s.Offset - c.Destination.Offset : long.MinValue));
 
             foreach (var group in groups)
                 TryCombine(method, block, group.OrderBy(c => c.Destination.Offset).ToList(), pointerSize);
@@ -155,7 +160,7 @@ public static class StructCopyRecovery
                 if (between.IsCall || between.OpCode == OpCode.IndirectCall)
                     return false;
 
-                if (Locate(between.Destination, pointerSize) is { } written && ReferenceEquals(written.Base, source.Base))
+                if (Locate(between.Destination, pointerSize) is { } written && Equals(written.Key, source.Key))
                     return false;
             }
 

@@ -123,6 +123,11 @@ public enum OpCode
     Box,
 
     /// <summary>
+    /// Moves op 3 into op 1 if it's an instance of the type described by op 2, otherwise null. IL's isinst.
+    /// </summary>
+    IsInst,
+
+    /// <summary>
     /// Throws a new instance of the exception type described by op 1.
     /// </summary>
     Throw

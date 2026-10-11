@@ -246,6 +246,15 @@ public static class LocalVariables
         // lets a field offset resolve, a field load types its result, and any of those can be the
         // receiver/base of the next step. Every pass is monotonic - it only resolves an operand or
         // fills a previously-unknown type - so the loop converges.
+        RunTypeAndFieldFixpoint(method);
+
+        // Calls to folded duplicate bodies that nothing could tell apart get a best guess, which in turn types more
+        if (MetadataResolver.GuessAmbiguousCalls(method))
+            RunTypeAndFieldFixpoint(method);
+    }
+
+    private static void RunTypeAndFieldFixpoint(MethodAnalysisContext method)
+    {
         var changed = true;
         var loopCount = 0;
 
@@ -437,6 +446,17 @@ public static class LocalVariables
                     break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
+                    break;
+                case OpCode.IsInst when instruction.Operands[0] is LocalVariable castResult:
+                    changed |= SetTypeIfUnknown(castResult, instruction.Operands[1] switch
+                    {
+                        LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var checkedType } } => checkedType,
+                        RuntimeClassTypeAnalysisContext { RepresentedType: var checkedType } => checkedType,
+                        TypeAnalysisContext checkedType and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => checkedType,
+                        _ => null
+                    });
+                    if (instruction.Operands[2] is LocalVariable castValue)
+                        changed |= SetTypeIfUnknown(castValue, method.AppContext.SystemTypes.SystemObjectType);
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
                     changed |= PropagateArithmetic(instruction, method);

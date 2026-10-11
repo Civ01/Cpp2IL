@@ -83,10 +83,16 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     /// </summary>
     public readonly ConcurrentDictionary<ulong, bool> ExceptionRaisersByAddress = new();
 
+
     /// <summary>
-    /// Cache of which native functions are the C runtime's memset. Populated on demand by <see cref="Analysis.StackStructRecovery"/>.
+    /// Cache of which native helper (if any) lives at an address. Populated on demand by <see cref="Utils.NativeHelpers"/>.
     /// </summary>
-    public readonly ConcurrentDictionary<ulong, bool> MemsetByAddress = new();
+    public readonly ConcurrentDictionary<ulong, Utils.NativeHelperKind> NativeHelperKindsByAddress = new();
+
+    /// <summary>
+    /// Cache of whether native functions return at all. Populated on demand by <see cref="Utils.NativeHelpers"/>.
+    /// </summary>
+    public readonly ConcurrentDictionary<ulong, bool> NoReturnByAddress = new();
 
     /// <summary>
     /// A dictionary of all the generic method variants to their corresponding analysis contexts.
