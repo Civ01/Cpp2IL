@@ -252,6 +252,10 @@ public static class LocalVariables
         if (MetadataResolver.GuessAmbiguousCalls(method))
             RunTypeAndFieldFixpoint(method);
 
+        // 8/16 byte struct chunks become one value per field
+        if (WideChunkSplitter.Run(method))
+            RunTypeAndFieldFixpoint(method);
+
         // Whatever's still untyped gets the integer type its definition suggests, rather than object, and that can
         // in turn type what it flows into
         if (DefaultUntypedLocals(method))

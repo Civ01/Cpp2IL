@@ -193,7 +193,7 @@ public static class StructCopyRecovery
     }
 
     // Every primitive (non-struct) field of a type, with its offset, looking inside struct fields
-    private static void CollectLeaves(TypeAnalysisContext type, bool isStatic, long baseOffset, List<FieldAnalysisContext> path,
+    internal static void CollectLeaves(TypeAnalysisContext type, bool isStatic, long baseOffset, List<FieldAnalysisContext> path,
         List<(List<FieldAnalysisContext> Chain, long Offset, long Size)> leaves, int pointerSize, int depth)
     {
         if (depth > 6)

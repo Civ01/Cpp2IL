@@ -34,28 +34,15 @@ public static class StackStructRecovery
         if (resolver == null)
             return;
 
-        var roots = new Dictionary<int, TypeAnalysisContext>();
-        var rejected = new HashSet<int>();
-        var bufferCalls = new List<(Block Block, Instruction Call, int Slot, TypeAnalysisContext Type)>();
+        var roots = new List<Root>();
+        var bufferCalls = new List<(Block Block, Instruction Call, Root Root)>();
 
-        void AddRoot(int offset, TypeAnalysisContext type)
+        void AddRoot(Block block, Instruction call, (int Offset, Instruction Definition)? addressed, TypeAnalysisContext type, bool calleeReads, bool calleeWrites)
         {
-            if (rejected.Contains(offset))
+            if (addressed is not { } found || !IsStruct(type))
                 return;
 
-            if (!IsStruct(type))
-                return;
-
-            if (roots.TryGetValue(offset, out var existing) && !ReferenceEquals(existing, type))
-            {
-                Debug?.Invoke($"reject {offset:X}: {existing} vs {type}");
-                // Slot reused for different struct types, can't give it one type
-                roots.Remove(offset);
-                rejected.Add(offset);
-                return;
-            }
-
-            roots[offset] = type;
+            roots.Add(new Root(found.Offset, type, call, found.Definition, calleeReads, calleeWrites));
         }
 
         foreach (var block in graph.Blocks)
@@ -80,18 +67,20 @@ public static class StackStructRecovery
             if (call.Operands.Count != argBase + expected.Length)
                 continue;
 
-            if (resolver.ReturnsViaHiddenBuffer(callee) && AddressedSlot(block, block.Instructions.Count - 1, "rcx") is { } bufferSlot)
+            var last = block.Instructions.Count - 1;
+
+            if (resolver.ReturnsViaHiddenBuffer(callee) && AddressedSlot(block, last, "rcx") is { } buffer)
             {
-                AddRoot(bufferSlot, callee.ReturnType);
-                if (call.OpCode == OpCode.Call && call.Operands[1] is Register)
-                    bufferCalls.Add((block, call, bufferSlot, callee.ReturnType));
+                AddRoot(block, call, buffer, callee.ReturnType, false, true);
+                if (call.OpCode == OpCode.Call && call.Operands[1] is Register && roots.Count > 0 && roots[^1].Call == call)
+                    bufferCalls.Add((block, call, roots[^1]));
             }
 
             var slot = argBase;
             if (!callee.IsStatic)
             {
-                if (callee.DeclaringType is { IsValueType: true } declaringType && AddressedSlot(block, block.Instructions.Count - 1, call.Operands[slot]) is { } receiverSlot)
-                    AddRoot(receiverSlot, declaringType);
+                if (callee.DeclaringType is { IsValueType: true } declaringType)
+                    AddRoot(block, call, AddressedSlot(block, last, call.Operands[slot]), declaringType, true, true);
 
                 slot++;
             }
@@ -102,15 +91,10 @@ public static class StackStructRecovery
                     break;
 
                 var parameterType = parameter.ParameterType;
-                var structType = parameterType switch
-                {
-                    ByRefTypeAnalysisContext { ElementType: { } element } => element,
-                    _ when IsStruct(parameterType) && TypeSizes.UnboxedSize(parameterType, 8) is not (1 or 2 or 4 or 8) => parameterType,
-                    _ => null
-                };
-
-                if (structType != null && AddressedSlot(block, block.Instructions.Count - 1, call.Operands[slot]) is { } argumentSlot)
-                    AddRoot(argumentSlot, structType);
+                if (parameterType is ByRefTypeAnalysisContext { ElementType: { } element })
+                    AddRoot(block, call, AddressedSlot(block, last, call.Operands[slot]), element, true, true);
+                else if (IsStruct(parameterType) && TypeSizes.UnboxedSize(parameterType, 8) is not (1 or 2 or 4 or 8))
+                    AddRoot(block, call, AddressedSlot(block, last, call.Operands[slot]), parameterType, true, false);
 
                 slot++;
             }
@@ -119,41 +103,88 @@ public static class StackStructRecovery
         if (roots.Count == 0)
             return;
 
-        // Turn roots into regions, dropping any that overlap each other
-        var regions = roots
-            .Select(r => (Start: r.Key, End: r.Key + (int)TypeSizes.UnboxedSize(r.Value, 8), Type: r.Value))
-            .Where(r => r.End > r.Start)
-            .OrderBy(r => r.Start)
-            .ToList();
-
-        Debug?.Invoke("regions: " + string.Join(", ", regions.Select(r => $"{r.Start:X}-{r.End:X} {r.Type}")));
-        var accepted = new List<(int Start, int End, TypeAnalysisContext Type)>();
-        for (var i = 0; i < regions.Count; i++)
+        // Each slot holds one struct, or - when MSVC reuses it for different struct types - one per call it's handed to
+        var slots = new List<Slot>();
+        foreach (var group in roots.GroupBy(r => r.Offset))
         {
-            var overlapsPrevious = i > 0 && regions[i - 1].End > regions[i].Start;
-            var overlapsNext = i + 1 < regions.Count && regions[i].End > regions[i + 1].Start;
-            if (!overlapsPrevious && !overlapsNext)
-                accepted.Add(regions[i]);
+            var types = group.Select(r => r.Type).Distinct().ToList();
+            var instances = types.Count == 1
+                ? [new Instance(StackAnalyzer.NameForSlot(new StackOffset(group.Key)), types[0], group.Key, group.Key + (int)TypeSizes.UnboxedSize(types[0], 8), group.ToList())]
+                : group.OrderBy(r => r.Call.Index).Select((r, n) => new Instance($"{StackAnalyzer.NameForSlot(new StackOffset(group.Key))}_{n}", r.Type, group.Key,
+                    group.Key + (int)TypeSizes.UnboxedSize(r.Type, 8), [r])).ToList();
+
+            if (instances.Any(i => i.End <= i.Start))
+                continue;
+
+            slots.Add(new Slot(group.Key, instances.Max(i => i.End), instances));
         }
 
-        // An access straddling a region boundary means our idea of the layout is wrong, as does taking the
-        // address of the middle of one (we can't represent that yet)
+        slots = slots.OrderBy(r => r.Start).ToList();
+        Debug?.Invoke("slots: " + string.Join(", ", slots.Select(r => $"{r.Start:X}-{r.End:X} " + string.Join("|", r.Instances.Select(i => i.Type.ToString())))));
+
+        var accepted = new List<Slot>();
+        for (var i = 0; i < slots.Count; i++)
+        {
+            var overlapsPrevious = i > 0 && slots[i - 1].End > slots[i].Start;
+            var overlapsNext = i + 1 < slots.Count && slots[i].End > slots[i + 1].Start;
+            if (!overlapsPrevious && !overlapsNext)
+                accepted.Add(slots[i]);
+        }
+
+        // Which instance each access belongs to. An access straddling a slot boundary means our idea of the layout is
+        // wrong, as does taking the address of the middle of one (we can't represent that yet)
+        var assignments = new List<(Instruction Instruction, int Operand, Instance Instance, int Start)>();
         foreach (var instruction in graph.Instructions)
         {
-            foreach (var operand in instruction.Operands)
+            for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
             {
-                switch (operand)
+                switch (instruction.Operands[operandIndex])
                 {
                     case StackOffset access:
+                    {
                         var accessEnd = access.Offset + (access.Size > 0 ? access.Size : 1);
-                        if (Debug != null)
-                            foreach (var r in accepted.Where(r => access.Offset < r.End && accessEnd > r.Start && (access.Offset < r.Start || accessEnd > r.End)))
-                                Debug($"straddle {r.Start:X} {r.Type} by {instruction}");
-                        accepted.RemoveAll(r => access.Offset < r.End && accessEnd > r.Start && (access.Offset < r.Start || accessEnd > r.End));
+                        foreach (var slot in accepted.Where(r => access.Offset < r.End && accessEnd > r.Start).ToList())
+                        {
+                            var isWrite = operandIndex == 0 && instruction.OpCode == OpCode.Move;
+                            var instance = slot.Instances.Count == 1 ? slot.Instances[0] : Choose(slot, instruction, isWrite);
+                            if (instance == null || access.Offset < instance.Start || accessEnd > instance.End)
+                            {
+                                Debug?.Invoke($"reject {slot.Start:X} by {instruction}");
+                                accepted.Remove(slot);
+                                continue;
+                            }
+
+                            assignments.Add((instruction, operandIndex, instance, slot.Start));
+                        }
+
                         break;
+                    }
                     case AddressOf { Target: StackOffset addressed }:
-                        accepted.RemoveAll(r => addressed.Offset > r.Start && addressed.Offset < r.End);
+                    {
+                        foreach (var slot in accepted.Where(r => addressed.Offset >= r.Start && addressed.Offset < r.End).ToList())
+                        {
+                            if (addressed.Offset > slot.Start)
+                            {
+                                accepted.Remove(slot);
+                                continue;
+                            }
+
+                            if (slot.Instances.Count == 1)
+                                continue; // becomes the address of the slot register as usual
+
+                            var owner = slot.Instances.FirstOrDefault(i => i.Roots.Any(r => r.Definition == instruction));
+                            if (owner == null)
+                            {
+                                Debug?.Invoke($"reject {slot.Start:X}: unowned address {instruction}");
+                                accepted.Remove(slot);
+                                continue;
+                            }
+
+                            assignments.Add((instruction, operandIndex, owner, slot.Start));
+                        }
+
                         break;
+                    }
                 }
             }
         }
@@ -161,47 +192,68 @@ public static class StackStructRecovery
         if (accepted.Count == 0)
             return;
 
-        foreach (var instruction in graph.Instructions)
+        foreach (var (instruction, operandIndex, instance, slotStart) in assignments)
         {
-            for (var i = 0; i < instruction.Operands.Count; i++)
+            if (!accepted.Any(r => r.Start == slotStart))
+                continue;
+
+            var structSlot = new Register(null, instance.Name);
+            switch (instruction.Operands[operandIndex])
             {
-                if (instruction.Operands[i] is not StackOffset access)
-                    continue;
-
-                foreach (var region in accepted)
-                {
-                    if (access.Offset < region.Start || access.Offset >= region.End)
-                        continue;
-
-                    var structSlot = new Register(null, StackAnalyzer.NameForSlot(new StackOffset(region.Start)));
-                    instruction.SetOperand(i, new MemoryOperand(structSlot, addend: access.Offset - region.Start, size: access.Size));
+                case StackOffset access:
+                    instruction.SetOperand(operandIndex, new MemoryOperand(structSlot, addend: access.Offset - instance.Start, size: access.Size));
                     break;
-                }
+                case AddressOf:
+                    instruction.SetOperand(operandIndex, new AddressOf(structSlot));
+                    break;
             }
         }
 
-        foreach (var region in accepted)
-            method.StackStructTypes[StackAnalyzer.NameForSlot(new StackOffset(region.Start))] = region.Type;
+        foreach (var instance in accepted.SelectMany(r => r.Instances))
+            method.StackStructTypes[instance.Name] = instance.Type;
 
         // A struct returned via hidden buffer is written into that buffer by the callee, which we otherwise don't see.
         // Model it as a copy of the returned value into the slot, right after the call.
-        foreach (var (block, call, slot, type) in bufferCalls)
+        foreach (var (block, call, root) in bufferCalls)
         {
-            if (!accepted.Any(r => r.Start == slot && ReferenceEquals(r.Type, type)))
+            if (accepted.SelectMany(r => r.Instances).FirstOrDefault(i => i.Roots.Contains(root) && ReferenceEquals(i.Type, root.Type)) is not { } instance)
                 continue;
 
             var successors = block.Successors.Distinct().ToList();
             if (successors is not [{ } next] || next == graph.ExitBlock || next.Predecessors.Distinct().Count() != 1)
                 continue;
 
-            var size = (int)TypeSizes.UnboxedSize(type, 8);
-            var structSlot = new Register(null, StackAnalyzer.NameForSlot(new StackOffset(slot)));
+            var size = (int)TypeSizes.UnboxedSize(root.Type, 8);
+            var structSlot = new Register(null, instance.Name);
             var returned = (Register)call.Operands[1];
 
             next.Instructions.Insert(0, new Instruction(call.Index, OpCode.Move,
                 new MemoryOperand(structSlot, size: size),
                 new MemoryOperand(returned, size: size)));
         }
+    }
+
+    private sealed record Root(int Offset, TypeAnalysisContext Type, Instruction Call, Instruction Definition, bool CalleeReads, bool CalleeWrites);
+
+    private sealed record Instance(string Name, TypeAnalysisContext Type, int Start, int End, List<Root> Roots);
+
+    private sealed record Slot(int Start, int End, List<Instance> Instances);
+
+    // A slot reused for several structs: our write is building the next call's argument, our read is of what the last
+    // call left there (a returned struct), or else of an argument we're building
+    private static Instance? Choose(Slot slot, Instruction access, bool isWrite)
+    {
+        var ordered = slot.Instances.OrderBy(i => i.Roots[0].Call.Index).ToList();
+        var next = ordered.FirstOrDefault(i => i.Roots[0].Call.Index > access.Index && i.Roots[0].CalleeReads);
+        var previous = ordered.LastOrDefault(i => i.Roots[0].Call.Index < access.Index);
+
+        if (isWrite)
+            return next ?? (previous is { Roots: [{ CalleeWrites: true }] } ? previous : null);
+
+        if (previous is { Roots: [{ CalleeWrites: true }] })
+            return previous;
+
+        return next ?? previous;
     }
 
     private static readonly HashSet<string> PrimitiveNames =
@@ -233,14 +285,14 @@ public static class StackStructRecovery
         return true;
     }
 
-    private static int? AddressedSlot(Block block, int callIndex, IOperand argument)
+    private static (int Offset, Instruction Definition)? AddressedSlot(Block block, int callIndex, IOperand argument)
         => argument is Register register ? AddressedSlot(block, callIndex, register.Name)
-            : argument is AddressOf { Target: StackOffset direct } ? direct.Offset
+            : argument is AddressOf { Target: StackOffset direct } ? (direct.Offset, block.Instructions[callIndex])
             : null;
 
     // Walks back from the call to the last write of the register in this block, and returns the stack
     // slot whose address it holds, if that's what it was set to.
-    private static int? AddressedSlot(Block block, int callIndex, string registerName)
+    private static (int Offset, Instruction Definition)? AddressedSlot(Block block, int callIndex, string registerName)
     {
         for (var i = callIndex - 1; i >= 0; i--)
         {
@@ -249,7 +301,7 @@ public static class StackStructRecovery
             if (instruction.Destination is not Register { } written || written.Name != registerName)
                 continue;
 
-            return instruction is { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: StackOffset slot }] } ? slot.Offset : null;
+            return instruction is { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: StackOffset slot }] } ? (slot.Offset, instruction) : null;
         }
 
         return null;
