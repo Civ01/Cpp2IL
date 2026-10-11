@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -21,6 +22,8 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class StackStructRecovery
 {
+    public static Action<string>? Debug;
+
     public static void Run(MethodAnalysisContext method, ISILControlFlowGraph graph)
     {
         var app = method.AppContext;
@@ -45,6 +48,7 @@ public static class StackStructRecovery
 
             if (roots.TryGetValue(offset, out var existing) && !ReferenceEquals(existing, type))
             {
+                Debug?.Invoke($"reject {offset:X}: {existing} vs {type}");
                 // Slot reused for different struct types, can't give it one type
                 roots.Remove(offset);
                 rejected.Add(offset);
@@ -122,6 +126,7 @@ public static class StackStructRecovery
             .OrderBy(r => r.Start)
             .ToList();
 
+        Debug?.Invoke("regions: " + string.Join(", ", regions.Select(r => $"{r.Start:X}-{r.End:X} {r.Type}")));
         var accepted = new List<(int Start, int End, TypeAnalysisContext Type)>();
         for (var i = 0; i < regions.Count; i++)
         {
@@ -141,6 +146,9 @@ public static class StackStructRecovery
                 {
                     case StackOffset access:
                         var accessEnd = access.Offset + (access.Size > 0 ? access.Size : 1);
+                        if (Debug != null)
+                            foreach (var r in accepted.Where(r => access.Offset < r.End && accessEnd > r.Start && (access.Offset < r.Start || accessEnd > r.End)))
+                                Debug($"straddle {r.Start:X} {r.Type} by {instruction}");
                         accepted.RemoveAll(r => access.Offset < r.End && accessEnd > r.Start && (access.Offset < r.Start || accessEnd > r.End));
                         break;
                     case AddressOf { Target: StackOffset addressed }:

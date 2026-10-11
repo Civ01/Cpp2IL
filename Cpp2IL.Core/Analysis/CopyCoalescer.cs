@@ -258,6 +258,14 @@ public static class CopyCoalescer
                 case AddressOf { Target: LocalVariable addressed }:
                     yield return addressed;
                     break;
+                case AddressOf { Target: ArrayAccess addressedElement }:
+                    yield return addressedElement.Array;
+                    if (addressedElement.Index is LocalVariable addressedIndex)
+                        yield return addressedIndex;
+                    break;
+                case AddressOf { Target: FieldReference { Local: { } addressedOwner } }:
+                    yield return addressedOwner;
+                    break;
             }
         }
     }
@@ -295,6 +303,14 @@ public static class CopyCoalescer
                             break;
                         case AddressOf { Target: LocalVariable addressed } addressOf:
                             addressOf.Target = groups.Find(addressed);
+                            break;
+                        case AddressOf { Target: ArrayAccess addressedElement }:
+                            addressedElement.Array = groups.Find(addressedElement.Array);
+                            if (addressedElement.Index is LocalVariable addressedIndex)
+                                addressedElement.Index = groups.Find(addressedIndex);
+                            break;
+                        case AddressOf { Target: FieldReference { Local: { } addressedOwner } addressedField }:
+                            addressedField.Local = groups.Find(addressedOwner);
                             break;
                     }
                 }

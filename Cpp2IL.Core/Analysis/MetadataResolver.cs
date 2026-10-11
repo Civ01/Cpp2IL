@@ -204,7 +204,7 @@ public static class MetadataResolver
 
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
+                var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } ? referent : local.Type);
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;

@@ -49,6 +49,7 @@ public class StackAnalyzer
         NativeHelperRecovery.RunEarly(method, graph);
         InlinedIsInstRecovery.Run(method, graph);
         InlineMemcpyRecovery.Run(method, graph);
+        VectorLaneRecovery.Run(method, graph);
         StackStructRecovery.Run(method, graph);
         ReplaceStackWithRegisters(method);
 
@@ -78,6 +79,13 @@ public class StackAnalyzer
             else if (instruction is { OpCode: OpCode.Move, Operands: [Register { Name: not "rsp" } leaDestination, AddressOf { Target: StackOffset frameSlot }] })
             {
                 aliases[leaDestination.Name] = atCopy.Size + frameSlot.Offset;
+                aliasDefinitions.Add(instruction);
+            }
+            // mov rax,rsp / lea rbp,[rax-87h]: a frame register derived from another alias
+            else if (instruction is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [Register derived, Register derivedFrom, Immediate derivedBy] }
+                     && derived.Name != derivedFrom.Name && derived.Name != "rsp" && aliases.TryGetValue(derivedFrom.Name, out var fromOffset))
+            {
+                aliases[derived.Name] = (int)(fromOffset + (instruction.OpCode == OpCode.Add ? derivedBy.Value : -derivedBy.Value));
                 aliasDefinitions.Add(instruction);
             }
         }
