@@ -84,6 +84,11 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     public readonly ConcurrentDictionary<ulong, bool> ExceptionRaisersByAddress = new();
 
     /// <summary>
+    /// Cache of which native functions are the C runtime's memset. Populated on demand by <see cref="Analysis.StackStructRecovery"/>.
+    /// </summary>
+    public readonly ConcurrentDictionary<ulong, bool> MemsetByAddress = new();
+
+    /// <summary>
     /// A dictionary of all the generic method variants to their corresponding analysis contexts.
     /// </summary>
     public readonly Dictionary<Cpp2IlMethodRef, ConcreteGenericMethodAnalysisContext> ConcreteGenericMethodsByRef = new();

@@ -356,7 +356,11 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 if (instruction.Op0Kind == OpKind.Register && instruction.Op1Kind == OpKind.Register && instruction.Op0Register == instruction.Op1Register)
                     Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), Imm(0));
                 else
+                {
                     Add(instruction.IP, ISIL.OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                    if (instruction.Mnemonic == Mnemonic.Xor)
+                        AddLogicalResultFlags(instruction.IP, ConvertOperand(instruction, 0));
+                }
                 break;
             case Mnemonic.Shl: // unsigned shift
             case Mnemonic.Sal: // signed shift
@@ -369,10 +373,14 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.And:
             case Mnemonic.Andps: //Floating point and
                 Add(instruction.IP, ISIL.OpCode.And, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction.Mnemonic == Mnemonic.And)
+                    AddLogicalResultFlags(instruction.IP, ConvertOperand(instruction, 0));
                 break;
             case Mnemonic.Or:
             case Mnemonic.Orps: //Floating point or
                 Add(instruction.IP, ISIL.OpCode.Or, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction.Mnemonic == Mnemonic.Or)
+                    AddLogicalResultFlags(instruction.IP, ConvertOperand(instruction, 0));
                 break;
             case Mnemonic.Bts: // CF = old bit, then set it
                 {
@@ -402,6 +410,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 break;
             case Mnemonic.Neg: // dest := -dest
                 Add(instruction.IP, ISIL.OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0));
+                AddArithmeticResultFlags(instruction.IP, ConvertOperand(instruction, 0), true);
                 break;
             case Mnemonic.Imul:
                 if (instruction.OpCount == 1)
@@ -513,9 +522,16 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 var left = ConvertOperand(instruction, 0);
                 var right = ConvertOperand(instruction, 1);
                 if (isSubtract)
+                {
+                    // sub sets the flags exactly as cmp of the same operands would (e.g. a sub rdx,1 / jne loop counter)
+                    AddCompareInstruction(instruction.IP, left, right);
                     Add(instruction.IP, ISIL.OpCode.Subtract, left, left, right);
+                }
                 else
+                {
                     Add(instruction.IP, ISIL.OpCode.Add, left, left, right);
+                    AddArithmeticResultFlags(instruction.IP, left, true);
+                }
 
                 break;
             case Mnemonic.Addss:
@@ -553,9 +569,11 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             // The following pair of instructions does not update the Carry Flag (CF):
             case Mnemonic.Dec:
                 Add(instruction.IP, ISIL.OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), Imm(1));
+                AddArithmeticResultFlags(instruction.IP, ConvertOperand(instruction, 0), false);
                 break;
             case Mnemonic.Inc:
                 Add(instruction.IP, ISIL.OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), Imm(1));
+                AddArithmeticResultFlags(instruction.IP, ConvertOperand(instruction, 0), false);
                 break;
 
             case Mnemonic.Shufps: // Packed Interleave Shuffle of Quadruplets of Single Precision Floating-Point Values
@@ -1067,6 +1085,19 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             Add(ip, ISIL.OpCode.CheckEqual, new ISIL.Register(null, "PF"), temp5, Imm(0)); // PF = temp5 == 0
         }
 
+        // ZF/SF from a result, for instructions other than cmp/test/sub that set flags. CF/OF are approximated
+        // as clear (they're rarely consumed after these), which beats leaving the previous compare's values.
+        void AddArithmeticResultFlags(ulong ip, ISIL.IOperand result, bool affectsCarry)
+        {
+            Add(ip, ISIL.OpCode.CheckEqual, new ISIL.Register(null, "ZF"), result, Imm(0)); // ZF = result == 0
+            Add(ip, ISIL.OpCode.CheckLess, new ISIL.Register(null, "SF"), result, Imm(0)); // SF = result < 0
+            Add(ip, ISIL.OpCode.Move, new ISIL.Register(null, "OF"), Imm(0));
+            if (affectsCarry)
+                Add(ip, ISIL.OpCode.Move, new ISIL.Register(null, "CF"), Imm(0));
+        }
+
+        void AddLogicalResultFlags(ulong ip, ISIL.IOperand result) => AddArithmeticResultFlags(ip, result, true); // and/or/xor clear CF and OF
+
         void AddTestInstruction(ulong ip, ISIL.IOperand op0, ISIL.IOperand op1)
         {
             var temp = new ISIL.Register(null, "TEMP");
@@ -1116,6 +1147,23 @@ public class X86InstructionSet : Cpp2IlInstructionSet
     }
 
     private ISIL.IOperand ConvertOperand(Instruction instruction, int operand, bool isLeaAddress = false)
+    {
+        var converted = ConvertOperandInternal(instruction, operand, isLeaAddress);
+
+        if (isLeaAddress || instruction.GetOpKind(operand) != OpKind.Memory)
+            return converted;
+
+        // Record the access width so multi-field copies (e.g. movsd of a Vector3's x and y) can be told apart from single fields
+        var size = instruction.MemorySize.GetSize();
+        return converted switch
+        {
+            ISIL.MemoryOperand memory => new ISIL.MemoryOperand(memory.Base, memory.Index, memory.Addend, memory.Scale, size),
+            ISIL.StackOffset slot => new ISIL.StackOffset(slot.Offset, size),
+            _ => converted
+        };
+    }
+
+    private ISIL.IOperand ConvertOperandInternal(Instruction instruction, int operand, bool isLeaAddress = false)
     {
         var kind = instruction.GetOpKind(operand);
 

@@ -156,6 +156,9 @@ public static class MetadataResolver
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;
+                var path = new List<FieldAnalysisContext>();
+                var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
                 if (genericOwner != null && staticOwner == null)
                 {
                     // metadata has all-0 offsets for generic definitions, so recompute layout
@@ -171,28 +174,113 @@ public static class MetadataResolver
                 }
                 else
                 {
-                    // an inherited field exists on the base type but sits at the same offset in the
-                    // derived layout, so the whole chain is searched
-                    field = null;
-                    for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
-                        field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
-                            && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
-                            && f.BackingData?.FieldOffset == memory.Addend);
+                    if (FindFieldChain(genericOwner?.GenericType ?? owner, staticOwner != null, memory.Addend, memory.Size, pointerSize) is not { } chain)
+                        continue;
+
+                    field = chain[^1];
+                    path = chain.GetRange(0, chain.Count - 1);
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
+                    continue;
+
+                // A wider access than the field is a copy of several fields at once, which a later pass deals with
+                if (path.Count == 0 && memory.Size > 0 && TypeSizes.StorageSize(field.FieldType, pointerSize) is > 0 and var fieldSize && memory.Size > fieldSize)
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
                 if (genericOwner != null)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
-                instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
+                var reference = new FieldReference(field, local, (int)memory.Addend) { Path = path };
+
+                instruction.SetOperand(i, reference);
                 changed = true;
             }
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// Finds the (possibly nested) field accessed by a <paramref name="size"/>-byte access at <paramref name="offset"/>
+    /// into an instance of <paramref name="owner"/> (or its static storage), outermost field first. Null if the access
+    /// doesn't correspond to a single field. A size of 0 means unknown, and matches any field starting there.
+    /// </summary>
+    public static List<FieldAnalysisContext>? FindFieldChain(TypeAnalysisContext owner, bool isStatic, long offset, int size, int pointerSize)
+    {
+        // an inherited field exists on the base type but sits at the same offset in the
+        // derived layout, so the whole chain is searched
+        FieldAnalysisContext? field = null;
+        for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+            field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
+                && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
+                && f.BackingData?.FieldOffset == offset);
+
+        long fieldOffset = offset;
+
+        // Not the start of a field - maybe it's inside a struct-typed one (e.g. transform.position.y)
+        if (field == null)
+        {
+            for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+                field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
+                    && (f.Attributes & FieldAttributes.Literal) == 0
+                    && f.BackingData?.FieldOffset is { } start && start < offset
+                    && StackStructRecovery.IsStruct(f.FieldType)
+                    && offset < start + TypeSizes.StorageSize(f.FieldType, pointerSize));
+
+            if (field == null)
+                return null;
+
+            fieldOffset = field.BackingData!.FieldOffset;
+        }
+
+        var path = new List<FieldAnalysisContext>();
+        if (!DescendIntoStructField(ref field, path, offset - fieldOffset, size, pointerSize))
+            return null;
+
+        path.Add(field);
+        return path;
+    }
+
+    /// <summary>
+    /// Given an access at <paramref name="offset"/> bytes into <paramref name="field"/>, narrows it down to the
+    /// innermost field actually accessed, recording the enclosing struct fields in <paramref name="path"/>.
+    /// Returns false if the access doesn't map onto a field (e.g. it spans several fields - a chunked copy).
+    /// </summary>
+    private static bool DescendIntoStructField(ref FieldAnalysisContext field, List<FieldAnalysisContext> path, long offset, int accessSize, int pointerSize)
+    {
+        for (var depth = 0; depth < 16; depth++)
+        {
+            var fieldSize = TypeSizes.StorageSize(field.FieldType, pointerSize);
+
+            // The access is the whole field (or we don't know enough to say otherwise)
+            if (offset == 0 && (accessSize <= 0 || fieldSize <= 0 || accessSize == fieldSize))
+                return true;
+
+            if (offset == 0 && accessSize > fieldSize)
+                return false; // spans several fields
+
+            if (!StackStructRecovery.IsStruct(field.FieldType))
+                return offset == 0; // part of a primitive, e.g. the low byte of an int, is still that field
+
+            var structType = field.FieldType;
+            var nested = structType.Fields.FirstOrDefault(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0
+                && f.BackingData?.FieldOffset is { } start && start <= offset
+                && (start == offset || offset < start + TypeSizes.StorageSize(f.FieldType, pointerSize)));
+
+            // prefer an exact match over a containing one
+            nested = structType.Fields.FirstOrDefault(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0 && f.BackingData?.FieldOffset == offset) ?? nested;
+
+            if (nested == null)
+                return false;
+
+            path.Add(field);
+            offset -= nested.BackingData!.FieldOffset;
+            field = nested;
+        }
+
+        return false;
     }
 
     private static void ResolveCalls(MethodAnalysisContext method)

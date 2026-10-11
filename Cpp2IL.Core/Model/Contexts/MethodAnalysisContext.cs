@@ -70,6 +70,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
     public List<string> AnalysisWarnings = [];
 
+    /// <summary>
+    /// Stack slots (by register name, e.g. stack_20) found to hold a whole struct, and that struct's type.
+    /// </summary>
+    public Dictionary<string, TypeAnalysisContext> StackStructTypes = [];
+
     public static int MaxMethodSizeBytes = 30000; // 30KB
 
     /// <summary>
@@ -366,6 +371,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
             return;
         }
 
+        StackStructTypes = [];
         ConvertedIsil = AppContext.InstructionSet.GetIsilFromMethod(this);
         ParameterOperands = AppContext.InstructionSet.GetParameterOperandsFromMethod(this);
 
@@ -426,6 +432,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         LocalVariables.ResolveTypesAndFields(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.ResolveTypesAndFields");
+
+        // Chunked struct copies/zeroing (e.g. a Vector3 moved as x+y then z) back into whole struct moves
+        StructCopyRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "StructCopyRecovery.Run");
 
         // Needs the MethodInfo* receivers typed, so runs after resolution unlike the class-init guards
         MetadataInitGuardRemover.RunRgctx(this);

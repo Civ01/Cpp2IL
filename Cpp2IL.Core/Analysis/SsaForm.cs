@@ -26,11 +26,19 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!);
+        => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackStructTypes.Keys);
 
-    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
+    // Struct-holding stack slots that are only ever accessed piecewise, through memory operands, and so behave as
+    // memory rather than as SSA variables: they're never versioned, and handing out their address doesn't
+    // redefine them.
+    private HashSet<string> _memorySlots = [];
+
+    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo, IEnumerable<string>? memorySlots = null)
     {
         var ssa = new SsaForm();
+        if (memorySlots != null)
+            ssa._memorySlots = [..memorySlots];
+
         ssa.FindClobberingAddressTakes(graph);
 
         graph.BuildUseDefLists(ssa._clobbering);
@@ -53,7 +61,7 @@ public class SsaForm
 
                 foreach (var operand in instruction.Operands)
                 {
-                    if (operand is AddressOf { Target: Register addressed } && IsReadAfter(block, i, addressed))
+                    if (operand is AddressOf { Target: Register addressed } && !_memorySlots.Contains(addressed.Name) && IsReadAfter(block, i, addressed))
                         _clobbering.Add(instruction);
                 }
             }

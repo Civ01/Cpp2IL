@@ -46,6 +46,8 @@ public class StackAnalyzer
 
         analyzer.ResolveFrameAliases(graph);
         analyzer.CorrectOffsets(graph);
+        InlineMemcpyRecovery.Run(method, graph);
+        StackStructRecovery.Run(method, graph);
         ReplaceStackWithRegisters(method);
 
         graph.RemoveNops();
@@ -132,7 +134,7 @@ public class StackAnalyzer
                 if (!aliases.TryGetValue(frameBase.Name, out var frameOffset))
                     continue;
 
-                instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size)));
+                instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size), memory.Size));
             }
         }
 
@@ -186,7 +188,7 @@ public class StackAnalyzer
                         // as doing so will make the dictionary lookup impossible.
                         state ??= _instructionState[instruction].Size;
 
-                        var actual = new StackOffset(state.Value + offset.Offset);
+                        var actual = new StackOffset(state.Value + offset.Offset, offset.Size);
                         instruction.SetOperand(i, op is AddressOf ? new AddressOf(actual) : actual);
                     }
                 }
@@ -289,5 +291,5 @@ public class StackAnalyzer
         }
     }
 
-    private static string NameForSlot(StackOffset offset) => offset.Offset < 0 ? $"stack_-{-offset.Offset:X}" : $"stack_{offset.Offset:X}";
+    internal static string NameForSlot(StackOffset offset) => offset.Offset < 0 ? $"stack_-{-offset.Offset:X}" : $"stack_{offset.Offset:X}";
 }

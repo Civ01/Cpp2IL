@@ -15,4 +15,47 @@ public static class TypeSizes
 
         return 0;
     }
+
+    /// <summary>
+    /// Size in bytes a value of this type occupies when stored in a field or local, or 0 if unknown.
+    /// </summary>
+    public static long StorageSize(TypeAnalysisContext type, int pointerSize)
+    {
+        if (type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+            return pointerSize;
+
+        if (type is GenericParameterTypeAnalysisContext)
+            return 0;
+
+        if (!type.IsValueType)
+            return pointerSize;
+
+        if (type.IsEnumType)
+        {
+            foreach (var field in type.Fields)
+                if (!field.IsStatic)
+                    return StorageSize(field.FieldType, pointerSize);
+
+            return 4;
+        }
+
+        if (type.Namespace == "System")
+        {
+            switch (type.Name)
+            {
+                case "Boolean" or "Byte" or "SByte":
+                    return 1;
+                case "Int16" or "UInt16" or "Char":
+                    return 2;
+                case "Int32" or "UInt32" or "Single":
+                    return 4;
+                case "Int64" or "UInt64" or "Double":
+                    return 8;
+                case "IntPtr" or "UIntPtr":
+                    return pointerSize;
+            }
+        }
+
+        return UnboxedSize(type, pointerSize);
+    }
 }

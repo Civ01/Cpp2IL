@@ -90,7 +90,7 @@ public static class DeadCodeEliminator
                     break;
                 // A static field access doesn't read the storage pointer it was resolved from, so that
                 // pointer (and the class load feeding it) is free to die.
-                case FieldReference { Field.IsStatic: false, Local: { } fieldLocal }:
+                case FieldReference { RootField.IsStatic: false, Local: { } fieldLocal }:
                     yield return fieldLocal;
                     break;
                 // Handing out a slot's address is a read of it as far as we can tell, whatever the callee then does with it.

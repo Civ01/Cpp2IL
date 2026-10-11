@@ -290,11 +290,10 @@ public static class IlGenerator
             case OpCode.Move:
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
-                    if (!field.Field.IsStatic)
-                        LoadLocal(field.Local, method, locals);
+                    var isStaticStore = LoadFieldContainer(field, method, locals);
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
-                    instructions.Add(field.Field.IsStatic ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
+                    instructions.Add(isStaticStore ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
                     break;
                 }
 
@@ -405,7 +404,20 @@ public static class IlGenerator
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
-                        LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
+                    {
+                        // A value type's instance method takes 'this' as a managed pointer
+                        var receiverLocal = instruction.Operands[thisParamIndex] switch
+                        {
+                            AddressOf { Target: LocalVariable addressedReceiver } => addressedReceiver,
+                            LocalVariable { Type: { IsValueType: true } receiverType } valueReceiver when receiverType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext) => valueReceiver,
+                            _ => null
+                        };
+
+                        if (targetMethod.DeclaringType is { IsValueType: true } && receiverLocal != null)
+                            LoadLocalAddress(receiverLocal, method, locals);
+                        else
+                            LoadOperand(instruction.Operands[thisParamIndex], method, locals, writeLine, targetMethod.DeclaringType);
+                    }
                     else
                     {
                         instructions.Add(CilOpCodes.Ldstr, Diagnostic($"Non static method called without 'this' param ({instruction})"));
@@ -666,9 +678,23 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Ldlen);
                 instructions.Add(CilOpCodes.Conv_I4);
                 break;
-            case AddressOf { Target: LocalVariable addressed }:
-                instructions.Add(CilOpCodes.Ldloca, locals[addressed]);
+            // A struct passed by value travels as a pointer to a copy (win64), but IL wants the value itself
+            case AddressOf { Target: LocalVariable addressedValue } when expectedType is { IsValueType: true } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+                                                                         && addressedValue.Type is { } addressedType && addressedType.FullName == expectedType.FullName:
+                LoadLocal(addressedValue, method, locals);
                 break;
+            case AddressOf { Target: LocalVariable addressed }:
+                LoadLocalAddress(addressed, method, locals);
+                break;
+            case DefaultValue defaultValue:
+            {
+                var defaultTemp = new CilLocalVariable(defaultValue.Type.ToTypeSignature());
+                method.CilMethodBody!.LocalVariables.Add(defaultTemp);
+                instructions.Add(CilOpCodes.Ldloca, defaultTemp);
+                instructions.Add(CilOpCodes.Initobj, defaultValue.Type.ToTypeSignature().ToTypeDefOrRef());
+                instructions.Add(CilOpCodes.Ldloc, defaultTemp);
+                break;
+            }
             case AddressOf { Target: ArrayAccess elementAddress }:
                 LoadLocal(elementAddress.Array, method, locals);
                 LoadOperand(elementAddress.Index, method, locals, writeLine);
@@ -682,15 +708,24 @@ public static class IlGenerator
                     ((SzArrayTypeAnalysisContext)arrayAccess.Array.Type!).ElementType.ToTypeSignature().ToTypeDefOrRef());
                 break;
             case FieldReference field:
-                if (field.Field.IsStatic)
+            {
+                var first = true;
+                foreach (var link in field.Chain)
                 {
-                    instructions.Add(CilOpCodes.Ldsfld, field.Field.ToFieldDescriptor());
-                    break;
+                    if (first && link.IsStatic)
+                        instructions.Add(CilOpCodes.Ldsfld, link.ToFieldDescriptor());
+                    else
+                    {
+                        if (first)
+                            LoadLocal(field.Local, method, locals);
+                        instructions.Add(CilOpCodes.Ldfld, link.ToFieldDescriptor());
+                    }
+
+                    first = false;
                 }
 
-                LoadLocal(field.Local, method, locals);
-                instructions.Add(CilOpCodes.Ldfld, field.Field.ToFieldDescriptor());
                 break;
+            }
             case MemoryOperand memory:
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
@@ -841,6 +876,86 @@ public static class IlGenerator
             _ => null
         };
 
+    /// <summary>
+    /// Pushes whatever a stfld of <paramref name="field"/>'s innermost field needs underneath the value: the
+    /// object reference, or the address of the struct holding it. Returns true if the store is instead a stsfld
+    /// (a direct static field, which needs nothing pushed).
+    /// </summary>
+    private static bool LoadFieldContainer(FieldReference field, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        var chain = field.Chain.ToList();
+
+        if (chain.Count == 1 && chain[0].IsStatic)
+            return true;
+
+        if (chain[0].IsStatic)
+            instructions.Add(CilOpCodes.Ldsflda, chain[0].ToFieldDescriptor());
+        else
+        {
+            // Writing into a struct needs its address, not a copy of it
+            if (field.Local.Type is { IsValueType: true } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext))
+                LoadLocalAddress(field.Local, method, locals);
+            else
+                LoadLocal(field.Local, method, locals);
+
+            if (chain.Count > 1)
+                instructions.Add(CilOpCodes.Ldflda, chain[0].ToFieldDescriptor());
+        }
+
+        for (var i = 1; i < chain.Count - 1; i++)
+            instructions.Add(CilOpCodes.Ldflda, chain[i].ToFieldDescriptor());
+
+        return false;
+    }
+
+    private static void StoreLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+
+        if (local.IsThis)
+        {
+            // Assigning to 'this' only makes sense in a struct, where it means overwriting the value
+            if (method.DeclaringType is { IsValueType: true } declaringType)
+            {
+                var thisValue = new CilLocalVariable(declaringType.ToTypeSignature());
+                method.CilMethodBody!.LocalVariables.Add(thisValue);
+                instructions.Add(CilOpCodes.Stloc, thisValue);
+                instructions.Add(CilOpCodes.Ldarg_0);
+                instructions.Add(CilOpCodes.Ldloc, thisValue);
+                instructions.Add(CilOpCodes.Stobj, declaringType);
+            }
+            else
+                instructions.Add(CilOpCodes.Starg, method.Parameters.ThisParameter!);
+            return;
+        }
+
+        var parameter = method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+
+        if (parameter != null)
+            instructions.Add(CilOpCodes.Starg, parameter);
+        else
+            instructions.Add(CilOpCodes.Stloc, locals[local]);
+    }
+
+    private static void LoadLocalAddress(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+
+        if (local.IsThis)
+        {
+            instructions.Add(CilOpCodes.Ldarg_0); // a value type's 'this' is already a managed pointer
+            return;
+        }
+
+        var parameter = method.Parameters.FirstOrDefault(p => p.Name == local.Name);
+
+        if (parameter != null)
+            instructions.Add(CilOpCodes.Ldarga, parameter);
+        else
+            instructions.Add(CilOpCodes.Ldloca, locals[local]);
+    }
+
     private static void LoadLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -867,13 +982,13 @@ public static class IlGenerator
         switch (operand)
         {
             case LocalVariable local:
-                instructions.Add(CilOpCodes.Stloc, locals[local]);
+                StoreLocal(local, method, locals);
                 break;
 
             case FieldReference field:
                 var fieldDescriptor = field.Field.ToFieldDescriptor();
 
-                if (field.Field.IsStatic)
+                if (field.Field.IsStatic && field.Path.Count == 0)
                 {
                     instructions.Add(CilOpCodes.Stsfld, fieldDescriptor);
                     break;
@@ -885,9 +1000,9 @@ public static class IlGenerator
                 method.CilMethodBody!.LocalVariables.Add(scratch);
 
                 instructions.Add(CilOpCodes.Stloc, scratch);
-                LoadLocal(field.Local, method, locals);
+                var isStaticStore = LoadFieldContainer(field, method, locals);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
-                instructions.Add(CilOpCodes.Stfld, fieldDescriptor);
+                instructions.Add(isStaticStore ? CilOpCodes.Stsfld : CilOpCodes.Stfld, fieldDescriptor);
                 break;
 
             case ArrayAccess arrayAccess:
@@ -907,8 +1022,22 @@ public static class IlGenerator
                 if (memory.Index == null && memory.Addend == 0 && memory.Scale == 0
                     && memory.Base is LocalVariable local2)
                 {
+                    // A store through a managed pointer writes the referent, not the pointer
+                    if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } storedReferent })
+                    {
+                        var storedValue = new CilLocalVariable(storedReferent.ToTypeSignature());
+                        method.CilMethodBody!.LocalVariables.Add(storedValue);
+                        instructions.Add(CilOpCodes.Stloc, storedValue);
+                        LoadLocal(local2, method, locals);
+                        instructions.Add(CilOpCodes.Ldloc, storedValue);
+                        instructions.Add(storedReferent.IsValueType
+                            ? new CilInstruction(CilOpCodes.Stobj, storedReferent.ToTypeSignature().ToTypeDefOrRef())
+                            : new CilInstruction(CilOpCodes.Stind_Ref));
+                        break;
+                    }
+
                     // Can pointer assignments just be ignored because it's C#? (Move [local], 123)
-                    instructions.Add(CilOpCodes.Stloc, locals[local2]);
+                    StoreLocal(local2, method, locals);
                     break;
                 }
                 instructions.Add(CilOpCodes.Pop);

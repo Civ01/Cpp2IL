@@ -231,6 +231,7 @@ public static class LocalVariables
         // loads. Applied once up front and, being applied first, they win over anything inferred later.
         PropagateFromReturn(method);
         PropagateFromParameters(method);
+        SeedStackStructTypes(method);
         SeedRuntimeClassTypes(method);
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
@@ -263,6 +264,19 @@ public static class LocalVariables
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
+        }
+    }
+
+    // Stack regions StackStructRecovery found to hold a whole struct
+    private static void SeedStackStructTypes(MethodAnalysisContext method)
+    {
+        if (method.StackStructTypes.Count == 0)
+            return;
+
+        foreach (var local in method.Locals)
+        {
+            if (local.Type == null && method.StackStructTypes.TryGetValue(local.Register.Name, out var structType))
+                local.Type = structType;
         }
     }
 
