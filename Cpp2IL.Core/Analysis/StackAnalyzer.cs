@@ -47,6 +47,7 @@ public class StackAnalyzer
         analyzer.ResolveFrameAliases(graph);
         analyzer.CorrectOffsets(graph);
         NativeHelperRecovery.RunEarly(method, graph);
+        InlinedIsInstRecovery.Run(method, graph);
         InlineMemcpyRecovery.Run(method, graph);
         StackStructRecovery.Run(method, graph);
         ReplaceStackWithRegisters(method);
