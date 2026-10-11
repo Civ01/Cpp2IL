@@ -118,7 +118,7 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
             if (GetOrCreateKeyFunctionAddresses().IsKeyFunctionAddress(a) || Utils.NativeHelpers.Classify(this, a) != Utils.NativeHelperKind.Unknown)
                 return null;
 
-            return Utils.ManagedCloneIndex.For(this).Lookup(a);
+            return Utils.ManagedCloneIndex.For(this).Lookup(a) ?? Utils.KnownNativeFunctions.Lookup(this, a);
         });
 
         return methods is { Count: > 0 };
