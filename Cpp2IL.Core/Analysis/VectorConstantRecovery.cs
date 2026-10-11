@@ -34,11 +34,19 @@ public static class VectorConstantRecovery
             if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable destination, MemoryOperand { Base: null, Index: null, Size: 16 } constant] }
                 && Classify(app, (ulong)constant.Addend) is { Kind: not ConstantKind.None } classified)
                 constants[destination] = classified;
+            else if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable literalDestination, FloatLiteral or DoubleLiteral] } literalMove
+                     && ConstantOfLiteral(literalMove.Operands[1]) is { } literalKind)
+                constants[literalDestination] = literalKind;
         }
 
         (ConstantKind Kind, float FirstLane)? ConstantOf(IOperand operand) => operand switch
         {
             LocalVariable local when constants.TryGetValue(local, out var known) => known,
+            // a mask whose low lane was already split off into a literal
+            FloatLiteral { Value: var single } when BitConverter.SingleToInt32Bits(single) == unchecked((int)0x80000000) => (ConstantKind.SignSingle, 0),
+            FloatLiteral { Value: var single } when BitConverter.SingleToInt32Bits(single) == 0x7FFFFFFF => (ConstantKind.AbsSingle, 0),
+            DoubleLiteral { Value: var @double } when BitConverter.DoubleToInt64Bits(@double) == long.MinValue => (ConstantKind.SignDouble, 0),
+            DoubleLiteral { Value: var @double } when BitConverter.DoubleToInt64Bits(@double) == long.MaxValue => (ConstantKind.AbsDouble, 0),
             MemoryOperand { Base: null, Index: null, Size: 16 } memory when Classify(app, (ulong)memory.Addend) is { Kind: not ConstantKind.None } inline => inline,
             _ => null
         };
@@ -96,6 +104,15 @@ public static class VectorConstantRecovery
                 instruction.SetOperand(1, new FloatLiteral(known.FirstLane));
         }
     }
+
+    private static (ConstantKind Kind, float FirstLane)? ConstantOfLiteral(IOperand literal) => literal switch
+    {
+        FloatLiteral { Value: var single } when BitConverter.SingleToInt32Bits(single) == unchecked((int)0x80000000) => (ConstantKind.SignSingle, 0),
+        FloatLiteral { Value: var single } when BitConverter.SingleToInt32Bits(single) == 0x7FFFFFFF => (ConstantKind.AbsSingle, 0),
+        DoubleLiteral { Value: var @double } when BitConverter.DoubleToInt64Bits(@double) == long.MinValue => (ConstantKind.SignDouble, 0),
+        DoubleLiteral { Value: var @double } when BitConverter.DoubleToInt64Bits(@double) == long.MaxValue => (ConstantKind.AbsDouble, 0),
+        _ => null
+    };
 
     private static (ConstantKind Kind, float FirstLane) Classify(ApplicationAnalysisContext app, ulong address)
     {

@@ -51,6 +51,52 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         }
     }
 
+    // The x86 instructions of the method being lifted so far, for looking back from a jump table dispatch
+    [ThreadStatic] private static List<Instruction>? _recent;
+
+    // jmp rcx after mov ecx,[rdx+rax*4+table] / add rcx,rdx: the index register and the case targets, read from the table
+    private static (Register Index, List<ulong> Targets)? FindJumpTable(Instruction jump, MethodAnalysisContext context)
+    {
+        const ulong imageBase = 0x180000000;
+        if (_recent is not { Count: > 1 })
+            return null;
+
+        var window = _recent.Skip(Math.Max(0, _recent.Count - 10)).ToList();
+        var load = window.LastOrDefault(i => i is { Mnemonic: Mnemonic.Mov or Mnemonic.Movsxd, Op1Kind: OpKind.Memory, MemoryIndexScale: 4 }
+                                             && i.MemoryIndex != Register.None && i.MemoryBase != Register.None);
+        if (load.Mnemonic == Mnemonic.INVALID || load.Code == Code.INVALID)
+            return null;
+
+        var table = imageBase + (uint)load.MemoryDisplacement32;
+        var index = load.MemoryIndex;
+
+        // the bound check before it gives the entry count
+        var count = 0;
+        var bound = _recent.LastOrDefault(i => i is { Mnemonic: Mnemonic.Cmp, Op0Kind: OpKind.Register } && i.Op1Kind is OpKind.Immediate8 or OpKind.Immediate32 or OpKind.Immediate8to32 or OpKind.Immediate8to64 or OpKind.Immediate32to64
+                                               && i.Op0Register.GetFullRegister() == index.GetFullRegister() && i.IP < load.IP && load.IP - i.IP < 64);
+        if (bound.Code != Code.INVALID)
+            count = (int)bound.GetImmediate(1) + 1;
+
+        if (count is <= 0 or > 512 || !context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var raw))
+            return null;
+
+        var content = context.AppContext.Binary.GetRawBinaryContent();
+        var start = context.UnderlyingPointer;
+        var end = context.AppContext.GetAddressOfNextFunctionStart(start);
+        var targets = new List<ulong>();
+        for (var k = 0; k < count; k++)
+        {
+            if (raw + 4 * k + 4 > content.Length)
+                return null;
+            var target = imageBase + BitConverter.ToUInt32(content.Slice((int)raw + 4 * k, 4).ToArray(), 0);
+            if (target < start || end != 0 && target >= end)
+                return null;
+            targets.Add(target);
+        }
+
+        return (index.GetFullRegister(), targets);
+    }
+
     private static bool IsScalarSingle(Mnemonic mnemonic) => mnemonic is Mnemonic.Addss or Mnemonic.Subss or Mnemonic.Mulss or Mnemonic.Divss
         or Mnemonic.Minss or Mnemonic.Maxss or Mnemonic.Sqrtss or Mnemonic.Comiss or Mnemonic.Ucomiss or Mnemonic.Cvtss2sd or Mnemonic.Cvttss2si
         or Mnemonic.Cvtss2si or Mnemonic.Movss or Mnemonic.Roundss or Mnemonic.Rcpss or Mnemonic.Rsqrtss;
@@ -60,8 +106,10 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         var instructions = new List<ISIL.Instruction>();
         var addresses = new List<ulong>();
 
+        _recent = [];
         foreach (var instruction in X86Utils.Iterate(context))
         {
+            _recent.Add(instruction);
             var before = instructions.Count;
             ConvertInstructionStatement(instruction, instructions, addresses, context);
 
@@ -1029,6 +1077,21 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     // A switch's jump table dispatch (jmp to an address read out of a table indexed by the case) stays a jump
                     var isJumpTable = instructions.Skip(Math.Max(0, instructions.Count - 8))
                         .Any(i => i.Operands.Any(o => o is ISIL.MemoryOperand { Index: not null, Scale: 4 }));
+
+                    // a switch: compare the index against each case in turn
+                    if (isJumpTable && context != null && FindJumpTable(instruction, context) is { } jumpTable)
+                    {
+                        var indexRegister = new ISIL.Register(null, X86Utils.GetRegisterName(jumpTable.Index));
+                        for (var k = 0; k < jumpTable.Targets.Count - 1; k++)
+                        {
+                            var caseFlag = new ISIL.Register(null, "TEMP");
+                            Add(instruction.IP, ISIL.OpCode.CheckEqual, caseFlag, indexRegister, Imm(k));
+                            Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTable.Targets[k]), caseFlag);
+                        }
+
+                        Add(instruction.IP, ISIL.OpCode.Jump, Imm(jumpTable.Targets[^1]));
+                        break;
+                    }
 
                     if (isJumpTable || context == null)
                     {
