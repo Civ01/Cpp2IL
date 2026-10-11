@@ -25,6 +25,9 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class InlineMemcpyRecovery
 {
+    /// <summary>Debugging aid: receives a reason whenever a candidate loop is rejected.</summary>
+    public static System.Action<string>? Debug;
+
     private static readonly HashSet<string> FlagRegisters = ["CF", "OF", "SF", "ZF", "PF", "TEMP", "TEMP1", "TEMP2", "TEMP3", "TEMP4", "TEMP5"];
 
     private static readonly HashSet<string> VolatileRegisters = ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"];
@@ -89,20 +92,27 @@ public static class InlineMemcpyRecovery
 
     public static void Run(MethodAnalysisContext method, ISILControlFlowGraph graph)
     {
-        foreach (var loop in graph.Blocks.ToList())
-            TryCollapseLoop(graph, loop);
+        // Collapsing one loop can make an earlier constant reachable for the next, so go until nothing changes
+        bool collapsed;
+        var rounds = 0;
+        do
+        {
+            collapsed = false;
+            foreach (var loop in graph.Blocks.ToList())
+                collapsed |= TryCollapseLoop(graph, loop);
+        } while (collapsed && ++rounds < 8);
 
         ResolvePointersToStack(graph);
     }
 
-    private static void TryCollapseLoop(ISILControlFlowGraph graph, Block loop)
+    private static bool TryCollapseLoop(ISILControlFlowGraph graph, Block loop)
     {
         if (!loop.Successors.Contains(loop) || loop.Instructions.Count < 3)
-            return;
+            return false;
 
         var jump = loop.Instructions[^1];
         if (jump.OpCode != OpCode.ConditionalJump)
-            return;
+            return false;
 
         var jumpsToSelf = jump.Operands[0] switch
         {
@@ -112,7 +122,7 @@ public static class InlineMemcpyRecovery
         };
 
         if (!jumpsToSelf)
-            return;
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 1"); return false; }
 
         // Body: chunk copies, pointer increments, one counter decrement and its flag computation
         var body = new CopyParse();
@@ -138,45 +148,69 @@ public static class InlineMemcpyRecovery
                     continue;
             }
 
-            return;
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 2"); return false; }
         }
 
         if (counter == null || !body.IsContiguousCopy(out var source, out var destination, out var stride))
-            return;
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 3"); return false; }
 
         if (body.DisplacementOf(source) != stride || body.DisplacementOf(destination) != stride)
-            return;
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 4"); return false; }
 
         // Exactly one way in (the preheader) and one way out (straight into the tail)
         var preheaders = loop.Predecessors.Where(p => p != loop).Distinct().ToList();
         var exits = loop.Successors.Where(s => s != loop).Distinct().ToList();
         if (preheaders is not [{ } preheader] || exits is not [{ } tail] || tail.Predecessors.Distinct().Count() != 1)
-            return;
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 5"); return false; }
 
         if (FindConstant(preheader, counter) is not { } iterations || iterations <= 0)
-            return;
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 6"); return false; }
 
-        // The tail carries on with the same pointers, from where the loop left them
+        // The tail carries on with the same pointers, from where the loop left them. The compiler interleaves
+        // unrelated setup for whatever comes next into it, which is fine as long as it stays clear of the copy.
         var rest = new CopyParse();
         var consumed = new List<Instruction>();
+        var sourceAlive = true;
         var tailEnd = 0;
 
         for (; tailEnd < tail.Instructions.Count; tailEnd++)
         {
             var instruction = tail.Instructions[tailEnd];
 
-            if (rest.TryConsumeCopy(instruction))
+            var isSourceLoad = instruction is { OpCode: OpCode.Move, Operands: [Register, MemoryOperand { Base: Register { } loadBase }] } && loadBase.Name == source;
+            var isDestinationStore = instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: Register { } storeBase }, Register] } && storeBase.Name == destination;
+
+            if ((isSourceLoad && sourceAlive || isDestinationStore) && rest.TryConsumeCopy(instruction))
             {
                 consumed.Add(instruction);
                 continue;
             }
 
-            // Unrelated setup for whatever comes next can be interleaved with the tail, as long as it leaves the pointers alone
-            if (instruction.IsCall || instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return or OpCode.IndirectCall or OpCode.IndirectJump)
+            if (isSourceLoad || isDestinationStore)
                 break;
 
-            if (Touches(instruction, source) || Touches(instruction, destination) || instruction.Operands.Any(o => o is MemoryOperand or StackOffset))
+            if (instruction.IsCall || instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return or OpCode.IndirectCall or OpCode.IndirectJump or OpCode.Nop)
                 break;
+
+            // Something else touching the destination pointer, or writing memory, ends the tail
+            if (Touches(instruction, destination) || instruction.Operands.Count > 0 && instruction.Operands[0] is MemoryOperand or StackOffset)
+                break;
+
+            // Reading the source pointer other than to copy from it ends it too
+            if (instruction.Sources.Any(o => o is Register r && r.Name == source || o is MemoryOperand { Base: Register { } b } && b.Name == source))
+                break;
+
+            // Clobbering a chunk that's been loaded but not yet stored would lose it
+            if (instruction.Destination is Register written)
+            {
+                if (rest.Loaded.ContainsKey(written.Name) && !rest.Pairs.Any(p => ReferenceEquals(p.Load, rest.LoadInstructions[written.Name])))
+                    break;
+
+                if (written.Name == source)
+                    sourceAlive = false;
+
+                rest.Loaded.Remove(written.Name);
+            }
         }
 
         // Only keep tail chunks that were actually stored (a dangling load isn't part of the copy)
@@ -184,16 +218,16 @@ public static class InlineMemcpyRecovery
         if (rest.Pairs.Count > 0)
         {
             if (!rest.IsContiguousCopy(out var tailSource, out var tailDestination, out remainder) || tailSource != source || tailDestination != destination)
-                return;
+                { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 7"); return false; }
         }
 
         var pairedInstructions = rest.Pairs.SelectMany(p => new[] { p.Load, p.Store }).ToHashSet();
         if (consumed.Any(c => !pairedInstructions.Contains(c)))
-            return; // a load that wasn't stored, can't reason about it
+            return false; // a load that was not stored, cannot reason about it
 
         // After the copy the advanced pointers must be dead
-        if (!DeadAfter(tail, tailEnd, source) || !DeadAfter(tail, tailEnd, destination))
-            return;
+        if (sourceAlive && !DeadAfter(tail, tailEnd, source) || !DeadAfter(tail, tailEnd, destination))
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 8"); return false; }
 
         var total = (int)(iterations * stride + remainder);
 
@@ -212,6 +246,8 @@ public static class InlineMemcpyRecovery
             instruction.OpCode = OpCode.Nop;
             instruction.SetOperands();
         }
+
+        return true;
     }
 
     private static bool IsFlagInput(IOperand operand, string? counter) => operand switch
@@ -233,15 +269,17 @@ public static class InlineMemcpyRecovery
 
     // The value a register holds at the end of the block, if it's (a copy of) a constant set in this block or, failing
     // that, in the chain of single predecessors leading to it
-    private static long? FindConstant(Block block, string register)
+    private static long? FindConstant(Block block, string register) => FindConstant(block, block.Instructions.Count, register, 0);
+
+    private static long? FindConstant(Block block, int before, string register, int depth)
     {
-        for (var depth = 0; depth < 8; depth++)
+        while (depth++ < 16)
         {
-            for (var i = block.Instructions.Count - 1; i >= 0; i--)
+            for (var i = before - 1; i >= 0; i--)
             {
                 var instruction = block.Instructions[i];
 
-                if (instruction.IsCall && VolatileRegisters.Contains(register))
+                if ((instruction.IsCall || instruction.OpCode == OpCode.IndirectCall) && VolatileRegisters.Contains(register))
                     return null;
 
                 if (instruction.Destination is not Register written || written.Name != register)
@@ -250,7 +288,7 @@ public static class InlineMemcpyRecovery
                 return instruction switch
                 {
                     { OpCode: OpCode.Move, Operands: [_, Immediate value] } => value.Value,
-                    { OpCode: OpCode.Move, Operands: [_, Register copied] } => FindConstantBefore(block, i, copied.Name),
+                    { OpCode: OpCode.Move, Operands: [_, Register copied] } => FindConstant(block, i, copied.Name, depth),
                     _ => null
                 };
             }
@@ -260,20 +298,7 @@ public static class InlineMemcpyRecovery
                 return null;
 
             block = only;
-        }
-
-        return null;
-    }
-
-    private static long? FindConstantBefore(Block block, int index, string register)
-    {
-        for (var i = index - 1; i >= 0; i--)
-        {
-            var instruction = block.Instructions[i];
-            if (instruction.Destination is not Register written || written.Name != register)
-                continue;
-
-            return instruction is { OpCode: OpCode.Move, Operands: [_, Immediate value] } ? value.Value : null;
+            before = block.Instructions.Count;
         }
 
         return null;
@@ -305,25 +330,67 @@ public static class InlineMemcpyRecovery
             _ => false
         });
 
-    // Is the register overwritten before it's next read, from the given point of the block onwards?
+    // Is the register overwritten (or clobbered by a call) before it's next read, on every path from the given point?
     private static bool DeadAfter(Block block, int index, string register)
     {
-        for (var i = index; i < block.Instructions.Count; i++)
+        var visited = new HashSet<Block>();
+        var pending = new Queue<(Block Block, int From)>();
+        pending.Enqueue((block, index));
+
+        while (pending.Count > 0)
         {
-            var instruction = block.Instructions[i];
+            var (current, from) = pending.Dequeue();
+            var pathEnded = false;
 
-            if (instruction.Sources.Any(s => s is Register r && r.Name == register)
-                || instruction.Operands.Any(o => o is MemoryOperand m && (m.Base is Register { Name: var b } && b == register || m.Index is Register { Name: var x } && x == register)))
-                return false;
+            for (var i = from; i < current.Instructions.Count && !pathEnded; i++)
+            {
+                var instruction = current.Instructions[i];
 
-            if (instruction.Destination is Register written && written.Name == register)
-                return true;
+                // A call to something unmanaged lists every argument register, used or not. Nothing sane hands a
+                // copy loop's leftover pointer to one, so take it as clobbering rather than reading them.
+                if (instruction.IsCall && instruction.Operands[0] is Immediate && instruction.Operands.Count >= (instruction.OpCode == OpCode.CallVoid ? 1 : 2) + 8)
+                {
+                    if (VolatileRegisters.Contains(register))
+                    {
+                        pathEnded = true;
+                        continue;
+                    }
+                }
 
-            if (instruction.IsCall)
-                return VolatileRegisters.Contains(register) && !instruction.Operands.Skip(1).Any(o => o is Register r && r.Name == register);
+                if (instruction.Sources.Any(s => s is Register r && r.Name == register)
+                    || instruction.Operands.Any(o => o is MemoryOperand m && (m.Base is Register { Name: var b } && b == register || m.Index is Register { Name: var x } && x == register)))
+                    return false;
+
+                if (instruction.Destination is Register written && written.Name == register)
+                    pathEnded = true;
+                else if (instruction.IsCall || instruction.OpCode == OpCode.IndirectCall)
+                {
+                    if (!VolatileRegisters.Contains(register))
+                        continue;
+
+                    pathEnded = true;
+                }
+                else if (instruction.OpCode == OpCode.Return)
+                    pathEnded = true; // Return's value operand was checked as a read above
+            }
+
+            if (pathEnded)
+                continue;
+
+            foreach (var successor in current.Successors)
+            {
+                if (successor.BlockType == BlockType.Exit)
+                    continue;
+
+                if (visited.Add(successor))
+                    pending.Enqueue((successor, 0));
+            }
+
+            if (visited.Count > 256)
+                return false; // give up rather than walk a huge method
         }
 
-        return false;
+        return true;
     }
 
     /// <summary>
