@@ -249,6 +249,37 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.Movsd: // scalar double
                 Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, instruction.Mnemonic == Mnemonic.Movss, context));
                 break;
+            // Conversions between float, double and integers. The conversion itself is implied by the types of the
+            // source and destination, which the IL generator reconciles.
+            case Mnemonic.Cvtss2sd:
+            case Mnemonic.Cvttss2si:
+            case Mnemonic.Cvtss2si:
+                Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, true, context));
+                break;
+            case Mnemonic.Cvtsd2ss:
+            case Mnemonic.Cvtsd2si:
+                Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
+            case Mnemonic.Cvtsi2ss:
+            case Mnemonic.Cvtsi2sd:
+                Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                break;
+            case Mnemonic.Sqrtss:
+            case Mnemonic.Sqrtsd:
+            case Mnemonic.Sqrtpd: // inlined Math.Sqrt works on the low lane only
+            case Mnemonic.Sqrtps:
+            {
+                if (context?.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName("System.Math")?.Methods
+                        .FirstOrDefault(m => m.Name == "Sqrt" && m.Parameters.Count == 1) is { } sqrt)
+                {
+                    var single = instruction.Mnemonic is Mnemonic.Sqrtss or Mnemonic.Sqrtps;
+                    Add(instruction.IP, ISIL.OpCode.Call, sqrt, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, single, context));
+                }
+                else
+                    goto default;
+
+                break;
+            }
             case Mnemonic.Cbw: // AX := sign-extend AL
                 Add(instruction.IP, ISIL.OpCode.Move, new ISIL.Register(null, X86Utils.GetRegisterName(Register.AX)),
                     new ISIL.Register(null, X86Utils.GetRegisterName(Register.AL)));
@@ -465,6 +496,16 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.Modulo, remainder, dividend, divisor);
                     break;
                 }
+            case Mnemonic.Mulsd:
+            case Mnemonic.Divsd:
+                Add(instruction.IP, instruction.Mnemonic == Mnemonic.Mulsd ? ISIL.OpCode.Multiply : ISIL.OpCode.Divide,
+                    ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
+            case Mnemonic.Addsd:
+            case Mnemonic.Subsd:
+                Add(instruction.IP, instruction.Mnemonic == Mnemonic.Addsd ? ISIL.OpCode.Add : ISIL.OpCode.Subtract,
+                    ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
             case Mnemonic.Mulss:
             case Mnemonic.Vmulss:
                 if (instruction.OpCount == 3)
@@ -651,7 +692,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 {
                     AddIndirectCall(instruction);
                 }
-                else if (context.AppContext.MethodsByAddress.TryGetValue(target, out var possibleMethods))
+                else if (context.AppContext.TryGetManagedMethodsAt(target, out var possibleMethods))
                 {
                     if (possibleMethods.Count == 1)
                     {
@@ -736,6 +777,26 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.Ucomiss: // same, but unsigned
                 AddCompareInstruction(instruction.IP, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, true, context));
                 break;
+            case Mnemonic.Comisd:
+            case Mnemonic.Ucomisd:
+                AddCompareInstruction(instruction.IP, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
+            case Mnemonic.Jp: // parity after a float compare means unordered (NaN). Treated as never happening.
+                if (instruction.Op0Kind != OpKind.Register)
+                {
+                    Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(instruction.NearBranchTarget), Imm(0));
+                    break;
+                }
+
+                goto default;
+            case Mnemonic.Jnp:
+                if (instruction.Op0Kind != OpKind.Register)
+                {
+                    Add(instruction.IP, ISIL.OpCode.Jump, Imm(instruction.NearBranchTarget));
+                    break;
+                }
+
+                goto default;
 
             case Mnemonic.Cmove: // move if condition
             case Mnemonic.Cmovne:

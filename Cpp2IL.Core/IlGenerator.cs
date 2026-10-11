@@ -309,6 +309,8 @@ public static class IlGenerator
                 }
 
                 LoadOperand(instruction.Operands[1], method, locals, writeLine, DestinationType(instruction.Operands[0]));
+                if (NumericConversion(SourceType(instruction.Operands[1], context), DestinationType(instruction.Operands[0])) is { } conversion)
+                    instructions.Add(conversion);
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
@@ -884,6 +886,48 @@ public static class IlGenerator
 
     private static bool IsZeroConstant(IOperand operand) => operand is Immediate { Value: 0 };
     
+    private enum NumericKind { None, Int32, Int64, Single, Double }
+
+    private static NumericKind KindOf(TypeAnalysisContext? type) => type?.FullName switch
+    {
+        "System.Single" => NumericKind.Single,
+        "System.Double" => NumericKind.Double,
+        "System.Int64" or "System.UInt64" => NumericKind.Int64,
+        "System.Int32" or "System.UInt32" or "System.Int16" or "System.UInt16" or "System.Byte" or "System.SByte" or "System.Char" => NumericKind.Int32,
+        _ => NumericKind.None
+    };
+
+    private static TypeAnalysisContext? SourceType(IOperand source, MethodAnalysisContext context) => source switch
+    {
+        LocalVariable local => local.Type,
+        FieldReference field => field.Field.FieldType,
+        FloatLiteral => context.AppContext.SystemTypes.SystemSingleType,
+        DoubleLiteral => context.AppContext.SystemTypes.SystemDoubleType,
+        Immediate { Value: >= int.MinValue and <= int.MaxValue } => context.AppContext.SystemTypes.SystemInt32Type,
+        Immediate => context.AppContext.SystemTypes.SystemInt64Type,
+        _ => null
+    };
+
+    // The lifter treats cvtsi2ss/cvtss2sd/etc as moves, and integer zero as the float zero, so a move between
+    // numeric types of different kinds needs the conversion making explicit
+    private static CilOpCode? NumericConversion(TypeAnalysisContext? from, TypeAnalysisContext? to)
+    {
+        var source = KindOf(from);
+        var destination = KindOf(to);
+
+        if (source == NumericKind.None || destination == NumericKind.None || source == destination)
+            return null;
+
+        return destination switch
+        {
+            NumericKind.Single => CilOpCodes.Conv_R4,
+            NumericKind.Double => CilOpCodes.Conv_R8,
+            NumericKind.Int32 when source is NumericKind.Single or NumericKind.Double => CilOpCodes.Conv_I4,
+            NumericKind.Int64 => CilOpCodes.Conv_I8,
+            _ => null
+        };
+    }
+
     private static TypeAnalysisContext? DestinationType(IOperand destination) =>
         destination switch
         {

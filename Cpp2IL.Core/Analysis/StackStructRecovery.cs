@@ -63,7 +63,7 @@ public static class StackStructRecovery
             if (!call.IsCall || call.Operands.Count == 0 || call.Operands[0] is not Immediate target)
                 continue;
 
-            if (!app.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count == 0)
+            if (!app.TryGetManagedMethodsAt(target.UnsignedValue, out var candidates) || candidates.Count == 0)
                 continue;
 
             var callee = candidates[0];

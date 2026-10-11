@@ -313,7 +313,7 @@ public static class MetadataResolver
             }
 
             //Non-key function call. Try to find a single match
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target, out var targetMethods))
+            if (!method.AppContext.TryGetManagedMethodsAt(target, out var targetMethods))
             {
                 // Not a managed method at all. It may be one of the runtime helpers built around an exception
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
@@ -383,7 +383,7 @@ public static class MetadataResolver
             if (instruction.Operands[0] is not Immediate target)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+            if (!method.AppContext.TryGetManagedMethodsAt(target.UnsignedValue, out var candidates) || candidates.Count < 2)
                 continue;
 
             // e.g. string.Equals and string.op_Equality, identical params, instance type, and bodies are shared
@@ -446,7 +446,7 @@ public static class MetadataResolver
             if (!instruction.IsCall || instruction.Operands[0] is not Immediate target)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+            if (!method.AppContext.TryGetManagedMethodsAt(target.UnsignedValue, out var candidates) || candidates.Count < 2)
                 continue;
 
             IEnumerable<MethodAnalysisContext> pool = candidates;
@@ -573,7 +573,7 @@ public static class MetadataResolver
             if (!instruction.IsCall || instruction.Operands[0] is not Immediate callTarget)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(callTarget.UnsignedValue, out var candidates))
+            if (!method.AppContext.TryGetManagedMethodsAt(callTarget.UnsignedValue, out var candidates))
                 continue;
 
             if (GetReceiver(instruction) is not { } receiver || AllocatedType(receiver, definitions) is not { } allocatedType)
@@ -657,7 +657,7 @@ public static class MetadataResolver
                 //No MethodInfo to work with
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
+            if (!method.AppContext.TryGetManagedMethodsAt(target.UnsignedValue, out var candidates))
             {
                 // Some shared generic bodies aren't in the address map at all (todo investigate?).
                 // Il2cpp still passes the concrete MethodInfo as the hidden final parameter, so we can use a methodof there if we have one.

@@ -95,6 +95,36 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
     public readonly ConcurrentDictionary<ulong, bool> NoReturnByAddress = new();
 
     /// <summary>
+    /// Lazily-built index of managed method bodies, for recognising unregistered copies of them. See <see cref="Utils.ManagedCloneIndex"/>.
+    /// </summary>
+    public Utils.ManagedCloneIndex? CloneIndex;
+
+    private readonly ConcurrentDictionary<ulong, List<MethodAnalysisContext>?> _cloneLookups = new();
+
+    /// <summary>
+    /// The managed method(s) whose code is at the address: the registered method pointers, or failing that, an
+    /// unregistered copy of a managed method's body, or a native function a managed method merely jumps to.
+    /// </summary>
+    public bool TryGetManagedMethodsAt(ulong address, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out List<MethodAnalysisContext>? methods)
+    {
+        if (MethodsByAddress.TryGetValue(address, out methods))
+            return true;
+
+        if (address == 0 || InstructionSet is not InstructionSets.X86InstructionSet || Binary.PointerSizeBytes != 8)
+            return false;
+
+        methods = _cloneLookups.GetOrAdd(address, a =>
+        {
+            if (GetOrCreateKeyFunctionAddresses().IsKeyFunctionAddress(a) || Utils.NativeHelpers.Classify(this, a) != Utils.NativeHelperKind.Unknown)
+                return null;
+
+            return Utils.ManagedCloneIndex.For(this).Lookup(a);
+        });
+
+        return methods is { Count: > 0 };
+    }
+
+    /// <summary>
     /// A dictionary of all the generic method variants to their corresponding analysis contexts.
     /// </summary>
     public readonly Dictionary<Cpp2IlMethodRef, ConcreteGenericMethodAnalysisContext> ConcreteGenericMethodsByRef = new();
