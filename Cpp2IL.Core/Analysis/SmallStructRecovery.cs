@@ -39,6 +39,34 @@ public static class SmallStructRecovery
                 definitions[defined] = instruction;
 
         var changed = false;
+        // first the other way (before pairs are rebuilt, which retypes the halves' sources): movq xmm0,rax with rax a Vector2 is its x, and the lane above it its y
+        foreach (var block in graph.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var instruction = block.Instructions[i];
+                if (!instruction.ReadsLowHalf && !instruction.ReadsHighHalf
+                    || instruction is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                    continue;
+
+                if (source.Type is { } sourceType && Halves(sourceType, pointerSize) is var (first, second))
+                {
+                    var half = instruction.ReadsHighHalf ? second : first;
+                    instruction.SetOperand(1, FieldOf(half, source));
+                    // a copy typed as the whole struct before it was known to be half of it
+                    if (instruction.Operands[0] is LocalVariable { } halfCopy && halfCopy.Type == sourceType)
+                        halfCopy.Type = half[^1].FieldType;
+                    changed = true;
+                }
+                else if (instruction.ReadsHighHalf)
+                {
+                    // as before: the high half of something we can't take apart
+                    instruction.OpCode = OpCode.NotImplemented;
+                    instruction.SetOperands(new StringLiteral("vector lane of an unknown value"));
+                }
+            }
+        }
+
         foreach (var block in graph.Blocks)
         {
             for (var i = 0; i < block.Instructions.Count; i++)
@@ -63,6 +91,18 @@ public static class SmallStructRecovery
 
                 var highMove = block.Instructions[highIndex];
                 var high = highMove.Operands[1];
+
+                // the two halves of one struct of that type, taken apart and put back together: that struct
+                if (WholeOf(low, first, definitions) is { } lowOwner && ReferenceEquals(lowOwner, WholeOf(high, second, definitions))
+                    && lowOwner.Type == structType)
+                {
+                    highMove.OpCode = OpCode.Nop;
+                    highMove.SetOperands();
+                    lowMove.SetOperand(1, lowOwner);
+                    packed.Type = structType;
+                    changed = true;
+                    continue;
+                }
 
                 // the halves may have been typed backwards from the register as a whole before it was known to be a pair
                 FixHalfType(low, first[^1].FieldType, definitions);
@@ -95,29 +135,9 @@ public static class SmallStructRecovery
             }
         }
 
-        // the other way: movq xmm0,rax with rax a Vector2 is its x, and the lane above it its y
-        foreach (var block in graph.Blocks)
-        {
-            for (var i = 0; i < block.Instructions.Count; i++)
-            {
-                var instruction = block.Instructions[i];
-                if (!instruction.ReadsLowHalf && !instruction.ReadsHighHalf
-                    || instruction is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
-                    continue;
-
-                if (source.Type is { } sourceType && Halves(sourceType, pointerSize) is var (first, second))
-                {
-                    instruction.SetOperand(1, FieldOf(instruction.ReadsHighHalf ? second : first, source));
-                    changed = true;
-                }
-                else if (instruction.ReadsHighHalf)
-                {
-                    // as before: the high half of something we can't take apart
-                    instruction.OpCode = OpCode.NotImplemented;
-                    instruction.SetOperands(new StringLiteral("vector lane of an unknown value"));
-                }
-            }
-        }
+        // arithmetic on the halves was typed as the whole struct while the halves were still the struct: it's a float
+        if (changed)
+            RetypeHalfArithmetic(graph, pointerSize);
 
         // whatever wasn't needed is free to go now
         foreach (var instruction in graph.Instructions)
@@ -125,6 +145,59 @@ public static class SmallStructRecovery
         DeadCodeEliminator.Run(graph);
 
         return changed;
+    }
+
+    // x where it is (a copy of) owner.field for the field chain given
+    private static LocalVariable? WholeOf(IOperand half, List<FieldAnalysisContext> chain, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        for (var hops = 0; hops < 4; hops++)
+        {
+            switch (half)
+            {
+                case FieldReference { Local: { } owner } field when field.Field == chain[^1] && field.Path.Count == chain.Count - 1:
+                    return owner;
+                case LocalVariable local when definitions.TryGetValue(local, out var definition) && definition is { OpCode: OpCode.Move, Operands: [_, var from] }:
+                    half = from;
+                    continue;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    private static void RetypeHalfArithmetic(Graphs.ISILControlFlowGraph graph, int pointerSize)
+    {
+        static TypeAnalysisContext? TypeOf(IOperand operand) => operand switch
+        {
+            LocalVariable local => local.Type,
+            FieldReference field => field.Field.FieldType,
+            _ => null,
+        };
+
+        for (var round = 0; round < 4; round++)
+        {
+            var any = false;
+            foreach (var instruction in graph.Instructions)
+            {
+                if (instruction.OpCode is not (OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Move or OpCode.Phi or OpCode.Negate)
+                    || instruction.Destination is not LocalVariable { Type: { } wholeType } destination
+                    || Halves(wholeType, pointerSize) == null)
+                    continue;
+
+                var sources = instruction.Operands.Skip(1).ToList();
+                var types = sources.Select(TypeOf).ToList();
+                var known = types.Where(t => t != null).ToList();
+                if (known.Count == 0 || known.Any(t => t!.FullName != "System.Single")
+                    || sources.Any(o => o is not (LocalVariable or FieldReference or FloatLiteral)))
+                    continue;
+
+                destination.Type = known[0];
+                any = true;
+            }
+
+            if (!any)
+                break;
+        }
     }
 
     private static void FixHalfType(IOperand half, TypeAnalysisContext fieldType, Dictionary<LocalVariable, Instruction> definitions)

@@ -69,6 +69,8 @@ public static class VectorLaneRecovery
         if (method.AppContext.Binary.PointerSizeBytes != 8 || method.AppContext.InstructionSet is not InstructionSets.X86InstructionSet)
             return;
 
+        SplitPackedSpills(graph);
+
         if (!graph.Blocks.Any(b => b.Instructions.Any(i => i.OpCode == OpCode.VectorShuffle)))
             return;
 
@@ -396,6 +398,66 @@ public static class VectorLaneRecovery
         }
 
         return merged;
+    }
+
+    // An 8 byte general register spilled to the stack and only ever read back as two 4 byte halves is a small struct
+    // (a Vector2 argument, say) being taken apart: the halves are stored separately so each read finds its own,
+    // and SmallStructRecovery names them once the register's type is known
+    private static void SplitPackedSpills(ISILControlFlowGraph graph)
+    {
+        var instructions = graph.Instructions.ToList();
+        foreach (var block in graph.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                if (block.Instructions[i] is not { OpCode: OpCode.Move, Operands: [StackOffset { Size: 8 } slot, Register { } value] } store
+                    || value.Name.StartsWith("xmm", StringComparison.Ordinal) || value.Name.EndsWith(HighSuffix, StringComparison.Ordinal))
+                    continue;
+
+                var lowReads = 0;
+                var highReads = 0;
+                var usable = true;
+                foreach (var other in instructions)
+                {
+                    if (ReferenceEquals(other, store))
+                        continue;
+
+                    foreach (var operand in other.Operands)
+                    {
+                        switch (operand)
+                        {
+                            case StackOffset access when access.Offset >= slot.Offset && access.Offset < slot.Offset + 8:
+                                if (other.Destination is StackOffset written && written.Offset == access.Offset)
+                                    usable = false; // written again
+                                else if (access.Size == 4 && access.Offset == slot.Offset)
+                                    lowReads++;
+                                else if (access.Size == 4 && access.Offset == slot.Offset + 4)
+                                    highReads++;
+                                else
+                                    usable = false;
+                                break;
+                            case StackOffset wide when wide.Offset < slot.Offset && wide.Offset + Math.Max(wide.Size, 1) > slot.Offset:
+                                usable = false;
+                                break;
+                            case AddressOf { Target: StackOffset addressed } when addressed.Offset <= slot.Offset + 8 && addressed.Offset > slot.Offset - 64:
+                                usable = false; // part of something addressed as a whole
+                                break;
+                        }
+                    }
+
+                    if (!usable)
+                        break;
+                }
+
+                if (!usable || lowReads == 0 || highReads == 0)
+                    continue;
+
+                store.SetOperand(0, new StackOffset(slot.Offset, 4));
+                store.ReadsLowHalf = true;
+                block.Instructions.Insert(i + 1, new Instruction(store.Index, OpCode.Move, new StackOffset(slot.Offset + 4, 4), value) { ReadsHighHalf = true });
+                i++;
+            }
+        }
     }
 
     private static Register Materialize(Context context, Lane lane)
