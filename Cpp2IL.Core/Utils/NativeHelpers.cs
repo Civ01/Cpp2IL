@@ -133,9 +133,23 @@ public static class NativeHelpers
             && !body.Take(firstReturn).Any(i => i.Op0Register == Register.RBX && i.Mnemonic is not (Mnemonic.Push or Mnemonic.Pop) && !(i is { Mnemonic: Mnemonic.Mov, Op1Register: Register.RCX })))
             return NativeHelperKind.ReturnsFirstArgument;
 
-        // Virtual invokers (slot, obj, args...): index obj->klass->vtable by the slot in cx, then call through it
+        // Static class init on first use: cmp [klass+cctor_finished],0 / je init / ret. Only runs the static
+        // constructor, which says nothing about what the code means
+        if (body.Count >= 3
+            && first is { Mnemonic: Mnemonic.Cmp, Op0Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryIndex: Register.None, MemoryDisplacement64: 0xE0, Op1Kind: OpKind.Immediate8to32 or OpKind.Immediate32 or OpKind.Immediate8 }
+            && body[1] is { Mnemonic: Mnemonic.Je, Op0Kind: OpKind.NearBranch64 }
+            && body[2].Mnemonic == Mnemonic.Ret)
+            return NativeHelperKind.Empty;
+
+        // Virtual invokers (slot, obj, args...): index obj->klass->vtable by the slot in cx, then call through it.
+        // obj may first be moved out of rdx (mov r9,rdx / ... / mov rax,[r9])
+        var objectRegisters = new System.Collections.Generic.HashSet<Register> { Register.RDX };
+        foreach (var copy in body.Take(6))
+            if (copy is { Mnemonic: Mnemonic.Mov, Op0Kind: OpKind.Register, Op1Kind: OpKind.Register, Op1Register: Register.RDX })
+                objectRegisters.Add(copy.Op0Register);
+
         if (body.Take(12).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })
-            && body.Take(12).Any(i => i.Op1Kind == OpKind.Memory && i.MemoryBase == Register.RDX && i.MemoryIndex == Register.None && i.MemoryDisplacement64 == 0)
+            && body.Take(12).Any(i => i.Op1Kind == OpKind.Memory && objectRegisters.Contains(i.MemoryBase) && i.MemoryIndex == Register.None && i.MemoryDisplacement64 == 0)
             && body.Any(i => (i.Op0Kind == OpKind.Memory || i.Op1Kind == OpKind.Memory) && i.MemoryDisplacement64 is 0x138 or 0x140)
             && !body.Take(16).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Memory, MemoryDisplacement64: 0x12E }))
             return NativeHelperKind.VirtualInvoker;
