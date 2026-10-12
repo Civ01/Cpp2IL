@@ -751,6 +751,14 @@ public static class IlGenerator
             return;
         }
 
+        // Likewise a zeroed struct (a null float? passed in a register, a cleared Color) is default(T), not a number
+        if (expectedType is { IsValueType: true, IsEnumType: false } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+            && !MetadataResolver.IsPrimitiveOrEnum(expectedType) && IsZeroConstant(operand))
+        {
+            LoadOperand(new DefaultValue(expectedType), method, locals, writeLine);
+            return;
+        }
+
         switch (operand)
         {
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
