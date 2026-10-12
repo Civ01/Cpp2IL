@@ -22,6 +22,9 @@ public static class VectorLaneRecovery
 {
     private const int Zero = 8;
 
+    /// <summary>Suffix of the register carrying the high half of a GPR filled from two packed floats.</summary>
+    public const string HighSuffix = "_hi";
+
     // The scalar some lane holds, made available as a temporary register the first time it's needed
     private sealed class Lane
     {
@@ -31,6 +34,10 @@ public static class VectorLaneRecovery
         public required IOperand Value;
         public WideLoad? Load;
         public Register? Materialized;
+        public bool HighHalf; // the high 4 bytes of the general register in Value
+        public List<(Block Predecessor, Lane Source)>? MergeOf; // at a join: whichever lane each predecessor had
+        public bool OfUnsplitLoads; // a join of lanes of different wide loads nobody has taken apart yet
+        public bool WholeRegisterZero; // an upper lane of a register zeroed as a whole (xorps x,x), so the low lane is 0 too
     }
 
     // A wide load into an xmm register, which might yet turn out to be packed floats
@@ -38,6 +45,7 @@ public static class VectorLaneRecovery
     {
         public required Block Block;
         public required Instruction Instruction;
+        public required IOperand Source; // as loaded, before any split
         public bool Split;
         public readonly List<(Block Block, Instruction Store)> PendingStores = [];
         public readonly Lane?[] Lanes = new Lane?[4];
@@ -63,18 +71,24 @@ public static class VectorLaneRecovery
         if (method.AppContext.Binary.PointerSizeBytes != 8 || method.AppContext.InstructionSet is not InstructionSets.X86InstructionSet)
             return;
 
+        SplitPackedSpills(graph);
+
         if (!graph.Blocks.Any(b => b.Instructions.Any(i => i.OpCode == OpCode.VectorShuffle)))
             return;
 
         var context = new Context(method);
         var endStates = new Dictionary<Block, Dictionary<string, Lane?[]>>();
 
-        foreach (var block in graph.Blocks)
+        // predecessors first (reverse postorder), so lanes reach blocks the list happens to place before their predecessors
+        foreach (var block in ReversePostorder(graph))
         {
-            var singlePredecessor = block.Predecessors.Distinct().ToList() is [{ } only] && endStates.ContainsKey(only) ? only : null;
+            var predecessors = block.Predecessors.Distinct().ToList();
+            var singlePredecessor = predecessors is [{ } only] && endStates.ContainsKey(only) ? only : null;
             var state = singlePredecessor != null
                 ? endStates[singlePredecessor].ToDictionary(kv => kv.Key, kv => (Lane?[])kv.Value.Clone())
-                : new Dictionary<string, Lane?[]>();
+                : predecessors.Count > 1 && predecessors.All(endStates.ContainsKey)
+                    ? Merge(block, predecessors.Select(p => (p, endStates[p])).ToList())
+                    : new Dictionary<string, Lane?[]>();
             if (singlePredecessor == null)
                 context.PendingStackCopies.Clear();
 
@@ -168,7 +182,7 @@ public static class VectorLaneRecovery
             case { OpCode: OpCode.Move, Operands: [var destination, var source] } when IsVector(destination, out var name)
                                                                                      && WideLoadSource(source) is { } wide:
             {
-                var load = new WideLoad { Block = block, Instruction = instruction };
+                var load = new WideLoad { Block = block, Instruction = instruction, Source = source };
                 context.Loads.Add(load);
                 var lanes = new Lane?[4];
                 for (var lane = 1; lane < 4; lane++)
@@ -193,6 +207,37 @@ public static class VectorLaneRecovery
                                                                                      && StoreSize(destination) is 8 or 16 && state.TryGetValue(sourceName, out var stored):
                 StoreLanes(context, block, instruction, destination, stored);
                 return;
+
+            // movq rax,xmm6 taking 8 bytes of a wide load that was never taken apart (a struct's Vector2 field passed on, say):
+            // the same 8 bytes, read where the load was
+            case { OpCode: OpCode.Move, Operands: [Register { Name: var gprName }, var source], ReadsLowDword: false } when !gprName.StartsWith("xmm", StringComparison.Ordinal)
+                                                                                                    && !gprName.EndsWith(HighSuffix, StringComparison.Ordinal)
+                                                                                                    && IsVector(source, out var wholeName)
+                                                                                                    && state.TryGetValue(wholeName, out var whole)
+                                                                                                    && UnsplitPair(whole) is var (pairLoad, pairOffset)
+                                                                                                    && Offset(pairLoad.Source, pairOffset, 8) is { } pairSource:
+            {
+                var copy = new Register(null, $"LANE_{context.Temporaries++}");
+                var loadIndex = pairLoad.Block.Instructions.IndexOf(pairLoad.Instruction);
+                pairLoad.Block.Instructions.Insert(loadIndex + 1, new Instruction(pairLoad.Instruction.Index, OpCode.Move, copy, pairSource));
+                instruction.SetOperand(1, copy);
+                return;
+            }
+
+            // movq rax,xmm1 with two floats packed in it (a Vector2 being returned or passed in a register): the high one
+            // goes along in rax_hi, for whoever turns out to need the pair (SmallStructRecovery)
+            case { OpCode: OpCode.Move, Operands: [Register { Name: var gprName }, var source], ReadsLowDword: false } when !gprName.StartsWith("xmm", StringComparison.Ordinal)
+                                                                                                    && !gprName.EndsWith(HighSuffix, StringComparison.Ordinal)
+                                                                                                    && IsVector(source, out var packedName)
+                                                                                                    && state.TryGetValue(packedName, out var packed)
+                                                                                                    && packed[1] is { } high && high != UnknownLow
+                                                                                                    && high.Load is not { Split: false }:
+            {
+                var highValue = Materialize(context, high);
+                block.Instructions.Insert(block.Instructions.IndexOf(instruction) + 1,
+                    new Instruction(instruction.Index, OpCode.Move, new Register(null, gprName + HighSuffix), highValue) { KeepAlive = true });
+                return;
+            }
         }
 
         if (instruction.IsCall || instruction.OpCode == OpCode.IndirectCall)
@@ -209,11 +254,16 @@ public static class VectorLaneRecovery
             var zeroesUpper = instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Size: 4 } or StackOffset { Size: 4 } or FloatLiteral or Immediate] }
                               || instruction is { OpCode: OpCode.Move, Operands: [_, Register { Name: var fromRegister }] } && !fromRegister.StartsWith("xmm", StringComparison.Ordinal);
             var lanes = new Lane?[4];
+            var wholeZero = instruction is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 } or FloatLiteral { Value: 0 }] };
             if (zeroesUpper)
                 for (var lane = 1; lane < 4; lane++)
-                    lanes[lane] = new Lane { Block = block, Anchor = instruction, Value = new FloatLiteral(0) };
-            if (instruction is { OpCode: OpCode.Move, Operands: [_, Register { Name: var gpr }] } && !gpr.StartsWith("xmm", StringComparison.Ordinal))
-                lanes[1] = null; // movq: the high half of the GPR
+                    lanes[lane] = new Lane { Block = block, Anchor = instruction, Value = new FloatLiteral(0), WholeRegisterZero = wholeZero };
+            if (instruction is { OpCode: OpCode.Move, Operands: [_, Register { Name: var gpr } gprRegister] } && !gpr.StartsWith("xmm", StringComparison.Ordinal))
+            {
+                // movq: the high half of the GPR (what it is - the y of a Vector2, say - is worked out once types are known)
+                lanes[1] = new Lane { Block = block, Anchor = instruction, After = true, Value = gprRegister, HighHalf = true };
+                instruction.ReadsLowHalf = true;
+            }
             state[writtenName] = lanes;
         }
     }
@@ -330,17 +380,172 @@ public static class VectorLaneRecovery
                 context.PendingStackCopies.Remove(offset);
     }
 
+    // A join's lanes: what every predecessor agrees on, or (lazily) a temporary each of them sets
+    private static Dictionary<string, Lane?[]> Merge(Block block, List<(Block Predecessor, Dictionary<string, Lane?[]> State)> incoming)
+    {
+        var merged = new Dictionary<string, Lane?[]>();
+        foreach (var name in incoming[0].State.Keys)
+        {
+            if (!incoming.All(i => i.State.ContainsKey(name)))
+                continue;
+
+            var lanes = new Lane?[4];
+            for (var lane = 1; lane < 4; lane++)
+            {
+                var sources = incoming.Select(i => i.State[name][lane]).ToList();
+                if (sources.Any(source => source == null || source == UnknownLow))
+                    continue;
+
+                if (sources.Distinct().Count() == 1)
+                    lanes[lane] = sources[0];
+                else if (sources.All(source => source!.Load == null && source.MergeOf == null && source.Value is FloatLiteral or Immediate) && sources.Select(source => source!.Value).Distinct().Count() == 1)
+                    lanes[lane] = sources[0]; // the same constant everywhere (a zeroed lane, typically)
+                else
+                    lanes[lane] = new Lane
+                    {
+                        Block = block, Anchor = null!, Value = new FloatLiteral(0),
+                        MergeOf = incoming.Select((i, n) => (i.Predecessor, sources[n]!)).ToList(),
+                        // lanes of wide loads not (yet) known to be floats: if all that happens is a whole copy, it's a copy
+                        OfUnsplitLoads = sources.Any(source => source!.Load is { Split: false }),
+                    };
+            }
+
+            // the low lane is the register itself: SSA joins it
+            merged[name] = lanes;
+        }
+
+        return merged;
+    }
+
+    // An 8 byte general register spilled to the stack and only ever read back as two 4 byte halves is a small struct
+    // (a Vector2 argument, say) being taken apart: the halves are stored separately so each read finds its own,
+    // and SmallStructRecovery names them once the register's type is known
+    private static void SplitPackedSpills(ISILControlFlowGraph graph)
+    {
+        var instructions = graph.Instructions.ToList();
+        foreach (var block in graph.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                if (block.Instructions[i] is not { OpCode: OpCode.Move, Operands: [StackOffset { Size: 8 } slot, Register { } value] } store
+                    || value.Name.StartsWith("xmm", StringComparison.Ordinal) || value.Name.EndsWith(HighSuffix, StringComparison.Ordinal))
+                    continue;
+
+                var lowReads = 0;
+                var highReads = 0;
+                var usable = true;
+                foreach (var other in instructions)
+                {
+                    if (ReferenceEquals(other, store))
+                        continue;
+
+                    foreach (var operand in other.Operands)
+                    {
+                        switch (operand)
+                        {
+                            case StackOffset access when access.Offset >= slot.Offset && access.Offset < slot.Offset + 8:
+                                if (other.Destination is StackOffset written && written.Offset == access.Offset)
+                                    usable = false; // written again
+                                else if (access.Size == 4 && access.Offset == slot.Offset)
+                                    lowReads++;
+                                else if (access.Size == 4 && access.Offset == slot.Offset + 4)
+                                    highReads++;
+                                else
+                                    usable = false;
+                                break;
+                            case StackOffset wide when wide.Offset < slot.Offset && wide.Offset + Math.Max(wide.Size, 1) > slot.Offset:
+                                usable = false;
+                                break;
+                            case AddressOf { Target: StackOffset addressed } when addressed.Offset <= slot.Offset + 8 && addressed.Offset > slot.Offset - 64:
+                                usable = false; // part of something addressed as a whole
+                                break;
+                        }
+                    }
+
+                    if (!usable)
+                        break;
+                }
+
+                if (!usable || lowReads == 0 || highReads == 0)
+                    continue;
+
+                store.SetOperand(0, new StackOffset(slot.Offset, 4));
+                store.ReadsLowHalf = true;
+                block.Instructions.Insert(i + 1, new Instruction(store.Index, OpCode.Move, new StackOffset(slot.Offset + 4, 4), value) { ReadsHighHalf = true });
+                i++;
+            }
+        }
+    }
+
+    // The low 8 bytes of a register being lanes (0, 1) or (2, 3) of one wide load nobody has taken apart yet
+    private static (WideLoad Load, int Offset)? UnsplitPair(Lane?[] lanes)
+    {
+        if (lanes[1] is not { Load: { Split: false } load } high)
+            return null;
+
+        var highIndex = Array.IndexOf(load.Lanes, high);
+        if (highIndex == 1 && lanes[0] == null && load.Lanes.Skip(1).Zip(lanes.Skip(1)).All(pair => ReferenceEquals(pair.First, pair.Second)))
+            return (load, 0); // the register as loaded
+        if (highIndex == 3 && ReferenceEquals(lanes[0], load.Lanes[2]))
+            return (load, 8);
+        return null;
+    }
+
+    private static List<Block> ReversePostorder(ISILControlFlowGraph graph)
+    {
+        var visited = new HashSet<Block>();
+        var postorder = new List<Block>();
+        var stack = new Stack<(Block Block, int Next)>();
+        stack.Push((graph.EntryBlock, 0));
+        visited.Add(graph.EntryBlock);
+        while (stack.Count > 0)
+        {
+            var (block, next) = stack.Pop();
+            if (next < block.Successors.Count)
+            {
+                stack.Push((block, next + 1));
+                var successor = block.Successors[next];
+                if (visited.Add(successor))
+                    stack.Push((successor, 0));
+                continue;
+            }
+            postorder.Add(block);
+        }
+
+        postorder.Reverse();
+        // anything unreachable from the entry keeps its place at the end
+        postorder.AddRange(graph.Blocks.Where(b => !visited.Contains(b)));
+        return postorder;
+    }
+
     private static Register Materialize(Context context, Lane lane)
     {
         if (lane.Materialized is { } done)
             return done;
+
+        if (lane.MergeOf is { } merges)
+        {
+            var joined = new Register(null, $"LANE_{context.Temporaries++}");
+            lane.Materialized = joined;
+            foreach (var (predecessor, source) in merges)
+            {
+                var value = Materialize(context, source);
+                var instructions = predecessor.Instructions;
+                var at = instructions.Count > 0 && instructions[^1].OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return
+                    ? instructions.Count - 1
+                    : instructions.Count;
+                instructions.Insert(at, new Instruction(at > 0 ? instructions[at - 1].Index : 0, OpCode.Move, joined, value));
+            }
+
+            return joined;
+        }
 
         if (lane.Load != null)
             Split(context, lane.Load);
 
         var temporary = new Register(null, $"LANE_{context.Temporaries++}");
         var index = lane.Block.Instructions.IndexOf(lane.Anchor);
-        lane.Block.Instructions.Insert(lane.After ? index + 1 : index, new Instruction(lane.Anchor.Index, OpCode.Move, temporary, lane.Value));
+        lane.Block.Instructions.Insert(lane.After ? index + 1 : index, new Instruction(lane.Anchor.Index, OpCode.Move, temporary, lane.Value) { ReadsHighHalf = lane.HighHalf });
         lane.Materialized = temporary;
         return temporary;
     }
@@ -352,6 +557,14 @@ public static class VectorLaneRecovery
 
         if (Enumerable.Range(1, count - 1).Any(lane => lanes[lane] == null))
             return; // something we can't account for
+
+        // a join of different wide loads, stored whole: a copy, which keeps to whole registers
+        if (Enumerable.Range(1, count - 1).Any(lane => lanes[lane]!.OfUnsplitLoads))
+            return;
+
+        // storing a register zeroed as a whole is zeroing that memory, which is clearer left as one store
+        if (Enumerable.Range(1, count - 1).All(lane => lanes[lane]!.WholeRegisterZero))
+            return;
 
         // only lanes of a load not yet known to be floats: an ordinary copy, unless it turns out otherwise
         var loads = Enumerable.Range(1, count - 1).Select(lane => lanes[lane]!.Load).ToList();
@@ -401,7 +614,7 @@ public static class VectorLaneRecovery
 
             return instruction switch
             {
-                { OpCode: OpCode.Move, Operands: [Register { Name: var to }, _] } when !to.StartsWith("xmm", StringComparison.Ordinal) => 8,
+                { OpCode: OpCode.Move, Operands: [Register { Name: var to }, _], ReadsLowDword: false } when !to.StartsWith("xmm", StringComparison.Ordinal) => 8,
                 { OpCode: OpCode.Move, Operands: [var store, _] } when StoreSize(store) is 8 or 16 => StoreSize(store),
                 _ => 4
             };
@@ -473,7 +686,7 @@ public static class VectorLaneRecovery
             0 when firstLanes != null => firstLanes[0] == UnknownLow ? null : first,
             4 when secondLanes != null => secondLanes[0] == UnknownLow ? null : second,
             _ => SourceLane(low) is { } known
-                ? known.Value is MemoryOperand or StackOffset or FloatLiteral or Immediate && known.Load == null ? known.Value : Materialize(context, known)
+                ? known.Value is MemoryOperand or StackOffset or FloatLiteral or Immediate && known.Load == null && known.MergeOf == null ? known.Value : Materialize(context, known)
                 : null
         };
 

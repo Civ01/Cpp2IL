@@ -347,6 +347,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.Cvttsd2si: // same, but double to integer
             case Mnemonic.Movdqu: // DEST[127:0] := SRC[127:0]
                 Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction is { Mnemonic: Mnemonic.Movd, Op0Kind: OpKind.Register, Op1Kind: OpKind.Register } && instruction.Op0Register.IsGPR32() && instruction.Op1Register.IsXMM())
+                    instructions[^1].ReadsLowDword = true;
                 break;
             case Mnemonic.Movss when instruction.Op0Kind == OpKind.Register && instruction.Op1Kind == OpKind.Register:
                 AddShuffle(4, 1, 2, 3); // merges the low lane only
