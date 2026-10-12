@@ -125,7 +125,7 @@ public static class NativeHelpers
         // back the class it was given
         var firstReturn = body.ToList().FindIndex(i => i.Mnemonic == Mnemonic.Ret);
         if (firstReturn is > 2 and < 12
-            && !body.Take(firstReturn).Any(i => i.Op0Kind == OpKind.Memory && i.MemoryBase is Register.RBX or Register.RCX)
+            && !body.Take(firstReturn).Any(i => i.Op0Kind == OpKind.Memory && i.MemoryBase is Register.RBX or Register.RCX && i.Mnemonic is not (Mnemonic.Cmp or Mnemonic.Test))
             && body.Take(4).Any(i => i is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RBX, Op1Register: Register.RCX })
             && body.Take(firstReturn).Skip(1).Any(i => i.Mnemonic == Mnemonic.Call)
             && body.Take(firstReturn).Reverse().SkipWhile(i => i is { Mnemonic: Mnemonic.Pop } or { Mnemonic: Mnemonic.Add, Op0Register: Register.RSP }).FirstOrDefault()

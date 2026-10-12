@@ -794,6 +794,14 @@ public static class IlGenerator
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
                     break;
                 }
+                // Il2CppClass::stack_slot_size (2022+ full generic sharing): what shared code sizes the storage for a T
+                // with, the size of a value type or of a reference, exactly sizeof(T)
+                if (memory is { Index: null, Addend: 0xFC, Size: 4, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } sized } } }
+                    && sized.AppContext.MetadataVersion >= 29 && sized.AppContext.Binary.PointerSizeBytes == 8)
+                {
+                    instructions.Add(CilOpCodes.Sizeof, sized.ToTypeSignature().ToTypeDefOrRef());
+                    break;
+                }
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);

@@ -92,7 +92,9 @@ public static class RgctxResolver
         if (definition.Definition is not { } typeDefinition)
             return null;
 
-        var typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments ?? [];
+        // an open definition is shared generic code, so its own parameters stand in for the arguments
+        IReadOnlyList<TypeAnalysisContext> typeArguments = (instance as GenericInstanceTypeAnalysisContext)?.GenericArguments
+                                                           ?? (IReadOnlyList<TypeAnalysisContext>)definition.GenericParameters;
 
         return ResolveEntry(typeDefinition.RgctXs, index, typeArguments, [], instance.AppContext);
     }
