@@ -22,48 +22,57 @@ public static class DeadCodeEliminator
 
     public static void Run(ISILControlFlowGraph cfg)
     {
-        // Removing a dead definition can make its operands dead in turn, so iterate to a fixpoint.
-        // This is monotonic (each pass only nops instructions) and therefore always terminates.
-        var changed = true;
-        while (changed)
+        // Mark and sweep rather than use counts: values that only feed each other (a phi and a copy of it around a
+        // loop, left by a register holding unrelated values on different paths) each have a use, but none of them
+        // reaches anything with an effect.
+        var definitions = new Dictionary<LocalVariable, List<Instruction>>();
+        var live = new HashSet<LocalVariable>();
+        var pending = new Stack<LocalVariable>();
+
+        void MarkUses(Instruction instruction)
         {
-            changed = false;
-
-            var useCounts = CountUses(cfg);
-
-            foreach (var block in cfg.Blocks)
-            {
-                foreach (var instruction in block.Instructions)
-                {
-                    if (!IsRemovable(instruction.OpCode))
-                        continue;
-
-                    // Only definitions of a register local are candidates. Stores have a memory or
-                    // field destination (Destination is not a local) and are never dead.
-                    if (instruction.Destination is not LocalVariable destination)
-                        continue;
-
-                    if (useCounts.TryGetValue(destination, out var count) && count > 0)
-                        continue;
-
-                    instruction.OpCode = OpCode.Nop;
-                    instruction.SetOperands();
-                    changed = true;
-                }
-            }
+            foreach (var used in UsedLocals(instruction))
+                if (live.Add(used))
+                    pending.Push(used);
         }
-    }
-
-    private static Dictionary<LocalVariable, int> CountUses(ISILControlFlowGraph cfg)
-    {
-        var counts = new Dictionary<LocalVariable, int>();
 
         foreach (var block in cfg.Blocks)
+        {
             foreach (var instruction in block.Instructions)
-                foreach (var used in UsedLocals(instruction))
-                    counts[used] = counts.TryGetValue(used, out var c) ? c + 1 : 1;
+            {
+                if (instruction.OpCode == OpCode.Nop)
+                    continue;
 
-        return counts;
+                if (IsRemovable(instruction.OpCode) && instruction.Destination is LocalVariable destination)
+                {
+                    if (!definitions.TryGetValue(destination, out var list))
+                        definitions[destination] = list = [];
+                    list.Add(instruction);
+                }
+                else
+                    MarkUses(instruction); // has an effect (or writes memory): everything it reads is needed
+            }
+        }
+
+        while (pending.Count > 0)
+        {
+            var local = pending.Pop();
+            if (definitions.TryGetValue(local, out var defining))
+                foreach (var instruction in defining)
+                    MarkUses(instruction);
+        }
+
+        foreach (var (local, defining) in definitions)
+        {
+            if (live.Contains(local))
+                continue;
+
+            foreach (var instruction in defining)
+            {
+                instruction.OpCode = OpCode.Nop;
+                instruction.SetOperands();
+            }
+        }
     }
 
     /// <summary>
