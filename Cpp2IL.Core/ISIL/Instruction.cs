@@ -41,6 +41,9 @@ public class Instruction : IOperand
     /// <summary>
     /// Lifted from a scalar single-precision SSE instruction, so it only looks at the low 4 bytes of any xmm register.
     /// </summary>
+    /// <summary>A conditional jump that came from an unsigned condition (ja/jae/jb/jbe), lowered with the signed flag logic.</summary>
+    public bool Unsigned;
+
     public bool ScalarSingle;
 
     public bool IsCall => OpCode is OpCode.Call or OpCode.CallVoid;

@@ -1209,6 +1209,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.Not, temp2, new ISIL.Register(null, "ZF")); // TEMP2 = !ZF
                     Add(instruction.IP, ISIL.OpCode.And, temp, temp, temp2); // TEMP = TEMP && TEMP2
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 
@@ -1223,6 +1225,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.CheckEqual, temp, new ISIL.Register(null, "SF"), new ISIL.Register(null, "OF")); // TEMP = SF == OF
                     Add(instruction.IP, ISIL.OpCode.Not, temp, temp); // TEMP = !TEMP
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 
@@ -1236,6 +1240,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
                     Add(instruction.IP, ISIL.OpCode.CheckEqual, temp, new ISIL.Register(null, "SF"), new ISIL.Register(null, "OF")); // TEMP = SF == OF
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 
@@ -1251,6 +1257,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.Not, temp, temp); // TEMP = !TEMP
                     Add(instruction.IP, ISIL.OpCode.Or, temp, temp, new ISIL.Register(null, "ZF")); // TEMP = TEMP || ZF
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 

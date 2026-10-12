@@ -567,6 +567,28 @@ public static class LocalVariables
         return true;
     }
 
+    // What a resolved call returns is ground truth: it also replaces a type guessed for the register that is plainly
+    // something else (a struct for a reference, or the other way round), which a use or a copy can have put there
+    private static bool SetFromReturn(LocalVariable local, TypeAnalysisContext type)
+    {
+        if (SetFromDefinition(local, type))
+            return true;
+
+        if (local.Type == null || local.TypeReplacements >= MaxTypeReplacements
+            || local.Type is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            || type is GenericParameterTypeAnalysisContext || local.Type is GenericParameterTypeAnalysisContext
+            || Kind(local.Type) == Kind(type))
+            return false;
+
+        local.Type = type;
+        local.TypeReplacements++;
+        return true;
+    }
+
+    // reference, primitive (or enum), struct: values of different kinds can't be the same value
+    private static int Kind(TypeAnalysisContext type) =>
+        !type.IsValueType || type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext ? 0 : MetadataResolver.IsPrimitiveOrEnum(type) ? 1 : 2;
+
     private static bool IsPlainClass(TypeAnalysisContext type) =>
         type is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
             or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext or SzArrayTypeAnalysisContext)
@@ -953,7 +975,7 @@ public static class LocalVariables
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
 
                 if (producedType != method.AppContext.SystemTypes.SystemVoidType && !HasForeignGenericParameters(producedType, method))
-                    changed |= SetOrRefineType(returnValue, producedType);
+                    changed |= SetFromReturn(returnValue, producedType);
             }
 
 
