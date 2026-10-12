@@ -1,5 +1,7 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
 
 namespace Cpp2IL.Core.Analysis;
 
@@ -31,6 +33,60 @@ public static class GenericInstanceFieldLayout
                 return field;
 
             offset += size;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// The (possibly nested) field a <paramref name="size"/>-byte access at <paramref name="targetOffset"/> into an instance
+    /// of a generic type touches, outermost first, each one the field of the concrete instantiation. Lays the type out
+    /// sequentially with its type arguments substituted, since the metadata has no offsets for generic types.
+    /// </summary>
+    public static List<FieldAnalysisContext>? FindFieldChain(GenericInstanceTypeAnalysisContext owner, long targetOffset, int size, int pointerSize, int depth = 0)
+    {
+        if (depth > 6)
+            return null;
+
+        var definition = owner.GenericType;
+        for (var baseType = definition.BaseType; baseType != null; baseType = baseType.BaseType)
+            if (baseType.Fields.Any(f => !f.IsStatic))
+                return null;
+
+        var offset = definition.IsValueType ? 0L : 2L * pointerSize;
+
+        foreach (var field in definition.Fields)
+        {
+            if (field.IsStatic || (field.Attributes & System.Reflection.FieldAttributes.Literal) != 0)
+                continue;
+
+            if (TypeSizes.SizeAndAlignment(field.FieldType, pointerSize, owner.GenericArguments, 0) is not var (fieldSize, alignment))
+                return null;
+
+            offset = (offset + alignment - 1) & ~(alignment - 1);
+
+            if (targetOffset >= offset && targetOffset < offset + fieldSize)
+            {
+                var concrete = new ConcreteGenericFieldAnalysisContext(field, owner);
+                var fieldType = concrete.FieldType;
+                var inner = targetOffset - offset;
+
+                // the whole field
+                if (inner == 0 && (size == 0 || size == fieldSize || !Analysis.StackStructRecovery.IsStruct(fieldType)))
+                    return [concrete];
+
+                // inside a struct field
+                if (!Analysis.StackStructRecovery.IsStruct(fieldType))
+                    return null;
+
+                var nested = fieldType is GenericInstanceTypeAnalysisContext genericField
+                    ? FindFieldChain(genericField, inner, size, pointerSize, depth + 1)
+                    : MetadataResolver.FindFieldChain(fieldType, false, inner, size, pointerSize);
+
+                return nested == null ? null : [concrete, ..nested];
+            }
+
+            offset += fieldSize;
         }
 
         return null;

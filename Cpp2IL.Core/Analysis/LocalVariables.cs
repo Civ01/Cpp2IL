@@ -497,7 +497,21 @@ public static class LocalVariables
     // type, once set, is never changed) so the fixpoint terminates. Returns whether it set anything.
     private static bool SetTypeIfUnknown(LocalVariable local, TypeAnalysisContext? type)
     {
-        if (type == null || local.Type != null)
+        if (type == null)
+            return false;
+
+        // object (a shared generic's T, usually) says next to nothing: anything more specific a use knows wins
+        if (local.Type is { FullName: "System.Object" } && type is not { FullName: "System.Object" } && !type.IsValueType
+            && type is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+                or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+            && local.TypeReplacements < MaxTypeReplacements)
+        {
+            local.Type = type;
+            local.TypeReplacements++;
+            return true;
+        }
+
+        if (local.Type != null)
             return false;
 
         local.Type = type;
@@ -624,7 +638,7 @@ public static class LocalVariables
                         changed |= SetTypeIfUnknown(castValue, method.AppContext.SystemTypes.SystemObjectType);
                     break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
-                    changed |= PropagateArithmetic(instruction, method);
+                    changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
                 case OpCode.Divide or OpCode.Modulo:
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
@@ -731,6 +745,13 @@ public static class LocalVariables
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
             return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
 
+        // the whole of a struct (an 8 byte ValueTuple<int, int> read in one go) is that struct
+        if (destination is LocalVariable { Type: null } wholeDest
+            && source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Size: > 0 and var wholeSize, Base: LocalVariable { Type: { } wholeBaseType } }
+            && (wholeBaseType is ByRefTypeAnalysisContext { ElementType: { } byRefElement } ? byRefElement : wholeBaseType) is var wholeType
+            && StackStructRecovery.IsStruct(wholeType) && TypeSizes.StorageSize(wholeType, pointerSize) == wholeSize)
+            return SetTypeIfUnknown(wholeDest, wholeType);
+
         // An element of T[] is a T, whether we loaded it (reference arrays) or only computed its address
         if (destination is LocalVariable { Type: null } elementDest
             && source is MemoryOperand { Base: LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { } elementType } } } elementAccess
@@ -797,6 +818,33 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// Whether the type mentions a generic parameter the method can't see (the T of some other generic class, from a
+    /// call resolved to its open definition), which can't be a type in this method's body.
+    /// </summary>
+    internal static bool HasForeignGenericParameters(TypeAnalysisContext type, MethodAnalysisContext method, int depth = 0)
+    {
+        if (depth > 8)
+            return false;
+
+        switch (type)
+        {
+            case GenericParameterTypeAnalysisContext parameter:
+                if (ReferenceEquals(parameter.Owner, method) || method is ConcreteGenericMethodAnalysisContext concrete && ReferenceEquals(parameter.Owner, concrete.BaseMethodContext))
+                    return false;
+                for (var declaring = method.DeclaringType; declaring != null; declaring = declaring.DeclaringType)
+                    if (ReferenceEquals(parameter.Owner, declaring))
+                        return false;
+                return true;
+            case GenericInstanceTypeAnalysisContext instance:
+                return instance.GenericArguments.Any(a => HasForeignGenericParameters(a, method, depth + 1));
+            case WrappedTypeAnalysisContext wrapped:
+                return HasForeignGenericParameters(wrapped.ElementType, method, depth + 1);
+            default:
+                return false;
+        }
+    }
+
     private static bool PropagateFromCallParameters(MethodAnalysisContext method)
     {
         var changed = false;
@@ -832,7 +880,7 @@ public static class LocalVariables
             {
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
 
-                if (producedType != method.AppContext.SystemTypes.SystemVoidType)
+                if (producedType != method.AppContext.SystemTypes.SystemVoidType && !HasForeignGenericParameters(producedType, method))
                     changed |= SetOrRefineType(returnValue, producedType);
             }
 
@@ -878,13 +926,14 @@ public static class LocalVariables
                 var parameterType = calledMethod.Parameters[parameterIndex].ParameterType;
 
                 if (parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType }
+                    && !HasForeignGenericParameters(referencedType, method)
                     && Addressed(instruction.Operands[i]) is { } referenced)
                 {
                     changed |= SetTypeIfUnknown(referenced, referencedType);
                     continue;
                 }
 
-                if (instruction.Operands[i] is LocalVariable local)
+                if (instruction.Operands[i] is LocalVariable local && !HasForeignGenericParameters(parameterType, method))
                     changed |= SetTypeIfUnknown(local, parameterType);
             }
         }

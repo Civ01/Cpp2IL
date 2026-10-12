@@ -5,6 +5,7 @@ using AsmResolver.DotNet;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.PE.DotNet.Cil;
+using Cpp2IL.Core.Analysis;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
 using Cpp2IL.Core.Model.Contexts;
@@ -110,9 +111,13 @@ public static class IlGenerator
             TypeSignature ilType;
 
             // Use object if type couldn't be determined, or if it's void, which no locals sig can hold
-            if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType)
+            if (local.Type != null && local.Type != context.AppContext.SystemTypes.SystemVoidType && !LocalVariables.HasForeignGenericParameters(local.Type, context))
                 ilType = local.Type.ToTypeSignature();
             else
+                ilType = module.CorLibTypeFactory.Object;
+
+            // a generic parameter in a method that has none (a call resolved to an open generic definition) isn't a type here
+            if (MentionsGenericParameter(ilType, 0) && context.GenericParameters.Count == 0 && context.DeclaringType is { GenericParameters.Count: 0, DeclaringType: null or { GenericParameters.Count: 0 } })
                 ilType = module.CorLibTypeFactory.Object;
 
             var ilLocal = new CilLocalVariable(ilType);
@@ -1152,4 +1157,12 @@ public static class IlGenerator
                 break;
         }
     }
+
+    private static bool MentionsGenericParameter(TypeSignature signature, int depth) => depth < 8 && signature switch
+    {
+        GenericParameterSignature => true,
+        GenericInstanceTypeSignature instance => instance.TypeArguments.Any(a => MentionsGenericParameter(a, depth + 1)),
+        TypeSpecificationSignature specification => MentionsGenericParameter(specification.BaseType, depth + 1),
+        _ => false
+    };
 }

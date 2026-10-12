@@ -58,7 +58,13 @@ public static class StackStructRecovery
                 continue;
 
             var callee = candidates[0];
-            if (candidates.Count > 1 && !candidates.All(c => SameLayout(c, callee)))
+
+            // shared generic code is told which instantiation it's running as by the MethodInfo it's passed, which also
+            // picks between folded instantiations
+            var passed = PassedMethodInfo(app, resolver, block, callee);
+            if (passed != null && candidates.Any(c => c.Name == passed.Name && c.Parameters.Count == passed.Parameters.Count && c.IsStatic == passed.IsStatic))
+                callee = passed;
+            else if (candidates.Count > 1 && !candidates.All(c => SameLayout(c, callee) && ReferenceEquals(c.DeclaringType, callee.DeclaringType)))
                 continue;
 
             // Only trust the operand layout if it's the managed one for this callee (not the raw unmanaged register dump)
@@ -231,6 +237,42 @@ public static class StackStructRecovery
                 new MemoryOperand(structSlot, size: size),
                 new MemoryOperand(returned, size: size)));
         }
+    }
+
+    // The method a call's hidden MethodInfo argument (the last one) names, when it's loaded from a metadata global
+    private static MethodAnalysisContext? PassedMethodInfo(ApplicationAnalysisContext app, BaseCallingConventionResolver resolver, Block block, MethodAnalysisContext layout)
+    {
+        var expected = resolver.ResolveForManaged(layout);
+        Debug?.Invoke("  expected " + string.Join(", ", expected.Select(e => e.ToString())));
+        if (expected.Length == 0 || expected[^1] is not Register methodInfoRegister)
+            return null;
+
+        for (var i = block.Instructions.Count - 2; i >= 0; i--)
+        {
+            var instruction = block.Instructions[i];
+            if (instruction.Destination is not Register { } written || written.Name != methodInfoRegister.Name)
+                continue;
+
+            if (instruction is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null } global] })
+                return null;
+
+            var usage = app.LibCpp2IlContext.GetMethodGlobalByAddress((ulong)global.Addend);
+            Debug?.Invoke($"  methodinfo global {global.Addend:X}: {usage?.Type}");
+            if (usage?.Type is not (LibCpp2IL.MetadataUsageType.MethodDef or LibCpp2IL.MetadataUsageType.MethodRef))
+                return null;
+
+            try
+            {
+                return app.ResolveContextForMethod(usage);
+            }
+            catch (Exception e)
+            {
+                Debug?.Invoke("  resolve failed " + e.Message);
+                return null;
+            }
+        }
+
+        return null;
     }
 
     private sealed record Root(int Offset, TypeAnalysisContext Type, Instruction Call, Instruction Definition, bool CalleeReads, bool CalleeWrites);

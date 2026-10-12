@@ -21,13 +21,15 @@ public static class DelegateInvokeRecovery
             if (instruction.OpCode != OpCode.IndirectCall)
                 continue;
 
-            if (GetInvokeImplLoad(instruction, instructions) is not { } memory)
+            LocalVariable? loadedFrom;
+            if (GetInvokeImplField(instruction, instructions) is { } field)
+                loadedFrom = field.Local;
+            else if (GetInvokeImplLoad(instruction, instructions) is { Index: null, Scale: 0 } memory && memory.Addend == invokeImplOffset)
+                loadedFrom = memory.Base as LocalVariable;
+            else
                 continue;
 
-            if (memory.Addend != invokeImplOffset || memory.Index != null || memory.Scale != 0)
-                continue;
-
-            if (memory.Base is not LocalVariable delegateLocal
+            if (loadedFrom is not LocalVariable delegateLocal
                 || delegateLocal.Type is not ({ IsDelegate: true } or GenericInstanceTypeAnalysisContext { GenericType.IsDelegate: true }) 
                 || delegateLocal.Type is not { } delegateType)
                 continue;
@@ -43,6 +45,19 @@ public static class DelegateInvokeRecovery
 
             RewriteAsInvoke(instruction, delegateLocal, invoke);
         }
+    }
+
+    // The same, once field resolution has already named it Delegate.invoke_impl
+    private static FieldReference? GetInvokeImplField(Instruction call, List<Instruction> instructions)
+    {
+        if (call.Operands.Count == 0)
+            return null;
+
+        var operand = call.Operands[0];
+        if (operand is LocalVariable target && instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, target)) is { OpCode: OpCode.Move, Operands: [_, FieldReference loaded] })
+            operand = loaded;
+
+        return operand is FieldReference { Field.Name: "invoke_impl" } field ? field : null;
     }
 
     // The address being called, whether it is still a separate load or has been inlined

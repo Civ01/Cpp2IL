@@ -53,7 +53,7 @@ public static class WideChunkSplitter
             // gather everything the chunk flows to
             var members = new List<LocalVariable>();
             var stores = new List<Instruction>();
-            if (!Collect(loaded, pieces, members, stores, definitions, uses, pointerSize, leafCache))
+            if (!Collect(loaded, pieces, memory.Size, members, stores, definitions, uses, pointerSize, leafCache))
                 continue;
 
             foreach (var member in members)
@@ -99,6 +99,9 @@ public static class WideChunkSplitter
         var isStatic = pointee is StaticFieldStorageTypeAnalysisContext;
         var owner = (pointee as StaticFieldStorageTypeAnalysisContext)?.OwnerType ?? pointee;
 
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner && !isStatic)
+            return GenericPieces(genericOwner, memory, pointerSize);
+
         if (owner is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext or RuntimeClassTypeAnalysisContext
                 or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext or PointerTypeAnalysisContext
             || owner.GenericParameters.Count > 0 || owner.Definition == null)
@@ -117,6 +120,11 @@ public static class WideChunkSplitter
         while (position < end)
         {
             var leaf = leaves.FirstOrDefault(l => l.Offset == position);
+            if (leaf.Chain == null && !leaves.Any(l => l.Offset < position && l.Offset + l.Size > position))
+            {
+                position++; // padding
+                continue;
+            }
             if (leaf.Chain == null || position + leaf.Size > end)
                 return null;
 
@@ -127,14 +135,52 @@ public static class WideChunkSplitter
         return pieces;
     }
 
+    private static List<Piece>? GenericPieces(GenericInstanceTypeAnalysisContext owner, MemoryOperand memory, int pointerSize)
+    {
+        var pieces = new List<Piece>();
+        var position = memory.Addend;
+        var end = memory.Addend + memory.Size;
+
+        while (position < end)
+        {
+            Piece? piece = null;
+            foreach (var size in new[] { 8, 4, 2, 1 })
+            {
+                if (position + size > end
+                    || GenericInstanceFieldLayout.FindFieldChain(owner, position, size, pointerSize) is not { } chain
+                    || StackStructRecovery.IsStruct(chain[^1].FieldType)
+                    || TypeSizes.StorageSize(chain[^1].FieldType, pointerSize) != size)
+                    continue;
+
+                piece = new Piece(position - memory.Addend, size, chain[^1].FieldType);
+                break;
+            }
+
+            if (piece == null)
+            {
+                // padding between fields (or after the last one), which gets copied along with them: skip to the next
+                // field, as long as nothing straddles this byte
+                if (GenericInstanceFieldLayout.FindFieldChain(owner, position, 0, pointerSize) != null)
+                    return null;
+
+                position++;
+                continue;
+            }
+
+            pieces.Add(piece);
+            position += piece.Size;
+        }
+
+        return pieces.Count > 0 ? pieces : null;
+    }
+
     private static bool SameLayout(List<Piece> a, List<Piece> b) =>
         a.Count == b.Count && a.Zip(b, (x, y) => x.Offset == y.Offset && x.Size == y.Size).All(same => same);
 
-    private static bool Collect(LocalVariable start, List<Piece> pieces, List<LocalVariable> members, List<Instruction> stores,
+    private static bool Collect(LocalVariable start, List<Piece> pieces, int size, List<LocalVariable> members, List<Instruction> stores,
         Dictionary<LocalVariable, Instruction> definitions, Dictionary<LocalVariable, List<Instruction>> uses, int pointerSize,
         Dictionary<(TypeAnalysisContext, bool), List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>> cache)
     {
-        var size = pieces.Sum(p => p.Size);
         var pending = new Stack<LocalVariable>();
         pending.Push(start);
 
@@ -177,7 +223,7 @@ public static class WideChunkSplitter
                 switch (use)
                 {
                     // stored whole
-                    case { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable, Index: null } destination, LocalVariable stored] }
+                    case { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable { Type: not SzArrayTypeAnalysisContext }, Index: null } destination, LocalVariable stored] }
                         when ReferenceEquals(stored, member) && destination.Size == size:
                         if (!stores.Contains(use))
                             stores.Add(use);

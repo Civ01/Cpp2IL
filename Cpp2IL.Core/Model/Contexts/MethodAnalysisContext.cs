@@ -433,6 +433,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         InterfaceDispatchRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "InterfaceDispatchRecovery.Run");
 
+        ConstantSplitter.Run(this);
+        DebugPassCallback?.Invoke(this, "ConstantSplitter.Run");
+
         LocalVariables.ResolveTypesAndFields(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.ResolveTypesAndFields");
 

@@ -213,15 +213,17 @@ public static class MetadataResolver
 
                 if (genericOwner != null && staticOwner == null)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout. That's only the shared
-                    // reference type layout if no field holds a type argument by value (List<T> keeps its Ts in a
-                    // T[], so List<int> is laid out the same as List<object>).
-                    // TODO support fields of value type argument type
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType)
-                        && genericOwner.GenericType.Fields.Any(f => !f.IsStatic && f.FieldType is GenericParameterTypeAnalysisContext or GenericInstanceTypeAnalysisContext { IsValueType: true }))
+                    // metadata has all-0 offsets for generic definitions, so lay the instantiation out ourselves
+                    if (GenericInstanceFieldLayout.FindFieldChain(genericOwner, memory.Addend, memory.Size, pointerSize) is not { } genericChain)
                         continue;
 
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
+                    var genericField = genericChain[^1];
+                    if (genericChain.Count == 1 && memory.Size > 0 && TypeSizes.StorageSize(genericField.FieldType, pointerSize) is > 0 and var genericFieldSize && memory.Size > genericFieldSize)
+                        continue;
+
+                    instruction.SetOperand(i, new FieldReference(genericField, local, (int)memory.Addend) { Path = genericChain.GetRange(0, genericChain.Count - 1) });
+                    changed = true;
+                    continue;
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
@@ -320,6 +322,19 @@ public static class MetadataResolver
                 return offset == 0; // part of a primitive, e.g. the low byte of an int, is still that field
 
             var structType = field.FieldType;
+
+            // a generic struct has no offsets in the metadata: its own layout takes it from here
+            if (structType is GenericInstanceTypeAnalysisContext genericStruct)
+            {
+                if (GenericInstanceFieldLayout.FindFieldChain(genericStruct, offset, accessSize, pointerSize) is not { } genericChain)
+                    return false;
+
+                path.Add(field);
+                path.AddRange(genericChain.Take(genericChain.Count - 1));
+                field = genericChain[^1];
+                return true;
+            }
+
             var nested = structType.Fields.FirstOrDefault(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0
                 && f.BackingData?.FieldOffset is { } start && start <= offset
                 && (start == offset || offset < start + TypeSizes.StorageSize(f.FieldType, pointerSize)));

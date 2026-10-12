@@ -51,6 +51,11 @@ public static class ArrayRecovery
 
                 if (ElementIndex(memory, arrayType, pointerSize) is { } index)
                     instruction.SetOperand(i, new ArrayAccess(array, index));
+                // a whole struct element at a constant index (array initialisers)
+                else if (memory is { Index: null, Scale: 0 } && arrayType.ElementType is { IsValueType: true } structElement
+                         && MetadataElementSize(structElement, pointerSize) is > 0 and var structSize && memory.Size == structSize
+                         && memory.Addend - ElementsOffset(pointerSize) is >= 0 and var structOffset && structOffset % structSize == 0)
+                    instruction.SetOperand(i, new ArrayAccess(array, new Immediate(structOffset / structSize)));
             }
         }
     }
