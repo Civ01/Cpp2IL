@@ -1154,10 +1154,12 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 {
                     var jumpTarget = instruction.NearBranchTarget;
 
-                    var methodEnd = instruction.IP + (ulong)context.RawBytes.Length;
                     var methodStart = context.UnderlyingPointer;
+                    var methodEnd = methodStart + (ulong)context.RawBytes.Length;
 
-                    if (jumpTarget < methodStart || jumpTarget > methodEnd)
+                    // outside this method, or the start of another one (a tail call to the next function in the binary)
+                    if (jumpTarget < methodStart || jumpTarget >= methodEnd
+                        || jumpTarget != methodStart && context.AppContext.MethodsByAddress.ContainsKey(jumpTarget))
                     {
                         callNoReturn = true;
                         goto case Mnemonic.Call;

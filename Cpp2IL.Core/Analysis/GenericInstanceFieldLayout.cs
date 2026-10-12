@@ -44,7 +44,8 @@ public static class GenericInstanceFieldLayout
     /// sequentially with its type arguments substituted, since the metadata has no offsets for generic types.
     /// </summary>
     public static List<FieldAnalysisContext>? FindFieldChain(GenericInstanceTypeAnalysisContext owner, long targetOffset, int size, int pointerSize, int depth = 0)
-        => FindFieldChain(owner.GenericType, owner.GenericArguments, owner, targetOffset, size, pointerSize, depth);
+        // arguments still type parameters (Foo<T> as seen by shared code) are references, as for an open type
+        => FindFieldChain(owner.GenericType, SizingArguments(owner, true), owner, targetOffset, size, pointerSize, depth);
 
     /// <summary>
     /// The same for an open generic type, as seen by its own (shared) code: its type parameters are references.
