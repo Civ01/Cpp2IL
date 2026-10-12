@@ -70,19 +70,46 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         var table = imageBase + (uint)load.MemoryDisplacement32;
         var index = load.MemoryIndex;
 
-        // the bound check before it gives the entry count
+        // the bound check before it gives the entry count; it may test the register the index was widened from
+        // (cmp ecx,9 / ja default / movsxd rax,ecx / mov ecx,[rdx+rax*4+table])
+        var indexSources = new HashSet<Register> { index.GetFullRegister() };
+        var widen = window.LastOrDefault(i => i is { Mnemonic: Mnemonic.Movsxd or Mnemonic.Movzx or Mnemonic.Mov, Op0Kind: OpKind.Register, Op1Kind: OpKind.Register }
+                                              && i.Op0Register.GetFullRegister() == index.GetFullRegister() && i.IP < load.IP);
+        if (widen.Code != Code.INVALID)
+            indexSources.Add(widen.Op1Register.GetFullRegister());
+
         var count = 0;
         var bound = _recent.LastOrDefault(i => i is { Mnemonic: Mnemonic.Cmp, Op0Kind: OpKind.Register } && i.Op1Kind is OpKind.Immediate8 or OpKind.Immediate32 or OpKind.Immediate8to32 or OpKind.Immediate8to64 or OpKind.Immediate32to64
-                                               && i.Op0Register.GetFullRegister() == index.GetFullRegister() && i.IP < load.IP && load.IP - i.IP < 64);
+                                               && indexSources.Contains(i.Op0Register.GetFullRegister()) && i.IP < load.IP && load.IP - i.IP < 64);
         if (bound.Code != Code.INVALID)
             count = (int)bound.GetImmediate(1) + 1;
-
-        if (count is <= 0 or > 512 || !context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var raw))
-            return null;
 
         var content = context.AppContext.Binary.GetRawBinaryContent();
         var start = context.UnderlyingPointer;
         var end = context.AppContext.GetAddressOfNextFunctionStart(start);
+
+        // A second switch on the same value reuses the first one's bound check, so there's none to read the size from:
+        // the table then runs until an entry leaves the function or the method's next table starts
+        if (count == 0 && context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var unboundedRaw))
+        {
+            var otherTables = X86Utils.Iterate(context)
+                .Where(i => i is { Op1Kind: OpKind.Memory, MemoryIndexScale: 4 } && i.MemoryIndex != Register.None && i.MemoryBase != Register.None)
+                .Select(i => imageBase + (uint)i.MemoryDisplacement32)
+                .Where(t => t > table)
+                .DefaultIfEmpty(ulong.MaxValue)
+                .Min();
+
+            while (count < 256 && table + 4UL * (ulong)(count + 1) <= otherTables && unboundedRaw + 4 * count + 4 <= content.Length)
+            {
+                var entry = imageBase + BitConverter.ToUInt32(content.Slice((int)unboundedRaw + 4 * count, 4).ToArray(), 0);
+                if (entry < start || end == 0 || entry >= end)
+                    break;
+                count++;
+            }
+        }
+
+        if (count is <= 0 or > 512 || !context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var raw))
+            return null;
         var targets = new List<ulong>();
         for (var k = 0; k < count; k++)
         {
