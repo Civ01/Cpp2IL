@@ -63,11 +63,14 @@ public static class MetadataResolver
             if (declaringInterface == null || InterfaceDispatchRecovery.ResolveInterfaceSlot(declaringInterface, (int)slot.Value) is not { } resolved)
                 continue;
 
+            if (resolved.Parameters.Count > 0 && InvokerArgument(instruction, 3, resolved.Parameters.Count - 1, false) == null)
+                continue;
+
             var operands = new List<IOperand> { resolved, instruction.Operands[1], instruction.Operands[4] };
 
-            // The invoker takes (slot, interface, obj, p1, ...): the first parameter is the fourth argument slot
-            if (resolved.Parameters.Count > 0)
-                operands.Add(BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[0].ParameterType) ? instruction.Operands[9] : instruction.Operands[5]);
+            // The invoker takes (slot, interface, obj, p1, ...): the parameters start at its fourth argument
+            for (var i = 0; i < resolved.Parameters.Count; i++)
+                operands.Add(InvokerArgument(instruction, 3, i, BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[i].ParameterType))!);
 
             instruction.SetOperands(operands);
         }
@@ -202,6 +205,16 @@ public static class MetadataResolver
                 if (memory.Base is not LocalVariable local || local?.Type == null)
                     continue;
 
+                // the whole value behind a pointer to a primitive or an enum is just that value (unboxed, or a ref
+                // parameter), not its m_value / value__ field
+                if (memory.Addend == 0 && local.Type is ByRefTypeAnalysisContext { ElementType: { } pointee } && IsPrimitiveOrEnum(pointee)
+                    && (memory.Size == 0 || memory.Size == TypeSizes.StorageSize(pointee, method.AppContext.Binary.PointerSizeBytes)))
+                    continue;
+
+                // a primitive held by value is no pointer: a read through it isn't its m_value, the local is mistyped
+                if (IsPrimitiveOrEnum(local.Type))
+                    continue;
+
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } ? referent : local.Type);
@@ -268,6 +281,10 @@ public static class MetadataResolver
         return changed;
     }
 
+    internal static bool IsPrimitiveOrEnum(TypeAnalysisContext type) =>
+        type.IsEnumType || type.Namespace == "System" && type.Name is "Boolean" or "Byte" or "SByte" or "Int16" or "UInt16" or "Char"
+            or "Int32" or "UInt32" or "Int64" or "UInt64" or "Single" or "Double" or "IntPtr" or "UIntPtr";
+
     /// <summary>
     /// Finds the (possibly nested) field accessed by a <paramref name="size"/>-byte access at <paramref name="offset"/>
     /// into an instance of <paramref name="owner"/> (or its static storage), outermost field first. Null if the access
@@ -275,10 +292,26 @@ public static class MetadataResolver
     /// </summary>
     public static List<FieldAnalysisContext>? FindFieldChain(TypeAnalysisContext owner, bool isStatic, long offset, int size, int pointerSize)
     {
+        // a generic base class has no offsets in the metadata: its fields come first, laid out like any generic instance
+        TypeAnalysisContext? genericBase = null;
+        if (!isStatic)
+        {
+            for (var candidateOwner = owner.BaseType; candidateOwner != null; candidateOwner = candidateOwner.BaseType)
+            {
+                if (candidateOwner is GenericInstanceTypeAnalysisContext instance)
+                {
+                    genericBase = instance;
+                    if (GenericInstanceFieldLayout.InstanceEnd(instance, pointerSize) is { } baseEnd && offset < baseEnd)
+                        return GenericInstanceFieldLayout.FindFieldChain(instance, offset, size, pointerSize);
+                    break;
+                }
+            }
+        }
+
         // an inherited field exists on the base type but sits at the same offset in the
         // derived layout, so the whole chain is searched
         FieldAnalysisContext? field = null;
-        for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+        for (var candidateOwner = owner; candidateOwner != null && candidateOwner != genericBase && field == null; candidateOwner = candidateOwner.BaseType)
             field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
                 && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
                 && f.BackingData?.FieldOffset == offset);
@@ -288,7 +321,7 @@ public static class MetadataResolver
         // Not the start of a field - maybe it's inside a struct-typed one (e.g. transform.position.y)
         if (field == null)
         {
-            for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+            for (var candidateOwner = owner; candidateOwner != null && candidateOwner != genericBase && field == null; candidateOwner = candidateOwner.BaseType)
                 field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
                     && (f.Attributes & FieldAttributes.Literal) == 0
                     && f.BackingData?.FieldOffset is { } start && start < offset
@@ -519,6 +552,7 @@ public static class MetadataResolver
     public static bool GuessAmbiguousCalls(MethodAnalysisContext method)
     {
         var changed = false;
+        Dictionary<LocalVariable, Instruction>? definitions = null;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -530,7 +564,8 @@ public static class MetadataResolver
 
             IEnumerable<MethodAnalysisContext> pool = candidates;
 
-            if (GetReceiver(instruction) is { Type: { } receiverType })
+            definitions ??= method.ControlFlowGraph.Instructions.Where(i => i.Destination is LocalVariable).GroupBy(i => (LocalVariable)i.Destination!).ToDictionary(g => g.Key, g => g.First());
+            if (ReceiverType(instruction, definitions, method.AppContext.Binary.PointerSizeBytes) is { } receiverType)
             {
                 var fitting = candidates.Where(c => !c.IsStatic && IsInHierarchy(receiverType, c.DeclaringType)).ToList();
                 if (fitting.Count > 0)
@@ -598,6 +633,32 @@ public static class MetadataResolver
     // The receiver ('this') of a call is the first integer-slot argument: operand 1 for CallVoid
     // (after the target), operand 2 for Call (after the target and the return value).
     // A value type receiver is passed byref, so it arrives as an AddressOf over the local.
+    // What the receiver is, also when it's the address of a struct field still being computed (lea rcx,[r8+0Ch])
+    private static TypeAnalysisContext? ReceiverType(Instruction call, Dictionary<LocalVariable, Instruction> definitions, int pointerSize)
+    {
+        var index = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (index >= call.Operands.Count)
+            return null;
+
+        switch (call.Operands[index])
+        {
+            case AddressOf { Target: FieldReference field }:
+                return field.Field.FieldType;
+            case AddressOf { Target: LocalVariable { Type: { } addressedType } }:
+                return addressedType;
+            case LocalVariable { Type: { } type }:
+                return type is ByRefTypeAnalysisContext { ElementType: { } element } ? element : type;
+            case LocalVariable receiver when definitions.TryGetValue(receiver, out var definition)
+                                             && definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: { } baseType }, Immediate { Value: > 0 and var offset }] }:
+                var owner = baseType is ByRefTypeAnalysisContext { ElementType: { } pointee } ? pointee : baseType;
+                return owner is GenericInstanceTypeAnalysisContext genericOwner
+                    ? GenericInstanceFieldLayout.FindFieldChain(genericOwner, offset, 0, pointerSize)?[^1].FieldType
+                    : FindFieldChain(owner, false, offset, 0, pointerSize)?[^1].FieldType;
+            default:
+                return null;
+        }
+    }
+
     private static LocalVariable? GetReceiver(Instruction call)
     {
         var index = call.OpCode == OpCode.CallVoid ? 1 : 2;
@@ -819,6 +880,13 @@ public static class MetadataResolver
 
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
+            if (instruction is { OpCode: OpCode.Call, Operands: [Immediate invoker, ..] } && instruction.Operands.Count >= 10
+                && NativeHelpers.Classify(method.AppContext, invoker.UnsignedValue) == NativeHelperKind.VirtualInvoker)
+            {
+                changed |= ResolveVirtualInvoker(method, instruction, loads);
+                continue;
+            }
+
             if (instruction.OpCode != OpCode.IndirectCall)
                 continue;
 
@@ -863,6 +931,48 @@ public static class MetadataResolver
         };
     }
 
+    // Argument n (0-based) of the invoker's managed method's parameters, which start at invoker argument 'first', in an
+    // unmanaged call's raw operands [target, rax, rcx, rdx, r8, r9, xmm0-3, stack args...]
+    private static IOperand? InvokerArgument(Instruction call, int first, int parameter, bool floating)
+    {
+        var position = first + parameter;
+        var index = position < 4 ? (floating ? 6 + position : 2 + position) : 10 + (position - 4);
+        return index < call.Operands.Count ? call.Operands[index] : null;
+    }
+
+    // An out-of-line virtual invoker, (slot, obj, args...) in the raw registers [target, rax, rcx, rdx, r8, r9, xmm0-3]
+    private static bool ResolveVirtualInvoker(MethodAnalysisContext method, Instruction call, Dictionary<LocalVariable, MemoryOperand> loads)
+    {
+        var slotOperand = call.Operands[2];
+        for (var depth = 0; depth < 4 && slotOperand is LocalVariable local; depth++)
+        {
+            var definition = method.ControlFlowGraph!.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, local));
+            if (definition is not { OpCode: OpCode.Move })
+                break;
+            slotOperand = definition.Operands[1];
+        }
+
+        if (slotOperand is not Immediate { Value: >= 0 and < 0x10000 } slot
+            || call.Operands[3] is not LocalVariable { Type: { } receiverType } receiver
+            || receiverType is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext || receiverType.IsValueType
+            || ResolveVTableSlot(method.AppContext, receiverType, (int)slot.Value) is not { } resolved
+            || InvokerArgument(call, 2, resolved.Parameters.Count - 1, false) == null && resolved.Parameters.Count > 0)
+            return false;
+
+        var operands = new List<IOperand> { resolved };
+        if (!resolved.IsVoid)
+            operands.Add(call.Operands[1]);
+        operands.Add(receiver);
+
+        // the invoker's own args start at its third argument
+        for (var i = 0; i < resolved.Parameters.Count; i++)
+            operands.Add(InvokerArgument(call, 2, i, BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[i].ParameterType))!);
+
+        call.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+        call.SetOperands(operands);
+        return true;
+    }
+
     private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
     {
         var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? type.Definition;
@@ -892,6 +1002,10 @@ public static class MetadataResolver
 
         for (var i = call.Operands.Count - 1; i >= firstArg; i--)
         {
+            // an unresolved call's raw argument registers include our own MethodInfo param, still sitting in r9
+            if (call.Operands[i] is LocalVariable { IsMethodInfo: true })
+                continue;
+
             if (AsMethodInfo(call.Operands[i]) is { } methodInfo)
                 return methodInfo;
         }

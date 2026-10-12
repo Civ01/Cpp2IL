@@ -11,7 +11,7 @@ namespace Cpp2IL.Core.Analysis;
 // Turns the raw Il2CppArray layout (header, then length, then inline elements) back into array ops
 public static class ArrayRecovery
 {
-    private static readonly HashSet<string> ArrayNewFunctions =
+    internal static readonly HashSet<string> ArrayNewFunctions =
     [
         "SzArrayNew",
         "il2cpp_vm_array_new_specific",

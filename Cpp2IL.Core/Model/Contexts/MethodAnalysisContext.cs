@@ -439,6 +439,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveTypesAndFields(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.ResolveTypesAndFields");
 
+        // again, for dispatch through classes and methods only the rgctx (resolved with the types) names
+        InterfaceDispatchRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "InterfaceDispatchRecovery.Run (rgctx)");
+
         NativeHelperRecovery.RunLate(this);
 
         // Chunked struct copies/zeroing (e.g. a Vector3 moved as x+y then z) back into whole struct moves
@@ -451,6 +455,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         MetadataInitGuardRemover.RewriteUnguardedInits(this);
         DebugPassCallback?.Invoke(this, "MetadataInitGuardRemover.RewriteUnguardedInits");
+        NativeHelperRecovery.LowerIdentityHelpers(this);
 
         // Needs type resolved for delegate locals
         DelegateInvokeRecovery.Run(this);

@@ -115,8 +115,21 @@ public class ApplicationAnalysisContext : ContextWithDataStorage
 
         methods = _cloneLookups.GetOrAdd(address, a =>
         {
-            if (GetOrCreateKeyFunctionAddresses().IsKeyFunctionAddress(a) || Utils.NativeHelpers.Classify(this, a) != Utils.NativeHelperKind.Unknown)
+            if (GetOrCreateKeyFunctionAddresses().IsKeyFunctionAddress(a))
                 return null;
+
+            // a memcpy/memset of a size we can't fold into a plain copy is still one, and Unity has the managed equivalent
+            switch (Utils.NativeHelpers.Classify(this, a))
+            {
+                case Utils.NativeHelperKind.Unknown or Utils.NativeHelperKind.ReturnsFirstArgument:
+                    break;
+                case Utils.NativeHelperKind.Memcpy:
+                    return Utils.KnownNativeFunctions.Named(this, "Unity.Collections.LowLevel.Unsafe.UnsafeUtility", "MemCpy", 3);
+                case Utils.NativeHelperKind.Memset:
+                    return Utils.KnownNativeFunctions.Named(this, "Unity.Collections.LowLevel.Unsafe.UnsafeUtility", "MemSet", 3);
+                default:
+                    return null;
+            }
 
             return Utils.ManagedCloneIndex.For(this).Lookup(a) ?? Utils.KnownNativeFunctions.Lookup(this, a);
         });

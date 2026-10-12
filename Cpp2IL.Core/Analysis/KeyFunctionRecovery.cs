@@ -1,3 +1,4 @@
+using Cpp2IL.Core.Graphs;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -51,6 +52,7 @@ public static class KeyFunctionRecovery
                 RewriteRaiseException(instruction);
             else if (BoxFunctions.Contains(keyFunction))
                 RewriteBox(instruction);
+
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.il2cpp_vm_reflection_get_type_object))
                 RewriteTypeObject(instruction);
             else if (keyFunction == nameof(BaseKeyFunctionAddresses.InternalCalls_Resolve))
@@ -86,6 +88,82 @@ public static class KeyFunctionRecovery
 
         instruction.OpCode = OpCode.Box;
         instruction.SetOperands(result, boxedType, value);
+    }
+
+    private static readonly HashSet<string> UnboxFunctions =
+    [
+        nameof(BaseKeyFunctionAddresses.il2cpp_object_unbox),
+        nameof(BaseKeyFunctionAddresses.il2cpp_vm_object_unbox),
+    ];
+
+    /// <summary>
+    /// Rewrites unbox calls once the class they unbox as is known (it is typed along with everything else).
+    /// </summary>
+    public static bool RewriteUnboxes(MethodAnalysisContext method)
+    {
+        var changed = false;
+        var graph = method.ControlFlowGraph!;
+        foreach (var block in graph.Blocks)
+        {
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction is not { OpCode: OpCode.Call, Operands: [StringLiteral { Value: var name }, ..] } || !UnboxFunctions.Contains(name)
+                    || !RewriteUnbox(instruction))
+                    continue;
+
+                changed = true;
+                AssumeElementClassCheckPasses(graph, block);
+            }
+        }
+        return changed;
+    }
+
+    // Before unboxing, il2cpp compares obj->klass->element_class (Il2CppClass+0x40) with the target class's and raises
+    // InvalidCastException if they differ. IL's unbox does that check itself, so the branch is always taken towards it.
+    private static void AssumeElementClassCheckPasses(ISILControlFlowGraph graph, Block unboxBlock)
+    {
+        if (unboxBlock.Predecessors is not [{ Instructions: [.., { OpCode: OpCode.ConditionalJump, Operands: [var target, LocalVariable condition] } jump] } guard])
+            return;
+
+        var check = guard.Instructions.LastOrDefault(i => i.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual && ReferenceEquals(i.Destination, condition));
+        if (check == null || !check.Operands.Skip(1).Any(o => o is MemoryOperand { Index: null, Addend: 0x40, Size: 8 }))
+            return;
+
+        var targetBlock = target switch
+        {
+            Block b => b,
+            Instruction i => graph.FindBlockByInstruction(i),
+            _ => null,
+        };
+        if (targetBlock == null)
+            return;
+
+        jump.SetOperand(1, new Immediate(targetBlock == unboxBlock ? 1 : 0));
+    }
+
+    // unbox(obj) -> pointer to the value inside. The class it's unboxed as isn't an argument, but the inlined type check
+    // before the call leaves it in one of the following argument registers
+    private static bool RewriteUnbox(Instruction instruction)
+    {
+        if (instruction.OpCode != OpCode.Call || instruction.Operands.Count < 4 || instruction.Operands[1] is not LocalVariable result)
+            return false;
+
+        var obj = instruction.Operands[2];
+        var unboxedClass = instruction.Operands.Skip(3).Take(2).FirstOrDefault(o => o switch
+        {
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType.IsValueType: true } } => true,
+            RuntimeClassTypeAnalysisContext { RepresentedType.IsValueType: true } => true,
+            _ => false,
+        });
+        if (unboxedClass == null)
+            return false;
+
+        var valueType = unboxedClass is LocalVariable { Type: RuntimeClassTypeAnalysisContext local } ? local.RepresentedType : ((RuntimeClassTypeAnalysisContext)unboxedClass).RepresentedType;
+
+        instruction.OpCode = OpCode.Unbox;
+        instruction.SetOperands(result, unboxedClass, obj);
+        result.Type = valueType.MakeByReferenceType();
+        return true;
     }
 
     private static void RewriteTypeObject(Instruction instruction)

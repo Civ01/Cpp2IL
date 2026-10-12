@@ -138,18 +138,26 @@ public static class MetadataInitGuardRemover
         var first = guard.Successors[0];
         var second = guard.Successors[1];
 
-        return TryExcise(cfg, guard, first, second, initialisedFlagTest)
-            || TryExcise(cfg, guard, second, first, initialisedFlagTest);
+        // the per-method init flag byte the guard tests, if it tests one
+        var guardFlag = guard.Instructions.Select(GuardFlagAddress).FirstOrDefault(a => a != null);
+
+        return TryExcise(cfg, guard, first, second, initialisedFlagTest, guardFlag)
+            || TryExcise(cfg, guard, second, first, initialisedFlagTest, guardFlag);
     }
+
+    private static long? GuardFlagAddress(Instruction instruction) =>
+        instruction is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [_, MemoryOperand { IsConstant: true, Size: 1 } flag, Immediate { Value: 0 }] }
+            ? flag.Addend
+            : null;
 
     private static bool IsOne(IOperand operand) => operand is Immediate { Value: 1 };
 
-    private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest)
+    private static bool TryExcise(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge, bool initialisedFlagTest, long? guardFlag = null)
     {
         if (merge == cfg.EntryBlock || merge == cfg.ExitBlock)
             return false;
 
-        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, out var region))
+        if (!TryCollectRegion(cfg, guard, initEntry, merge, initialisedFlagTest, guardFlag, out var region))
             return false;
 
         Excise(cfg, guard, initEntry, merge, region);
@@ -157,8 +165,9 @@ public static class MetadataInitGuardRemover
     }
 
     private static bool TryCollectRegion(ISILControlFlowGraph cfg, Block guard, Block initEntry, Block merge,
-        bool initialisedFlagTest, out HashSet<Block> region)
+        bool initialisedFlagTest, long? guardFlag, out HashSet<Block> region)
     {
+        var sawGuardFlagStore = false;
         region = [];
 
         if (initEntry == merge || initEntry == guard)
@@ -192,14 +201,22 @@ public static class MetadataInitGuardRemover
             if (!ClassifyBlock(block, initialisedFlagTest, ref sawMetadataInit, ref sawClassInit, ref sawFlagStore))
                 return false;
 
+            sawGuardFlagStore |= guardFlag != null && block.Instructions.Any(i =>
+                i is { OpCode: OpCode.Move, Operands: [MemoryOperand { IsConstant: true } stored, _] } && stored.Addend == guardFlag);
+
             foreach (var successor in block.Successors)
                 queue.Enqueue(successor);
         }
 
-        if (!reconverges || !(sawClassInit || (sawMetadataInit && sawFlagStore)))
+        // A metadata init whose result is used has already become a plain load (MetadataResolver), leaving a region
+        // that only sets the flag it is guarded by: still boilerplate, as long as nothing else in it has an effect
+        if (!reconverges || !(sawClassInit || (sawMetadataInit && sawFlagStore) || (sawGuardFlagStore && !sawClassInit)))
             return false;
 
         var collected = region;
+        if (sawGuardFlagStore && !(sawClassInit || (sawMetadataInit && sawFlagStore)) && DefinesValueUsedOutside(cfg, collected, merge))
+            return false;
+
         foreach (var block in collected)
         {
             if (block.Predecessors.Any(predecessor => predecessor != guard && !collected.Contains(predecessor)))
@@ -209,6 +226,23 @@ public static class MetadataInitGuardRemover
         }
 
         return true;
+    }
+
+    private static bool DefinesValueUsedOutside(ISILControlFlowGraph cfg, HashSet<Block> region, Block merge)
+    {
+        var defined = region.SelectMany(b => b.Instructions).Where(i => i.OpCode != OpCode.Nop).Select(i => i.Destination).OfType<LocalVariable>().ToHashSet();
+        if (defined.Count == 0)
+            return false;
+
+        // the merge's phis lose their inputs from the region when it is excised
+        return cfg.Blocks.Where(b => !region.Contains(b)).SelectMany(b => b.Instructions)
+            .Where(i => i.OpCode != OpCode.Nop && !(i.OpCode == OpCode.Phi && merge.Instructions.Contains(i)))
+            .Any(i => i.Operands.Any(o => o switch
+            {
+                LocalVariable local => defined.Contains(local) && !ReferenceEquals(local, i.Destination),
+                MemoryOperand { Base: LocalVariable b } m => defined.Contains(b) || m.Index is LocalVariable x && defined.Contains(x),
+                _ => false,
+            }));
     }
 
     // A region block is acceptable only if every instruction is intra-region control flow, an init

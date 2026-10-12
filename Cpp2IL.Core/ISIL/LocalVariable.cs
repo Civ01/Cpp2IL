@@ -22,5 +22,8 @@ public class LocalVariable(string name, Register register, TypeAnalysisContext? 
     public bool IsReturn = false;
     public bool IsMethodInfo = false;
 
+    /// <summary>Which of the method's declared parameters this local is, or -1.</summary>
+    public int ParameterIndex = -1;
+
     public override string ToString() => Type == null ? $"{Name} @ {Register}" : $"{Name} @ {Register} ({Type.FullName})";
 }

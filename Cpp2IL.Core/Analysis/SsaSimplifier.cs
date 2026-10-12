@@ -23,7 +23,8 @@ public static class SsaSimplifier
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
                     && !parameterLocals.Contains(dest)
-                    && IsForwardable(instruction.Operands[1]))
+                    && IsForwardable(instruction.Operands[1])
+                    && !IsNumericConversion(dest, instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
 
         if (forwarded.Count == 0)
@@ -54,6 +55,14 @@ public static class SsaSimplifier
                     instruction.SetOperands();
                 }
     }
+
+    // A copy between different numeric types is a conversion (int to long), which forwarding would lose
+    private static bool IsNumericConversion(LocalVariable destination, IOperand source) =>
+        source is LocalVariable { Type: { } sourceType } && destination.Type is { } destinationType
+        && !ReferenceEquals(sourceType, destinationType) && IsNumeric(sourceType) && IsNumeric(destinationType);
+
+    private static bool IsNumeric(Model.Contexts.TypeAnalysisContext type) =>
+        type.Namespace == "System" && type.Name is "Byte" or "SByte" or "Int16" or "UInt16" or "Int32" or "UInt32" or "Int64" or "UInt64" or "Single" or "Double";
 
     // Follows local-to-local copies to the end of the chain. The visited set guards against a cycle a
     // malformed graph could present; a well-formed SSA graph (definitions dominate uses) has none.

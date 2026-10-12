@@ -138,6 +138,18 @@ public static class IlGenerator
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
 
+        // IL starts executing at the first block emitted, which isn't necessarily where the method starts (a pass may
+        // have replaced the start with a block that sits later in the list, like a collapsed copy loop): jump there
+        var cfg = context.ControlFlowGraph!;
+        var firstEmitted = cfg.Blocks.FirstOrDefault(b => b != cfg.EntryBlock && b != cfg.ExitBlock && b.Instructions.Count > 0);
+        var realStart = cfg.EntryBlock.Successors.FirstOrDefault(s => s != cfg.ExitBlock);
+        if (realStart != null && firstEmitted != null && realStart != firstEmitted)
+        {
+            var startBridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
+            definition.CilMethodBody!.Instructions.Add(startBridge);
+            pendingBlockBranchFixups.Add((startBridge, realStart));
+        }
+
         foreach (var block in context.ControlFlowGraph!.Blocks)
         {
             if (block == context.ControlFlowGraph.EntryBlock || block == context.ControlFlowGraph.ExitBlock)
@@ -365,7 +377,13 @@ public static class IlGenerator
                 break;
 
             case OpCode.Box:
-                if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
+                if (instruction.Operands is [_, var boxedClass, var boxedValue] && boxedClass switch
+                    {
+                        RuntimeClassTypeAnalysisContext { RepresentedType: var represented } => represented,
+                        LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } } => represented,
+                        TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => type,
+                        _ => null,
+                    } is { } boxedType)
                 {
                     // il2cpp_value_box takes the value by address, but IL boxes it by value
                     LoadOperand(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue, method, locals, writeLine, boxedType);
@@ -376,6 +394,22 @@ public static class IlGenerator
 
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
+
+            case OpCode.Unbox:
+            {
+                var unboxedType = instruction.Operands[1] switch
+                {
+                    LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } } => represented,
+                    RuntimeClassTypeAnalysisContext { RepresentedType: var represented } => represented,
+                    _ => null,
+                };
+
+                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                if (unboxedType != null)
+                    instructions.Add(CilOpCodes.Unbox, unboxedType.ToTypeSignature().ToTypeDefOrRef());
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+            }
 
             case OpCode.IsInst:
             {
@@ -427,11 +461,29 @@ public static class IlGenerator
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+                TypeAnalysisContext? constrainedTo = null;
 
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
+                        // a struct's address handed to a method of object/Enum/an interface (ToString on an enum, MoveNext through
+                        // IEnumerator): that's a constrained virtual call on the struct
+                        if (targetMethod.DeclaringType is { IsValueType: false } && instruction.Operands[thisParamIndex] switch
+                            {
+                                AddressOf { Target: LocalVariable { Type: { IsValueType: true } addressedType } } when addressedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext) => addressedType,
+                                AddressOf { Target: FieldReference { Field.FieldType: { IsValueType: true } fieldType } } => fieldType,
+                                _ => null,
+                            } is { } valueReceiverType)
+                        {
+                            if (instruction.Operands[thisParamIndex] is AddressOf { Target: FieldReference constrainedField })
+                                LoadFieldAddress(constrainedField, method, locals);
+                            else
+                                LoadLocalAddress((LocalVariable)((AddressOf)instruction.Operands[thisParamIndex]).Target, method, locals);
+                            constrainedTo = valueReceiverType;
+                            goto receiverLoaded;
+                        }
+
                         // A value type's instance method takes 'this' as a managed pointer
                         if (targetMethod.DeclaringType is { IsValueType: true } && instruction.Operands[thisParamIndex] is AddressOf { Target: FieldReference receiverField })
                         {
@@ -477,7 +529,13 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(CilOpCodes.Call, importedMethod);
+                if (constrainedTo != null)
+                {
+                    instructions.Add(CilOpCodes.Constrained, constrainedTo.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Callvirt, importedMethod);
+                }
+                else
+                    instructions.Add(CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack
@@ -557,6 +615,11 @@ public static class IlGenerator
                 LoadOperand(instruction.Operands[1], method, locals, writeLine);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
+                // a 32 bit value shifted into a 64 bit result has to be widened first, or the shift wraps
+                else if (instruction.OpCode == OpCode.ShiftLeft
+                         && DestinationType(instruction.Operands[0]) is { Namespace: "System", Name: "Int64" or "UInt64" }
+                         && SourceType(instruction.Operands[1], context) is { Namespace: "System", Name: "Int32" or "UInt32" or "Int16" or "UInt16" or "Byte" or "SByte" } narrow)
+                    instructions.Add(narrow.Name.StartsWith("U") || narrow.Name == "Byte" ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8);
                 LoadOperand(instruction.Operands[2], method, locals, writeLine);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);
@@ -782,6 +845,14 @@ public static class IlGenerator
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
                     break;
                 }
+                // Il2CppClass::stack_slot_size (2022+ full generic sharing): what shared code sizes the storage for a T
+                // with, the size of a value type or of a reference, exactly sizeof(T)
+                if (memory is { Index: null, Addend: 0xFC, Size: 4, Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } sized } } }
+                    && sized.AppContext.MetadataVersion >= 29 && sized.AppContext.Binary.PointerSizeBytes == 8)
+                {
+                    instructions.Add(CilOpCodes.Sizeof, sized.ToTypeSignature().ToTypeDefOrRef());
+                    break;
+                }
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);
@@ -958,6 +1029,8 @@ public static class IlGenerator
             LocalVariable local => local.Type,
             FieldReference field => field.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            // a store through a managed pointer writes its referent
+            MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } referent } } } => referent,
             _ => null
         };
 

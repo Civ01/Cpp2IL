@@ -33,6 +33,11 @@ public enum NativeHelperKind
     /// tail-calls it with (obj, args..., methodInfo).
     /// </summary>
     InterfaceInvoker,
+    VirtualInvoker,
+    /// <summary>Hands back its first argument, after some runtime side effect (class or rgctx initialisation).</summary>
+    ReturnsFirstArgument,
+    /// <summary>(obj, FieldInfo*) -> the address of that field of obj: shared generic code reading a field whose offset depends on T.</summary>
+    FieldAddress,
 }
 
 /// <summary>
@@ -61,7 +66,7 @@ public static class NativeHelpers
 
     private static NativeHelperKind ClassifyUncached(ApplicationAnalysisContext app, ulong address)
     {
-        var body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, app, 128);
+        var body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, app, 320);
         if (body.Count == 0)
             return NativeHelperKind.Unknown;
 
@@ -73,6 +78,13 @@ public static class NativeHelpers
         // Everything else is never a managed method
         if (app.MethodsByAddress.ContainsKey(address))
             return NativeHelperKind.Unknown;
+
+        // A write barrier variant taking the field address in rdx (mov rcx,rdx / jmp the barrier's target): no effect
+        // on what the code means
+        if (body.Count >= 2 && first is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RCX, Op1Register: Register.RDX }
+            && body[1] is { Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.NearBranch64 } barrierJump
+            && WriteBarrierTarget(app) is { } barrierTarget && barrierJump.NearBranchTarget == barrierTarget)
+            return NativeHelperKind.Empty;
 
         if (body.Count >= 3
             && first is { Mnemonic: Mnemonic.Sub, Op0Register: Register.RSP, Op1Kind: OpKind.Immediate8to64 or OpKind.Immediate32to64 or OpKind.Immediate8 }
@@ -96,8 +108,51 @@ public static class NativeHelpers
         // Interface invokers scan klass->interfaceOffsets (count at 0x12E) and finish with a register tail-jump
         if (body.Take(16).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Memory, MemoryDisplacement64: 0x12E, MemorySize: MemorySize.UInt16 })
             && body.Take(8).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })
-            && body.Any(i => i is { Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.Register }))
+            && body.Any(i => i is { Mnemonic: Mnemonic.Jmp or Mnemonic.Call, Op0Kind: OpKind.Register }))
             return NativeHelperKind.InterfaceInvoker;
+
+        // thunk to: mov rax,[rdx+10h] (field->parent) / movsxd r8,[rdx+18h] (field->offset) / add r8,rcx ...
+        var fieldAddressBody = first is { Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.NearBranch64 } thunk
+            ? X86Utils.GetMethodBodyAtVirtAddressNew(thunk.NearBranchTarget, true, app, 32)
+            : body;
+        if (fieldAddressBody.Count >= 3
+            && fieldAddressBody[0] is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RAX, MemoryBase: Register.RDX, MemoryDisplacement64: 0x10 }
+            && fieldAddressBody[1] is { Mnemonic: Mnemonic.Movsxd, Op0Register: Register.R8, MemoryBase: Register.RDX, MemoryDisplacement64: 0x18 }
+            && fieldAddressBody[2] is { Mnemonic: Mnemonic.Add, Op0Register: Register.R8, Op1Register: Register.RCX })
+            return NativeHelperKind.FieldAddress;
+
+        // push rbx / mov rbx,rcx / call init / mov rax,rbx / ret: runtime class or rgctx initialisation, which hands
+        // back the class it was given
+        var firstReturn = body.ToList().FindIndex(i => i.Mnemonic == Mnemonic.Ret);
+        if (firstReturn is > 2 and < 12
+            && !body.Take(firstReturn).Any(i => i.Op0Kind == OpKind.Memory && i.MemoryBase is Register.RBX or Register.RCX && i.Mnemonic is not (Mnemonic.Cmp or Mnemonic.Test))
+            && body.Take(4).Any(i => i is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RBX, Op1Register: Register.RCX })
+            && body.Take(firstReturn).Skip(1).Any(i => i.Mnemonic == Mnemonic.Call)
+            && body.Take(firstReturn).Reverse().SkipWhile(i => i is { Mnemonic: Mnemonic.Pop } or { Mnemonic: Mnemonic.Add, Op0Register: Register.RSP }).FirstOrDefault()
+                is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RAX, Op1Register: Register.RBX }
+            && !body.Take(firstReturn).Any(i => i.Op0Register == Register.RBX && i.Mnemonic is not (Mnemonic.Push or Mnemonic.Pop) && !(i is { Mnemonic: Mnemonic.Mov, Op1Register: Register.RCX })))
+            return NativeHelperKind.ReturnsFirstArgument;
+
+        // Static class init on first use: cmp [klass+cctor_finished],0 / je init / ret. Only runs the static
+        // constructor, which says nothing about what the code means
+        if (body.Count >= 3
+            && first is { Mnemonic: Mnemonic.Cmp, Op0Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryIndex: Register.None, MemoryDisplacement64: 0xE0, Op1Kind: OpKind.Immediate8to32 or OpKind.Immediate32 or OpKind.Immediate8 }
+            && body[1] is { Mnemonic: Mnemonic.Je, Op0Kind: OpKind.NearBranch64 }
+            && body[2].Mnemonic == Mnemonic.Ret)
+            return NativeHelperKind.Empty;
+
+        // Virtual invokers (slot, obj, args...): index obj->klass->vtable by the slot in cx, then call through it.
+        // obj may first be moved out of rdx (mov r9,rdx / ... / mov rax,[r9])
+        var objectRegisters = new System.Collections.Generic.HashSet<Register> { Register.RDX };
+        foreach (var copy in body.Take(6))
+            if (copy is { Mnemonic: Mnemonic.Mov, Op0Kind: OpKind.Register, Op1Kind: OpKind.Register, Op1Register: Register.RDX })
+                objectRegisters.Add(copy.Op0Register);
+
+        if (body.Take(12).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })
+            && body.Take(12).Any(i => i.Op1Kind == OpKind.Memory && objectRegisters.Contains(i.MemoryBase) && i.MemoryIndex == Register.None && i.MemoryDisplacement64 == 0)
+            && body.Any(i => (i.Op0Kind == OpKind.Memory || i.Op1Kind == OpKind.Memory) && i.MemoryDisplacement64 is 0x138 or 0x140)
+            && !body.Take(16).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Memory, MemoryDisplacement64: 0x12E }))
+            return NativeHelperKind.VirtualInvoker;
 
         // RaiseInvalidCastException(obj, klass): reads the object's klass for the message, then raises
         if (body.Take(4).Any(i => i is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RDX, Op1Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryDisplacement64: 0 })
@@ -107,6 +162,16 @@ public static class NativeHelpers
             return NativeHelperKind.RaiseInvalidCast;
 
         return NativeHelperKind.Unknown;
+    }
+
+    private static ulong? WriteBarrierTarget(ApplicationAnalysisContext app)
+    {
+        var barrier = app.GetOrCreateKeyFunctionAddresses().il2cpp_codegen_write_barrier;
+        if (barrier == 0)
+            return null;
+
+        var body = X86Utils.GetMethodBodyAtVirtAddressNew(barrier, true, app, 4);
+        return body is [{ Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.NearBranch64 } jump, ..] ? jump.NearBranchTarget : barrier;
     }
 
     /// <summary>

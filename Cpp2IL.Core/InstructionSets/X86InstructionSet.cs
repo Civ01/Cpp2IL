@@ -70,19 +70,46 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         var table = imageBase + (uint)load.MemoryDisplacement32;
         var index = load.MemoryIndex;
 
-        // the bound check before it gives the entry count
+        // the bound check before it gives the entry count; it may test the register the index was widened from
+        // (cmp ecx,9 / ja default / movsxd rax,ecx / mov ecx,[rdx+rax*4+table])
+        var indexSources = new HashSet<Register> { index.GetFullRegister() };
+        var widen = window.LastOrDefault(i => i is { Mnemonic: Mnemonic.Movsxd or Mnemonic.Movzx or Mnemonic.Mov, Op0Kind: OpKind.Register, Op1Kind: OpKind.Register }
+                                              && i.Op0Register.GetFullRegister() == index.GetFullRegister() && i.IP < load.IP);
+        if (widen.Code != Code.INVALID)
+            indexSources.Add(widen.Op1Register.GetFullRegister());
+
         var count = 0;
         var bound = _recent.LastOrDefault(i => i is { Mnemonic: Mnemonic.Cmp, Op0Kind: OpKind.Register } && i.Op1Kind is OpKind.Immediate8 or OpKind.Immediate32 or OpKind.Immediate8to32 or OpKind.Immediate8to64 or OpKind.Immediate32to64
-                                               && i.Op0Register.GetFullRegister() == index.GetFullRegister() && i.IP < load.IP && load.IP - i.IP < 64);
+                                               && indexSources.Contains(i.Op0Register.GetFullRegister()) && i.IP < load.IP && load.IP - i.IP < 64);
         if (bound.Code != Code.INVALID)
             count = (int)bound.GetImmediate(1) + 1;
-
-        if (count is <= 0 or > 512 || !context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var raw))
-            return null;
 
         var content = context.AppContext.Binary.GetRawBinaryContent();
         var start = context.UnderlyingPointer;
         var end = context.AppContext.GetAddressOfNextFunctionStart(start);
+
+        // A second switch on the same value reuses the first one's bound check, so there's none to read the size from:
+        // the table then runs until an entry leaves the function or the method's next table starts
+        if (count == 0 && context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var unboundedRaw))
+        {
+            var otherTables = X86Utils.Iterate(context)
+                .Where(i => i is { Op1Kind: OpKind.Memory, MemoryIndexScale: 4 } && i.MemoryIndex != Register.None && i.MemoryBase != Register.None)
+                .Select(i => imageBase + (uint)i.MemoryDisplacement32)
+                .Where(t => t > table)
+                .DefaultIfEmpty(ulong.MaxValue)
+                .Min();
+
+            while (count < 256 && table + 4UL * (ulong)(count + 1) <= otherTables && unboundedRaw + 4 * count + 4 <= content.Length)
+            {
+                var entry = imageBase + BitConverter.ToUInt32(content.Slice((int)unboundedRaw + 4 * count, 4).ToArray(), 0);
+                if (entry < start || end == 0 || entry >= end)
+                    break;
+                count++;
+            }
+        }
+
+        if (count is <= 0 or > 512 || !context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var raw))
+            return null;
         var targets = new List<ulong>();
         for (var k = 0; k < count; k++)
         {
@@ -160,6 +187,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
     // The calling convention gives stack arguments relative to rsp on entry to the callee, which is one return address
     // further on than at the call site
+    public const int InvokerStackArguments = 6;
+
     private static IEnumerable<ISIL.IOperand> AtCallSite(IEnumerable<ISIL.IOperand> arguments)
         => arguments.Select(a => a is ISIL.StackOffset slot ? new ISIL.StackOffset(slot.Offset - 8) : a);
 
@@ -814,6 +843,27 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     var call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), new ISIL.Register(null, "rax") /* return value */);
                     call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
 
+                    // invokers pass the method's further arguments on, some of them on the stack: keep those slots too
+                    // ([target, rax, 4 int registers, 4 float registers, then rsp+20h, +28h, ...])
+                    // (only the slots the caller just stored to, so nothing else on the stack looks used)
+                    if (context != null && Utils.NativeHelpers.Classify(context.AppContext, target) is Utils.NativeHelperKind.VirtualInvoker or Utils.NativeHelperKind.InterfaceInvoker)
+                    {
+                        var stored = new HashSet<int>();
+                        for (var back = instructions.Count - 2; back >= 0; back--)
+                        {
+                            var previous = instructions[back];
+                            if (previous.OpCode is ISIL.OpCode.Call or ISIL.OpCode.CallVoid or ISIL.OpCode.IndirectCall or ISIL.OpCode.Jump or ISIL.OpCode.ConditionalJump or ISIL.OpCode.Return)
+                                break;
+                            if (previous is { OpCode: ISIL.OpCode.Move, Operands: [ISIL.StackOffset { Offset: >= 0x20 and < 0x20 + InvokerStackArguments * 8 } argument, _] } && (argument.Offset - 0x20) % 8 == 0)
+                                stored.Add((argument.Offset - 0x20) / 8);
+                        }
+
+                        var count = 0;
+                        while (stored.Contains(count))
+                            count++;
+                        call.AddOperands(Enumerable.Range(0, count).Select(i => (ISIL.IOperand)new ISIL.StackOffset(0x20 + i * 8)));
+                    }
+
                     // as for indirect calls, the result may really be in xmm0
                     if (!callNoReturn && context != null)
                         Add(instruction.IP, ISIL.OpCode.Move, new ISIL.Register(null, "xmm0"), new ISIL.Register(null, "rax"));
@@ -1159,6 +1209,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.Not, temp2, new ISIL.Register(null, "ZF")); // TEMP2 = !ZF
                     Add(instruction.IP, ISIL.OpCode.And, temp, temp, temp2); // TEMP = TEMP && TEMP2
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 
@@ -1173,6 +1225,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.CheckEqual, temp, new ISIL.Register(null, "SF"), new ISIL.Register(null, "OF")); // TEMP = SF == OF
                     Add(instruction.IP, ISIL.OpCode.Not, temp, temp); // TEMP = !TEMP
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 
@@ -1186,6 +1240,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
                     Add(instruction.IP, ISIL.OpCode.CheckEqual, temp, new ISIL.Register(null, "SF"), new ISIL.Register(null, "OF")); // TEMP = SF == OF
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 
@@ -1201,6 +1257,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.Not, temp, temp); // TEMP = !TEMP
                     Add(instruction.IP, ISIL.OpCode.Or, temp, temp, new ISIL.Register(null, "ZF")); // TEMP = TEMP || ZF
                     Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTarget), temp);
+                    if (instruction.Mnemonic is Mnemonic.Ja or Mnemonic.Jb or Mnemonic.Jae or Mnemonic.Jbe)
+                        instructions[^1].Unsigned = true;
                     break;
                 }
 

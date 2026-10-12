@@ -126,6 +126,7 @@ public static class LocalVariables
                 continue;
 
             local.Name = method.Parameters[i].ParameterName;
+            local.ParameterIndex = i;
             paramLocals.Add(local);
         }
 
@@ -260,6 +261,10 @@ public static class LocalVariables
         // in turn type what it flows into
         if (DefaultUntypedLocals(method))
             RunTypeAndFieldFixpoint(method);
+
+        // two neighbouring int fields read as one long
+        if (WideChunkSplitter.SplitIntegerPairs(method))
+            RunTypeAndFieldFixpoint(method);
     }
 
     private static bool DefaultUntypedLocals(MethodAnalysisContext method)
@@ -334,6 +339,8 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= ArrayPointerLoopRecovery.Run(method);
             changed |= RgctxResolver.Run(method);
+            changed |= KeyFunctionRecovery.RewriteUnboxes(method);
+            changed |= CastNarrowing.Run(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
@@ -560,12 +567,34 @@ public static class LocalVariables
         return true;
     }
 
+    // What a resolved call returns is ground truth: it also replaces a type guessed for the register that is plainly
+    // something else (a struct for a reference, or the other way round), which a use or a copy can have put there
+    private static bool SetFromReturn(LocalVariable local, TypeAnalysisContext type)
+    {
+        if (SetFromDefinition(local, type))
+            return true;
+
+        if (local.Type == null || local.TypeReplacements >= MaxTypeReplacements
+            || local.Type is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            || type is GenericParameterTypeAnalysisContext || local.Type is GenericParameterTypeAnalysisContext
+            || Kind(local.Type) == Kind(type))
+            return false;
+
+        local.Type = type;
+        local.TypeReplacements++;
+        return true;
+    }
+
+    // reference, primitive (or enum), struct: values of different kinds can't be the same value
+    private static int Kind(TypeAnalysisContext type) =>
+        !type.IsValueType || type is ByRefTypeAnalysisContext or PointerTypeAnalysisContext ? 0 : MetadataResolver.IsPrimitiveOrEnum(type) ? 1 : 2;
+
     private static bool IsPlainClass(TypeAnalysisContext type) =>
         type is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
             or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext or SzArrayTypeAnalysisContext)
         && !type.IsValueType && !type.IsInterface && type.FullName != "System.Object";
 
-    private static bool IsStrictlyMoreDerived(TypeAnalysisContext candidate, TypeAnalysisContext current)
+    internal static bool IsStrictlyMoreDerived(TypeAnalysisContext candidate, TypeAnalysisContext current)
     {
         if (candidate is RuntimeClassTypeAnalysisContext { RepresentedType: var candidateClass } && current is RuntimeClassTypeAnalysisContext { RepresentedType: var currentClass })
             return IsStrictlyMoreDerived(candidateClass, currentClass);
@@ -616,6 +645,12 @@ public static class LocalVariables
     {
         var changed = false;
 
+        // locals holding null (or 0): no type of their own to give a phi
+        var nulls = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable zero, Immediate { Value: 0 }] })
+                nulls.Add(zero);
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             switch (instruction.OpCode)
@@ -625,6 +660,18 @@ public static class LocalVariables
                     break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
+                    changed |= RefinePhi(instruction, nulls);
+                    break;
+                // a new T[], before it's rewritten into NewArr: typed by the array class it's given
+                case OpCode.Call when instruction.Operands is [StringLiteral { Value: var allocator }, LocalVariable allocated, var arrayClass, ..]
+                                      && ArrayRecovery.ArrayNewFunctions.Contains(allocator):
+                    changed |= SetTypeIfUnknown(allocated, arrayClass switch
+                    {
+                        LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: SzArrayTypeAnalysisContext arrayType } } => arrayType,
+                        RuntimeClassTypeAnalysisContext { RepresentedType: SzArrayTypeAnalysisContext arrayType } => arrayType,
+                        SzArrayTypeAnalysisContext arrayType => arrayType,
+                        _ => null,
+                    });
                     break;
                 case OpCode.IsInst when instruction.Operands[0] is LocalVariable castResult:
                     changed |= SetTypeIfUnknown(castResult, instruction.Operands[1] switch
@@ -764,6 +811,16 @@ public static class LocalVariables
             && (elementAccess.Index != null || elementAccess.Addend >= 4L * pointerSize))
             return SetTypeIfUnknown(elementDest, elementType);
 
+        // the whole value behind a pointer to a primitive or enum (ref/out parameters, unboxed values) is of that type
+        if (destination is LocalVariable { Type: null } primitiveLoad
+            && source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } loadedPointee } } } primitiveSource
+            && MetadataResolver.IsPrimitiveOrEnum(loadedPointee) && primitiveSource.Size == TypeSizes.StorageSize(loadedPointee, pointerSize))
+            return SetTypeIfUnknown(primitiveLoad, loadedPointee);
+        if (source is LocalVariable { Type: null } primitiveStore
+            && destination is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } storedPointee } } } primitiveDestination
+            && MetadataResolver.IsPrimitiveOrEnum(storedPointee) && primitiveDestination.Size == TypeSizes.StorageSize(storedPointee, pointerSize))
+            return SetTypeIfUnknown(primitiveStore, storedPointee);
+
         // Move local, [byref]: dereferencing a managed pointer to a reference type yields that referent
         // (a struct byref accesses fields directly with no deref, so this only fires for class referents).
         if (destination is LocalVariable { Type: null } derefDest
@@ -822,6 +879,37 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    // A phi typed early by a use (or by a null input typed by one) can be refined once its real inputs are known: to the
+    // most derived class all of its non-null inputs share
+    private static bool RefinePhi(Instruction phi, HashSet<LocalVariable> nulls)
+    {
+        if (phi.Operands[0] is not LocalVariable { Type: { } current } destination || !IsPlainClass(current) && current.FullName != "System.Object")
+            return false;
+
+        TypeAnalysisContext? common = null;
+        for (var i = 1; i < phi.Operands.Count; i++)
+        {
+            if (phi.Operands[i] is not LocalVariable input || ReferenceEquals(input, destination) || nulls.Contains(input))
+                continue;
+            if (input.Type is not { } inputType || !IsPlainClass(inputType))
+                return false;
+
+            common = common == null ? inputType : CommonBase(common, inputType);
+            if (common == null)
+                return false;
+        }
+
+        return common != null && SetOrRefineType(destination, common);
+    }
+
+    private static TypeAnalysisContext? CommonBase(TypeAnalysisContext a, TypeAnalysisContext b)
+    {
+        for (var candidate = a; candidate != null; candidate = candidate.BaseType)
+            if (MetadataResolver.IsInHierarchy(b, candidate))
+                return IsPlainClass(candidate) ? candidate : null;
+        return null;
     }
 
     /// <summary>
@@ -887,7 +975,7 @@ public static class LocalVariables
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
 
                 if (producedType != method.AppContext.SystemTypes.SystemVoidType && !HasForeignGenericParameters(producedType, method))
-                    changed |= SetOrRefineType(returnValue, producedType);
+                    changed |= SetFromReturn(returnValue, producedType);
             }
 
 
@@ -904,8 +992,10 @@ public static class LocalVariables
             var thisParamIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
 
             // 'this' param
+            // (anything can be the receiver of a System.Object method, e.g. GetType, so that says nothing)
             if (!calledMethod.IsStatic
-                && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
+                && instruction.Operands[thisParamIndex] is LocalVariable thisParam
+                && calledMethod.DeclaringType != method.AppContext.SystemTypes.SystemObjectType)
             {
                 changed |= SetTypeIfUnknown(thisParam, calledMethod.DeclaringType);
             }
@@ -965,18 +1055,13 @@ public static class LocalVariables
         if (method.Parameters.Count == 0)
             return;
 
-        // Normal params
-        var paramIndex = 0;
+        // Normal params (by the index each was named from: a parameter the body never reads has no local)
         foreach (var local in method.ParameterLocals)
         {
-            if (local.IsThis || local.IsMethodInfo)
+            if (local.IsThis || local.IsMethodInfo || local.ParameterIndex < 0 || local.ParameterIndex >= method.Parameters.Count)
                 continue;
 
-            if (paramIndex >= method.Parameters.Count)
-                break;
-
-            local.Type = method.Parameters[paramIndex].ParameterType;
-            paramIndex++;
+            local.Type = method.Parameters[local.ParameterIndex].ParameterType;
         }
     }
 

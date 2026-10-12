@@ -45,11 +45,43 @@ public static class FlagConditionRecovery
 
                 // Rewrite the condition's defining instruction in place into a single comparison.
                 // Its destination (the condition local the branch reads) is preserved.
+                // unsigned against zero is (in)equality: x >u 0 is x != 0, x <=u 0 is x == 0 (a null test, typically)
+                if (instruction.Unsigned)
+                {
+                    if (IsZero(op1, defOf))
+                        relop = relop switch { OpCode.CheckGreater => OpCode.CheckNotEqual, OpCode.CheckLessOrEqual => OpCode.CheckEqual, _ => relop };
+                    else if (IsZero(op0, defOf))
+                        relop = relop switch { OpCode.CheckLess => OpCode.CheckNotEqual, OpCode.CheckGreaterOrEqual => OpCode.CheckEqual, _ => relop };
+                }
+
                 var definition = defOf[condition];
                 definition.OpCode = relop;
                 definition.SetOperands(definition.Operands[0], op0!, op1!);
             }
         }
+    }
+
+    private static bool IsZero(IOperand? operand, Dictionary<LocalVariable, Instruction> defOf)
+    {
+        for (var hops = 0; hops < 4; hops++)
+        {
+            switch (operand)
+            {
+                case Immediate { Value: 0 }:
+                    return true;
+                case LocalVariable local when defOf.TryGetValue(local, out var definition):
+                    if (definition is { OpCode: OpCode.Xor, Operands: [_, var left, var right] } && left.Equals(right))
+                        return true;
+                    if (definition is not { OpCode: OpCode.Move, Operands: [_, var source] })
+                        return false;
+                    operand = source;
+                    continue;
+                default:
+                    return false;
+            }
+        }
+
+        return false;
     }
 
     private static Dictionary<LocalVariable, Instruction> BuildDefMap(ISILControlFlowGraph cfg)

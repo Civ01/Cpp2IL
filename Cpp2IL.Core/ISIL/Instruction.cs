@@ -41,6 +41,9 @@ public class Instruction : IOperand
     /// <summary>
     /// Lifted from a scalar single-precision SSE instruction, so it only looks at the low 4 bytes of any xmm register.
     /// </summary>
+    /// <summary>A conditional jump that came from an unsigned condition (ja/jae/jb/jbe), lowered with the signed flag logic.</summary>
+    public bool Unsigned;
+
     public bool ScalarSingle;
 
     public bool IsCall => OpCode is OpCode.Call or OpCode.CallVoid;
@@ -119,6 +122,7 @@ public class Instruction : IOperand
             case OpCode.Newobj:
             case OpCode.Box:
             case OpCode.IsInst:
+            case OpCode.Unbox:
             case OpCode.VectorShuffle:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
@@ -161,8 +165,8 @@ public class Instruction : IOperand
                 or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Box => [_operands[2]],
-            OpCode.IsInst => [_operands[2], _operands[1]],
+            OpCode.Box => [_operands[2], _operands[1]],
+            OpCode.IsInst or OpCode.Unbox => [_operands[2], _operands[1]],
             OpCode.VectorShuffle => [_operands[1], _operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
