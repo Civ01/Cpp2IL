@@ -106,6 +106,8 @@ public static class StackStructRecovery
             }
         }
 
+        AddParameterCopyRoots(method, graph, roots);
+
         if (roots.Count == 0)
             return;
 
@@ -273,6 +275,56 @@ public static class StackStructRecovery
         }
 
         return null;
+    }
+
+    // A struct parameter passed by pointer that the method copies into its frame (MSVC copies a by-value struct
+    // argument it modifies or keeps): the copy is that struct
+    private static void AddParameterCopyRoots(MethodAnalysisContext method, ISILControlFlowGraph graph, List<Root> roots)
+    {
+        var parameterRegisters = new Dictionary<string, TypeAnalysisContext>();
+        var operandIndex = method.IsStatic ? 0 : 1;
+        foreach (var parameter in method.Parameters)
+        {
+            if (operandIndex < method.ParameterOperands.Count && method.ParameterOperands[operandIndex] is Register register
+                && IsStruct(parameter.ParameterType) && TypeSizes.UnboxedSize(parameter.ParameterType, 8) is not (1 or 2 or 4 or 8))
+                parameterRegisters[register.Name] = parameter.ParameterType;
+            operandIndex++;
+        }
+
+        if (parameterRegisters.Count == 0)
+            return;
+
+        // follow the registers from the entry, as long as there's a single path
+        var live = new Dictionary<string, TypeAnalysisContext>(parameterRegisters);
+        var block = graph.EntryBlock.Successors.Distinct().ToList() is [{ } first] ? first : null;
+        var visited = new HashSet<Block>();
+        while (block != null && visited.Add(block))
+        {
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction is { OpCode: OpCode.Move, Operands: [StackOffset destination, MemoryOperand { Base: Register from, Index: null, Addend: 0 } source] }
+                    && live.TryGetValue(from.Name, out var copied) && source.Size == destination.Size && destination.Size == TypeSizes.UnboxedSize(copied, 8))
+                {
+                    roots.Add(new Root(destination.Offset, copied, instruction, instruction, false, true));
+                    continue;
+                }
+
+                if (instruction is { OpCode: OpCode.Move, Operands: [Register to, Register copiedFrom] } && live.TryGetValue(copiedFrom.Name, out var carried))
+                {
+                    live[to.Name] = carried;
+                    continue;
+                }
+
+                if (instruction.Destination is Register overwritten)
+                    live.Remove(overwritten.Name);
+
+                if (instruction.IsCall || instruction.OpCode is OpCode.IndirectCall)
+                    foreach (var volatileRegister in new[] { "rax", "rcx", "rdx", "r8", "r9", "r10", "r11" })
+                        live.Remove(volatileRegister);
+            }
+
+            block = block.Successors.Distinct().ToList() is [{ } next] && next.Predecessors.Distinct().Count() == 1 ? next : null;
+        }
     }
 
     private sealed record Root(int Offset, TypeAnalysisContext Type, Instruction Call, Instruction Definition, bool CalleeReads, bool CalleeWrites);

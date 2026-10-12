@@ -110,6 +110,8 @@ public static class InlineMemcpyRecovery
         if (!loop.Successors.Contains(loop) || loop.Instructions.Count < 3)
             return false;
 
+        Debug?.Invoke($"memcpy candidate B{loop.ID}");
+
         var jump = loop.Instructions[^1];
         if (jump.OpCode != OpCode.ConditionalJump)
             return false;
@@ -192,8 +194,11 @@ public static class InlineMemcpyRecovery
             if (instruction.IsCall || instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return or OpCode.IndirectCall or OpCode.IndirectJump or OpCode.Nop)
                 break;
 
-            // Something else touching the destination pointer, or writing memory, ends the tail
-            if (Touches(instruction, destination) || instruction.Operands.Count > 0 && instruction.Operands[0] is MemoryOperand or StackOffset)
+            // Something else touching the destination pointer, or writing memory, ends the tail - except a stack store
+            // well clear of a stack destination (spilling callee-saved registers, which MSVC likes to interleave)
+            if (Touches(instruction, destination) || instruction.Operands.Count > 0 && instruction.Operands[0] is MemoryOperand
+                || instruction.Operands.Count > 0 && instruction.Operands[0] is StackOffset spill
+                   && !(SizedOperand(preheader, destination, 0) is StackOffset copyStart && (spill.Offset >= 0 || spill.Offset >= copyStart.Offset + iterations * stride + 0x80 || spill.Offset + 16 <= copyStart.Offset)))
                 break;
 
             // Reading the source pointer other than to copy from it ends it too
@@ -223,7 +228,7 @@ public static class InlineMemcpyRecovery
 
         var pairedInstructions = rest.Pairs.SelectMany(p => new[] { p.Load, p.Store }).ToHashSet();
         if (consumed.Any(c => !pairedInstructions.Contains(c)))
-            return false; // a load that was not stored, cannot reason about it
+            { Debug?.Invoke($"memcpy loop B{loop.ID} rejected: unstored tail load: " + string.Join(" | ", consumed.Where(c => !pairedInstructions.Contains(c)))); return false; } // a load that was not stored, cannot reason about it
 
         // After the copy the advanced pointers must be dead
         if (sourceAlive && !DeadAfter(tail, tailEnd, source) || !DeadAfter(tail, tailEnd, destination))
@@ -237,6 +242,7 @@ public static class InlineMemcpyRecovery
 
         loop.Instructions.Clear();
         loop.Instructions.Add(copy);
+        loop.Instructions.Add(new Instruction(copy.Index, OpCode.Move, new Register(null, counter), new Immediate(0))); // the loop leaves its counter at 0
         loop.Successors.RemoveAll(s => s == loop);
         loop.Predecessors.RemoveAll(p => p == loop);
         loop.BlockType = BlockType.Fall;
