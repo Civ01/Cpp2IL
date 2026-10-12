@@ -74,6 +74,13 @@ public static class NativeHelpers
         if (app.MethodsByAddress.ContainsKey(address))
             return NativeHelperKind.Unknown;
 
+        // A write barrier variant taking the field address in rdx (mov rcx,rdx / jmp the barrier's target): no effect
+        // on what the code means
+        if (body.Count >= 2 && first is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RCX, Op1Register: Register.RDX }
+            && body[1] is { Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.NearBranch64 } barrierJump
+            && WriteBarrierTarget(app) is { } barrierTarget && barrierJump.NearBranchTarget == barrierTarget)
+            return NativeHelperKind.Empty;
+
         if (body.Count >= 3
             && first is { Mnemonic: Mnemonic.Sub, Op0Register: Register.RSP, Op1Kind: OpKind.Immediate8to64 or OpKind.Immediate32to64 or OpKind.Immediate8 }
             && body[1] is { Mnemonic: Mnemonic.Mov, Op0Kind: OpKind.Memory, MemoryBase: Register.RSP, Op1Register: Register.R10 }
@@ -107,6 +114,16 @@ public static class NativeHelpers
             return NativeHelperKind.RaiseInvalidCast;
 
         return NativeHelperKind.Unknown;
+    }
+
+    private static ulong? WriteBarrierTarget(ApplicationAnalysisContext app)
+    {
+        var barrier = app.GetOrCreateKeyFunctionAddresses().il2cpp_codegen_write_barrier;
+        if (barrier == 0)
+            return null;
+
+        var body = X86Utils.GetMethodBodyAtVirtAddressNew(barrier, true, app, 4);
+        return body is [{ Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.NearBranch64 } jump, ..] ? jump.NearBranchTarget : barrier;
     }
 
     /// <summary>

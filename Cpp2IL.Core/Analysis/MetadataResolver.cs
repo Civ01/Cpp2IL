@@ -892,6 +892,10 @@ public static class MetadataResolver
 
         for (var i = call.Operands.Count - 1; i >= firstArg; i--)
         {
+            // an unresolved call's raw argument registers include our own MethodInfo param, still sitting in r9
+            if (call.Operands[i] is LocalVariable { IsMethodInfo: true })
+                continue;
+
             if (AsMethodInfo(call.Operands[i]) is { } methodInfo)
                 return methodInfo;
         }

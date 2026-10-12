@@ -43,6 +43,16 @@ public static class InterfaceDispatchRecovery
                 if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                     continue;
 
+                if (MatchGenericVirtual(instruction, definitions) is { } genericVirtual)
+                {
+                    RewriteDispatch(method, instruction, block, genericVirtual, definitions);
+                    ReplaceUsesOf(cfg, genericVirtual.SlowCall, new RuntimeMethodInfoAnalysisContext(genericVirtual.Resolved,
+                        genericVirtual.Resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType!.DeclaringAssembly));
+                    slowCalls.Add(genericVirtual.SlowCall);
+                    changed = true;
+                    continue;
+                }
+
                 if (MatchSlowPathOnly(instruction, definitions) is { } slowOnly)
                 {
                     RewriteDispatch(method, instruction, block, slowOnly, definitions);
@@ -167,6 +177,54 @@ public static class InterfaceDispatchRecovery
             return null;
 
         return new Match(resolved, slowCall, null!, slowCall, invokeData);
+    }
+
+    // A generic virtual method call: the runtime finds the override of the generic method (a MethodInfo global) for the
+    // object's class, then the code calls its method pointer, passing that MethodInfo along
+    //   rcx = klass->vtable[slot].method / rdx = methodof(Base.M<T>) / call GetGenericVirtualMethod / call [rax+8]
+    private static Match? MatchGenericVirtual(Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var targetLoad = dispatch.Operands[0] switch
+        {
+            MemoryOperand folded => folded,
+            LocalVariable target when Definition(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
+            _ => default(MemoryOperand?)
+        };
+
+        if (targetLoad is not { Index: null, Scale: 0, Addend: 8, Base: LocalVariable resolvedMethod })
+            return null;
+
+        if (ChaseLocalCopies(definitions, resolvedMethod) is not { OpCode: OpCode.Call, Operands: [Immediate, LocalVariable, _, LocalVariable genericMethodArg, ..] } lookup)
+            return null;
+
+        if (ChaseCopies(definitions, genericMethodArg) is not { OpCode: OpCode.Move, Operands: [_, RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } called }] })
+            return null;
+
+        if (called.IsStatic || called.GenericParameters.Count == 0 && called is not ConcreteGenericMethodAnalysisContext)
+            return null;
+
+        return new Match(called, lookup, null!, lookup, resolvedMethod);
+    }
+
+    // Anything still reading the looked-up MethodInfo reads that method's MethodInfo
+    private static void ReplaceUsesOf(ISILControlFlowGraph cfg, Instruction call, IOperand replacement)
+    {
+        if (call.Operands.Count < 2 || call.Operands[1] is not LocalVariable result)
+            return;
+
+        var copies = new HashSet<LocalVariable> { result };
+        foreach (var instruction in cfg.Instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable copy, LocalVariable source] } && copies.Contains(source))
+                copies.Add(copy);
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction == call)
+                continue;
+            for (var i = 0; i < instruction.Operands.Count; i++)
+                if (instruction.Operands[i] is LocalVariable used && copies.Contains(used) && !ReferenceEquals(instruction.Destination, used))
+                    instruction.SetOperand(i, replacement);
+        }
     }
 
     // The definition behind a chain of plain local copies

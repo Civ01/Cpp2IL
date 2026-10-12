@@ -25,8 +25,19 @@ internal static class KnownNativeFunctions
         new(0x18048C0E0, "4883ec38803df24fcc03000f", "UnityEngine.Mathf", "RoundToInt", ["System.Single"]),
         new(0x18000D0D0, "4883ec380f29742420488d54", "UnityEngine.Mathf", "Round", ["System.Single"]),
         new(0x18048C940, "48895c240848897424105748", "UnityEngine.Vector3", "Normalize", ["UnityEngine.Vector3"]),
+        new(0x18044A920, "833dc952d003020f8d73bf01", "UnityEngine.Mathf", "Floor", ["System.Single"]),
+        new(0x18044D7A0, "833d4924d003020f8d139101", "UnityEngine.Mathf", "Ceil", ["System.Single"]),
+        new(0x18044AA70, "8b05b251d20383e0033c030f", "UnityEngine.Mathf", "Atan2", ["System.Single", "System.Single"]),
+        new(0x18044D840, "8b05e223d20383e0033c030f", "UnityEngine.Mathf", "Acos", ["System.Single"]),
+        new(0x18044B6C0, "833d6145d203000f8483feff", "UnityEngine.Mathf", "Exp", ["System.Single"]),
         new(0x1803BA6D0, "40534883ec20498bd8498bc0", "System.Threading.Interlocked", "CompareExchange", ["System.Object&", "System.Object", "System.Object"]),
     ];
+
+    public static List<MethodAnalysisContext>? Named(ApplicationAnalysisContext app, string type, string name, int parameterCount)
+    {
+        var method = app.AllTypes.FirstOrDefault(t => t.FullName == type)?.Methods.FirstOrDefault(m => m.Name == name && m.Parameters.Count == parameterCount);
+        return method == null ? null : [method];
+    }
 
     public static List<MethodAnalysisContext>? Lookup(ApplicationAnalysisContext app, ulong address)
     {
