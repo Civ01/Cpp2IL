@@ -21,6 +21,8 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class ArrayPointerLoopRecovery
 {
+    public static System.Action<string>? Debug;
+
     public static bool Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
@@ -82,6 +84,7 @@ public static class ArrayPointerLoopRecovery
                     }
                 }
 
+                Debug?.Invoke($"pointer phi {pointerPhi}: valid={valid} array={array} steps={steps.Count} size={elementSize}");
                 if (!valid || array == null || arrayType == null || initialInputs.Count == 0 || steps.Count == 0)
                     continue;
 
@@ -102,8 +105,7 @@ public static class ArrayPointerLoopRecovery
                         var operand = indexPhi.Operands[input];
                         if (initialInputs.Contains(input))
                         {
-                            if (!(operand is Immediate { Value: 0 } || operand is LocalVariable zero && definitions.TryGetValue(zero, out var zeroDefinition)
-                                    && zeroDefinition is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] }))
+                            if (!(operand is Immediate { Value: 0 } || operand is LocalVariable zero && ChaseCopies(definitions, zero) is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] }))
                                 return false;
                         }
                         else if (operand is not LocalVariable next || !definitions.TryGetValue(next, out var nextDefinition)
@@ -115,8 +117,37 @@ public static class ArrayPointerLoopRecovery
                     return true;
                 });
 
+                Debug?.Invoke($"  index {index}");
+
+                // no counter alongside it (the loop compares against an end pointer): make one
                 if (index == null)
-                    continue;
+                {
+                    if (steps.Count != 1 || !UsedOnlyAsElementPointer(graph, pointer, pointerPhi, steps))
+                        continue;
+
+                    var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+                    var synthesized = NewLocal(method, "index", int32);
+                    var next = NewLocal(method, "nextIndex", int32);
+                    var operands = new List<IOperand> { synthesized };
+                    for (var input = 1; input < pointerPhi.Operands.Count; input++)
+                    {
+                        if (initialInputs.Contains(input))
+                        {
+                            var zero = NewLocal(method, "startIndex", int32);
+                            var startDefinition = definitions[(LocalVariable)pointerPhi.Operands[input]];
+                            var startBlock = graph.Blocks.First(b => b.Instructions.Contains(startDefinition));
+                            startBlock.Instructions.Insert(startBlock.Instructions.IndexOf(startDefinition) + 1, new Instruction(startDefinition.Index, OpCode.Move, zero, new Immediate(0)));
+                            operands.Add(zero);
+                        }
+                        else
+                            operands.Add(next);
+                    }
+
+                    block.Instructions.Insert(block.Instructions.IndexOf(pointerPhi) + 1, new Instruction(pointerPhi.Index, OpCode.Phi, operands));
+                    var stepBlock = graph.Blocks.First(b => b.Instructions.Contains(steps[0]));
+                    stepBlock.Instructions.Insert(stepBlock.Instructions.IndexOf(steps[0]) + 1, new Instruction(steps[0].Index, OpCode.Add, next, synthesized, new Immediate(1)));
+                    index = synthesized;
+                }
 
                 if (Rewrite(method, block, pointerPhi, pointer, array, elementType, index, steps))
                     changed = true;
@@ -258,6 +289,36 @@ public static class ArrayPointerLoopRecovery
         }
 
         return changed;
+    }
+
+    // The pointer is only dereferenced (so it can be replaced wholesale) - an end-of-loop compare against another pointer
+    // would still need it
+    private static bool UsedOnlyAsElementPointer(Graphs.ISILControlFlowGraph graph, LocalVariable pointer, Instruction phi, List<Instruction> steps)
+    {
+        var stepped = steps.Select(s => (LocalVariable)s.Operands[0]).ToList();
+        foreach (var instruction in graph.Instructions)
+        {
+            if (instruction == phi || steps.Contains(instruction))
+                continue;
+
+            foreach (var operand in instruction.Operands)
+            {
+                if (operand is MemoryOperand { Base: var memoryBase, Index: null } && ReferenceEquals(memoryBase, pointer))
+                    continue;
+                if (Mentions(operand, pointer) || stepped.Any(n => Mentions(operand, n)))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
+    {
+        var definition = definitions.GetValueOrDefault(local);
+        for (var hops = 0; hops < 4 && definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }; hops++)
+            definition = definitions.GetValueOrDefault(copied);
+        return definition;
     }
 
     private static LocalVariable NewLocal(MethodAnalysisContext method, string name, TypeAnalysisContext type)
