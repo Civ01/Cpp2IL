@@ -39,6 +39,12 @@ public static class ConstantFolder
             {
                 case OpCode.CheckEqual: return ToConstant(instruction, a == b ? 1 : 0);
                 case OpCode.CheckNotEqual: return ToConstant(instruction, a != b ? 1 : 0);
+                case OpCode.CheckLess: return ToConstant(instruction, a < b ? 1 : 0);
+                case OpCode.CheckLessOrEqual: return ToConstant(instruction, a <= b ? 1 : 0);
+                case OpCode.CheckGreater: return ToConstant(instruction, a > b ? 1 : 0);
+                case OpCode.CheckGreaterOrEqual: return ToConstant(instruction, a >= b ? 1 : 0);
+                case OpCode.Add: return ToConstant(instruction, a + b);
+                case OpCode.Subtract: return ToConstant(instruction, a - b);
                 case OpCode.And: return ToConstant(instruction, a & b);
                 case OpCode.Or: return ToConstant(instruction, a | b);
                 case OpCode.Xor: return ToConstant(instruction, a ^ b);

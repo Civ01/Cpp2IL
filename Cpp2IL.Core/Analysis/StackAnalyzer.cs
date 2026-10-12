@@ -46,6 +46,12 @@ public class StackAnalyzer
 
         analyzer.ResolveFrameAliases(graph);
         analyzer.CorrectOffsets(graph);
+        NativeHelperRecovery.RunEarly(method, graph);
+        InlinedIsInstRecovery.Run(method, graph);
+        InlinedInterfaceLookupRemoval.Run(method, graph);
+        InlineMemcpyRecovery.Run(method, graph);
+        VectorLaneRecovery.Run(method, graph);
+        StackStructRecovery.Run(method, graph);
         ReplaceStackWithRegisters(method);
 
         graph.RemoveNops();
@@ -57,31 +63,79 @@ public class StackAnalyzer
     private void ResolveFrameAliases(ISILControlFlowGraph graph)
     {
         var aliases = new Dictionary<string, int>();
+        var aliasDefinitions = new HashSet<Instruction>();
 
         foreach (var instruction in graph.EntryBlock.Successors.SelectMany(b => b.Instructions))
         {
-            if (instruction is { OpCode: OpCode.Move, Operands: [Register destination, Register { Name: "rsp" }] }
-                && _instructionState.TryGetValue(instruction, out var atCopy))
+            if (!_instructionState.TryGetValue(instruction, out var atCopy))
+                continue;
+
+            // mov reg, rsp
+            if (instruction is { OpCode: OpCode.Move, Operands: [Register destination, Register { Name: "rsp" }] })
+            {
                 aliases[destination.Name] = atCopy.Size;
+                aliasDefinitions.Add(instruction);
+            }
+            // lea reg, [rsp+x] - MSVC sets up rbp as a frame pointer this way (lea rbp,[rsp-98h]) in larger methods
+            else if (instruction is { OpCode: OpCode.Move, Operands: [Register { Name: not "rsp" } leaDestination, AddressOf { Target: StackOffset frameSlot }] })
+            {
+                aliases[leaDestination.Name] = atCopy.Size + frameSlot.Offset;
+                aliasDefinitions.Add(instruction);
+            }
+            // mov rax,rsp / lea rbp,[rax-87h]: a frame register derived from another alias
+            else if (instruction is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [Register derived, Register derivedFrom, Immediate derivedBy] }
+                     && derived.Name != derivedFrom.Name && derived.Name != "rsp" && aliases.TryGetValue(derivedFrom.Name, out var fromOffset))
+            {
+                aliases[derived.Name] = (int)(fromOffset + (instruction.OpCode == OpCode.Add ? derivedBy.Value : -derivedBy.Value));
+                aliasDefinitions.Add(instruction);
+            }
         }
 
         if (aliases.Count == 0)
             return;
 
-        // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely
+        // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely.
+        // The exception is the epilogue restoring the caller's value from the stack (pop rbp), after which
+        // the register is never used as a frame base again.
         foreach (var instruction in graph.Instructions)
         {
-            if (instruction is { OpCode: OpCode.Move, Operands: [Register, Register { Name: "rsp" }] })
+            if (aliasDefinitions.Contains(instruction))
+                continue;
+
+            if (instruction is { OpCode: OpCode.Move, Operands: [Register, StackOffset] })
                 continue;
 
             if (instruction.Destination is Register written)
                 aliases.Remove(written.Name);
         }
 
+        if (aliases.Count == 0)
+            return;
+
         foreach (var instruction in graph.Instructions)
         {
             if (!_instructionState.TryGetValue(instruction, out var state))
                 continue;
+
+            if (aliasDefinitions.Contains(instruction))
+                continue;
+
+            // lea reg, [frame+x] - lowered to an add/sub/move of the frame register - is the address of a stack slot
+            if (instruction is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [Register addressDestination, Register { } addressBase, Immediate displacement] }
+                && aliases.TryGetValue(addressBase.Name, out var addressFrame))
+            {
+                var delta = instruction.OpCode == OpCode.Add ? displacement.Value : -displacement.Value;
+                instruction.OpCode = OpCode.Move;
+                instruction.SetOperands(addressDestination, new AddressOf(new StackOffset((int)(addressFrame + delta - state.Size))));
+                continue;
+            }
+
+            if (instruction is { OpCode: OpCode.Move, Operands: [Register copyDestination, Register { } copySource] }
+                && aliases.TryGetValue(copySource.Name, out var copyFrame) && !aliases.ContainsKey(copyDestination.Name))
+            {
+                instruction.SetOperands(copyDestination, new AddressOf(new StackOffset((int)(copyFrame - state.Size))));
+                continue;
+            }
 
             for (var i = 0; i < instruction.Operands.Count; i++)
             {
@@ -91,7 +145,22 @@ public class StackAnalyzer
                 if (!aliases.TryGetValue(frameBase.Name, out var frameOffset))
                     continue;
 
-                instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size)));
+                instruction.SetOperand(i, new StackOffset((int)(frameOffset + memory.Addend - state.Size), memory.Size));
+            }
+        }
+
+        // The frame register itself is now dead; drop its setup so it doesn't linger as a bogus local
+        foreach (var definition in aliasDefinitions)
+        {
+            if (definition.Operands[0] is Register { Name: not "rsp" } frameRegister && definition.Operands[1] is AddressOf
+                && aliases.ContainsKey(frameRegister.Name)
+                && !graph.Instructions.Any(other => !ReferenceEquals(other, definition) && other.OpCode != OpCode.ShiftStack
+                    && (other.Sources.Any(source => source is Register used && used.Name == frameRegister.Name)
+                        || other.Operands.Any(operand => operand is MemoryOperand memory
+                            && (memory.Base is Register { } b && b.Name == frameRegister.Name || memory.Index is Register { } x && x.Name == frameRegister.Name)))))
+            {
+                definition.OpCode = OpCode.Nop;
+                definition.SetOperands();
             }
         }
     }
@@ -130,7 +199,7 @@ public class StackAnalyzer
                         // as doing so will make the dictionary lookup impossible.
                         state ??= _instructionState[instruction].Size;
 
-                        var actual = new StackOffset(state.Value + offset.Offset);
+                        var actual = new StackOffset(state.Value + offset.Offset, offset.Size);
                         instruction.SetOperand(i, op is AddressOf ? new AddressOf(actual) : actual);
                     }
                 }
@@ -233,5 +302,5 @@ public class StackAnalyzer
         }
     }
 
-    private static string NameForSlot(StackOffset offset) => offset.Offset < 0 ? $"stack_-{-offset.Offset:X}" : $"stack_{offset.Offset:X}";
+    internal static string NameForSlot(StackOffset offset) => offset.Offset < 0 ? $"stack_-{-offset.Offset:X}" : $"stack_{offset.Offset:X}";
 }

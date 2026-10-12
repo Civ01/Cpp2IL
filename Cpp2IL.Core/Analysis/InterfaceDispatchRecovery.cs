@@ -34,6 +34,7 @@ public static class InterfaceDispatchRecovery
         }
 
         var changed = false;
+        var slowCalls = new List<Instruction>();
 
         foreach (var block in cfg.Blocks.ToList())
         {
@@ -41,6 +42,15 @@ public static class InterfaceDispatchRecovery
             {
                 if (instruction.OpCode is not (OpCode.IndirectCall or OpCode.IndirectJump))
                     continue;
+
+                if (MatchSlowPathOnly(instruction, definitions) is { } slowOnly)
+                {
+                    RewriteDispatch(method, instruction, block, slowOnly, definitions);
+                    ReplaceInvokeDataLoads(method, cfg, slowOnly, definitions);
+                    slowCalls.Add(slowOnly.SlowCall);
+                    changed = true;
+                    continue;
+                }
 
                 if (MatchDispatch(method, instruction, definitions, homeBlock) is not { } match)
                     continue;
@@ -53,6 +63,14 @@ public static class InterfaceDispatchRecovery
 
         if (changed)
             DeadCodeEliminator.Run(method);
+
+        // the lookups only fed the calls that are now direct
+        if (slowCalls.Count > 0)
+        {
+            foreach (var slowCall in slowCalls)
+                DropSlowCallIfUnused(cfg, slowCall);
+            DeadCodeEliminator.Run(method);
+        }
     }
 
     private const long VTableOffset = 0x138;
@@ -119,6 +137,82 @@ public static class InterfaceDispatchRecovery
         return new Match(resolved, phi, merge, slowCall, klassLocal);
     }
 
+    // GetInterfaceInvokeDataFromVTableSlowPath(obj, interface, slot) and a call through what it returns, with the inlined
+    // fast path gone (InlinedInterfaceLookupRemoval) or duplicated into its own copy of the call
+    private static Match? MatchSlowPathOnly(Instruction dispatch, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var targetLoad = dispatch.Operands[0] switch
+        {
+            MemoryOperand folded => folded,
+            LocalVariable target when Definition(definitions, target) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand loaded] } => loaded,
+            _ => default(MemoryOperand?)
+        };
+
+        if (targetLoad is not { Index: null, Scale: 0, Addend: 0, Base: LocalVariable invokeData })
+            return null;
+
+        if (ChaseLocalCopies(definitions, invokeData) is not { OpCode: OpCode.Call, Operands: [Immediate, _, _, LocalVariable interfaceArg, LocalVariable slotArg, ..] } slowCall)
+            return null;
+
+        if (ChaseCopies(definitions, interfaceArg) is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext declaringInterface] }
+            || declaringInterface is RuntimeMethodInfoAnalysisContext
+            || !(declaringInterface is GenericInstanceTypeAnalysisContext { GenericType.IsInterface: true } || declaringInterface.IsInterface))
+            return null;
+
+        if (ChaseCopies(definitions, slotArg) is not { OpCode: OpCode.Move, Operands: [_, Immediate slotImmediate] }
+            || slotImmediate.Value is < 0 or > ushort.MaxValue)
+            return null;
+
+        if (ResolveInterfaceSlot(declaringInterface, (int)slotImmediate.Value) is not { } resolved)
+            return null;
+
+        return new Match(resolved, slowCall, null!, slowCall, invokeData);
+    }
+
+    // The definition behind a chain of plain local copies
+    private static Instruction? ChaseLocalCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
+    {
+        for (var depth = 0; depth < 8; depth++)
+        {
+            var definition = Definition(definitions, local);
+            if (definition is not { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
+                return definition;
+            local = source;
+        }
+
+        return null;
+    }
+
+    // Anything else still reading the VirtualInvokeData (raw argument lists of unresolved calls) reads what it holds instead
+    private static void ReplaceInvokeDataLoads(MethodAnalysisContext method, ISILControlFlowGraph cfg, Match match, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var assembly = match.Resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly;
+
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable, MemoryOperand { Index: null, Base: LocalVariable loadBase } load] }
+                || !ReferenceEquals(ChaseLocalCopies(definitions, loadBase), match.SlowCall))
+                continue;
+
+            if (load.Addend == 8 && assembly != null)
+                instruction.SetOperand(1, new RuntimeMethodInfoAnalysisContext(match.Resolved, assembly));
+            else if (load.Addend == 0)
+                instruction.SetOperand(1, new Immediate(0));
+        }
+    }
+
+    private static void DropSlowCallIfUnused(ISILControlFlowGraph cfg, Instruction slowCall)
+    {
+        if (slowCall.Operands.Count < 2 || slowCall.Operands[1] is not LocalVariable result)
+            return;
+
+        if (cfg.Instructions.Any(other => other != slowCall && UsedLocals(other).Contains(result)))
+            return;
+
+        slowCall.OpCode = OpCode.Nop;
+        slowCall.SetOperands();
+    }
+
     private static LocalVariable? MatchVTableEntryChain(Dictionary<LocalVariable, Instruction> definitions, Instruction? vtableEntry, int slot)
     {
         if (vtableEntry is not { OpCode: OpCode.Add, Operands: [_, LocalVariable addLeft, LocalVariable addRight] })
@@ -159,9 +253,11 @@ public static class InterfaceDispatchRecovery
         => definitions.TryGetValue(local, out var definition) ? definition : null;
 
     private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
-    {
-        var visited = new HashSet<LocalVariable>();
+        => ChaseCopies(definitions, local, []);
 
+    // Follows copies, and phis whose inputs all come down to the same value (a class pointer loaded before a loop)
+    private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local, HashSet<LocalVariable> visited)
+    {
         while (visited.Add(local))
         {
             if (Definition(definitions, local) is not { } definition)
@@ -173,13 +269,34 @@ public static class InterfaceDispatchRecovery
                 continue;
             }
 
+            if (definition.OpCode == OpCode.Phi)
+            {
+                Instruction? agreed = null;
+                for (var i = 1; i < definition.Operands.Count; i++)
+                {
+                    if (definition.Operands[i] is not LocalVariable input)
+                        return null;
+                    if (visited.Contains(input))
+                        continue; // round a loop
+
+                    var chased = ChaseCopies(definitions, input, visited);
+                    if (chased is not { OpCode: OpCode.Move, Operands: [_, var value] })
+                        return null;
+                    if (agreed != null && !Equals(agreed.Operands[1], value))
+                        return null;
+                    agreed ??= chased;
+                }
+
+                return agreed;
+            }
+
             return definition;
         }
 
         return null;
     }
 
-    private static MethodAnalysisContext? ResolveInterfaceSlot(TypeAnalysisContext declaringInterface, int slot)
+    internal static MethodAnalysisContext? ResolveInterfaceSlot(TypeAnalysisContext declaringInterface, int slot)
     {
         if (declaringInterface is GenericInstanceTypeAnalysisContext genericInstance)
         {
@@ -226,7 +343,7 @@ public static class InterfaceDispatchRecovery
         {
             if (dispatch.Operands[i] is not LocalVariable argument
                 || Definition(definitions, argument) is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Base: LocalVariable loadBase } load] }
-                || !ReferenceEquals(Definition(definitions, loadBase), match.InvokeDataPhi))
+                || !ReferenceEquals(ChaseLocalCopies(definitions, loadBase), match.InvokeDataPhi))
                 continue;
 
             if (load.Addend == 8 && assembly != null)

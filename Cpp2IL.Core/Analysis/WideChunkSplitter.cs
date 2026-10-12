@@ -1,0 +1,319 @@
+using System.Collections.Generic;
+using System.Linq;
+using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
+
+namespace Cpp2IL.Core.Analysis;
+
+/// <summary>
+/// MSVC copies structs in 8 and 16 byte chunks (movsd/movups) that don't line up with any one field: the x and y of
+/// Vector3.up in one 8 byte load, its z separately. When such a chunk is only ever stored somewhere else (possibly after
+/// passing through a phi, as when a ternary picks Vector3.up or Vector3.right) or read as its first float, it can be
+/// split into one value per field it covers, each of which then resolves as a normal field access.
+/// Runs in SSA form once types are known, before still-untyped locals are given default types.
+/// </summary>
+public static class WideChunkSplitter
+{
+    private sealed record Piece(long Offset, int Size, TypeAnalysisContext Type);
+
+    public static bool Run(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        if (pointerSize != 8)
+            return false;
+
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        var uses = new Dictionary<LocalVariable, List<Instruction>>();
+        foreach (var instruction in graph.Instructions)
+        {
+            if (instruction.Destination is LocalVariable defined)
+                definitions[defined] = instruction;
+
+            foreach (var used in Reads(instruction))
+            {
+                if (!uses.TryGetValue(used, out var list))
+                    uses[used] = list = [];
+                list.Add(instruction);
+            }
+        }
+
+        var leafCache = new Dictionary<(TypeAnalysisContext, bool), List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>>();
+        var done = new HashSet<LocalVariable>();
+        var changed = false;
+
+        foreach (var load in graph.Instructions.ToList())
+        {
+            if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand { Base: LocalVariable, Index: null, Size: 8 or 16 } memory] }
+                || done.Contains(loaded)
+                || Pieces(memory, pointerSize, leafCache) is not { Count: > 1 } pieces)
+                continue;
+
+            // gather everything the chunk flows to
+            var members = new List<LocalVariable>();
+            var stores = new List<Instruction>();
+            if (!Collect(loaded, pieces, memory.Size, members, stores, definitions, uses, pointerSize, leafCache))
+                continue;
+
+            foreach (var member in members)
+                done.Add(member);
+
+            Rewrite(method, members, stores, pieces, definitions);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static IEnumerable<LocalVariable> Reads(Instruction instruction)
+    {
+        var destination = instruction.Destination;
+        foreach (var operand in instruction.Operands)
+        {
+            switch (operand)
+            {
+                case LocalVariable local when !ReferenceEquals(local, destination):
+                    yield return local;
+                    break;
+                case MemoryOperand { Base: LocalVariable memoryBase } memory:
+                    yield return memoryBase;
+                    if (memory.Index is LocalVariable memoryIndex)
+                        yield return memoryIndex;
+                    break;
+                case FieldReference { Local: { } fieldLocal }:
+                    yield return fieldLocal;
+                    break;
+            }
+        }
+    }
+
+    // The fields exactly covering a chunk of memory
+    private static List<Piece>? Pieces(MemoryOperand memory, int pointerSize,
+        Dictionary<(TypeAnalysisContext, bool), List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>> cache)
+    {
+        if (memory.Base is not LocalVariable { Type: { } baseType })
+            return null;
+
+        var pointee = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element : baseType;
+        var isStatic = pointee is StaticFieldStorageTypeAnalysisContext;
+        var owner = (pointee as StaticFieldStorageTypeAnalysisContext)?.OwnerType ?? pointee;
+
+        if (owner is GenericInstanceTypeAnalysisContext genericOwner && !isStatic)
+            return GenericPieces(genericOwner, memory, pointerSize);
+
+        if (owner is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext or RuntimeClassTypeAnalysisContext
+                or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext or PointerTypeAnalysisContext
+            || owner.GenericParameters.Count > 0 || owner.Definition == null)
+            return null;
+
+        if (!cache.TryGetValue((owner, isStatic), out var leaves))
+        {
+            leaves = [];
+            StructCopyRecovery.CollectLeaves(owner, isStatic, 0, [], leaves, pointerSize, 0);
+            cache[(owner, isStatic)] = leaves;
+        }
+
+        var pieces = new List<Piece>();
+        var position = memory.Addend;
+        var end = memory.Addend + memory.Size;
+        while (position < end)
+        {
+            var leaf = leaves.FirstOrDefault(l => l.Offset == position);
+            if (leaf.Chain == null && !leaves.Any(l => l.Offset < position && l.Offset + l.Size > position))
+            {
+                position++; // padding
+                continue;
+            }
+            if (leaf.Chain == null || position + leaf.Size > end)
+                return null;
+
+            pieces.Add(new Piece(position - memory.Addend, (int)leaf.Size, leaf.Chain[^1].FieldType));
+            position += leaf.Size;
+        }
+
+        return pieces;
+    }
+
+    private static List<Piece>? GenericPieces(GenericInstanceTypeAnalysisContext owner, MemoryOperand memory, int pointerSize)
+    {
+        var pieces = new List<Piece>();
+        var position = memory.Addend;
+        var end = memory.Addend + memory.Size;
+
+        while (position < end)
+        {
+            Piece? piece = null;
+            foreach (var size in new[] { 8, 4, 2, 1 })
+            {
+                if (position + size > end
+                    || GenericInstanceFieldLayout.FindFieldChain(owner, position, size, pointerSize) is not { } chain
+                    || StackStructRecovery.IsStruct(chain[^1].FieldType)
+                    || TypeSizes.StorageSize(chain[^1].FieldType, pointerSize) != size)
+                    continue;
+
+                piece = new Piece(position - memory.Addend, size, chain[^1].FieldType);
+                break;
+            }
+
+            if (piece == null)
+            {
+                // padding between fields (or after the last one), which gets copied along with them: skip to the next
+                // field, as long as nothing straddles this byte
+                if (GenericInstanceFieldLayout.FindFieldChain(owner, position, 0, pointerSize) != null)
+                    return null;
+
+                position++;
+                continue;
+            }
+
+            pieces.Add(piece);
+            position += piece.Size;
+        }
+
+        return pieces.Count > 0 ? pieces : null;
+    }
+
+    private static bool SameLayout(List<Piece> a, List<Piece> b) =>
+        a.Count == b.Count && a.Zip(b, (x, y) => x.Offset == y.Offset && x.Size == y.Size).All(same => same);
+
+    private static bool Collect(LocalVariable start, List<Piece> pieces, int size, List<LocalVariable> members, List<Instruction> stores,
+        Dictionary<LocalVariable, Instruction> definitions, Dictionary<LocalVariable, List<Instruction>> uses, int pointerSize,
+        Dictionary<(TypeAnalysisContext, bool), List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>> cache)
+    {
+        var pending = new Stack<LocalVariable>();
+        pending.Push(start);
+
+        while (pending.Count > 0)
+        {
+            var member = pending.Pop();
+            if (members.Contains(member))
+                continue;
+
+            // a member is one of: the wide load, a phi of wide loads/members, a copy of a member
+            if (!definitions.TryGetValue(member, out var definition))
+                return false;
+
+            switch (definition)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable, Index: null } memory] }
+                    when memory.Size == size && Pieces(memory, pointerSize, cache) is { } layout && SameLayout(layout, pieces):
+                    break;
+                case { OpCode: OpCode.Phi }:
+                    for (var input = 1; input < definition.Operands.Count; input++)
+                    {
+                        if (definition.Operands[input] is not LocalVariable incoming)
+                            return false;
+                        pending.Push(incoming);
+                    }
+                    break;
+                case { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }:
+                    pending.Push(copied);
+                    break;
+                default:
+                    return false;
+            }
+
+            members.Add(member);
+            if (members.Count > 32)
+                return false;
+
+            foreach (var use in uses.GetValueOrDefault(member) ?? [])
+            {
+                switch (use)
+                {
+                    // stored whole
+                    case { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable { Type: not SzArrayTypeAnalysisContext }, Index: null } destination, LocalVariable stored] }
+                        when ReferenceEquals(stored, member) && destination.Size == size:
+                        if (!stores.Contains(use))
+                            stores.Add(use);
+                        break;
+                    // into a phi or a copy, which become members too
+                    case { OpCode: OpCode.Phi, Operands: [LocalVariable joined, ..] }:
+                        pending.Push(joined);
+                        break;
+                    case { OpCode: OpCode.Move, Operands: [LocalVariable copy, LocalVariable copied] } when ReferenceEquals(copied, member):
+                        pending.Push(copy);
+                        break;
+                    // only its first float read
+                    case { ScalarSingle: true } when pieces[0].Size == 4 && use.OpCode is not (OpCode.Phi or OpCode.VectorShuffle):
+                        break;
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static void Rewrite(MethodAnalysisContext method, List<LocalVariable> members, List<Instruction> stores, List<Piece> pieces,
+        Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pieceLocals = new Dictionary<LocalVariable, LocalVariable[]>();
+
+        foreach (var member in members)
+        {
+            var locals = new LocalVariable[pieces.Count];
+            locals[0] = member;
+            for (var k = 1; k < pieces.Count; k++)
+            {
+                var register = new Register(null, $"PIECE_{method.Locals.Count}", 0);
+                locals[k] = new LocalVariable($"piece{method.Locals.Count}", register, pieces[k].Type);
+                method.Locals.Add(locals[k]);
+            }
+
+            member.Type = pieces[0].Type;
+            pieceLocals[member] = locals;
+        }
+
+        foreach (var member in members)
+        {
+            var definition = definitions[member];
+            var block = graph.Blocks.First(b => b.Instructions.Contains(definition));
+            var index = block.Instructions.IndexOf(definition);
+            var added = new List<Instruction>();
+
+            switch (definition)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, MemoryOperand memory] }:
+                    for (var k = 1; k < pieces.Count; k++)
+                        added.Add(new Instruction(definition.Index, OpCode.Move, pieceLocals[member][k],
+                            new MemoryOperand(memory.Base, null, memory.Addend + pieces[k].Offset, 0, pieces[k].Size)));
+                    definition.SetOperand(1, new MemoryOperand(memory.Base, null, memory.Addend, 0, pieces[0].Size));
+                    break;
+                case { OpCode: OpCode.Phi }:
+                    for (var k = 1; k < pieces.Count; k++)
+                    {
+                        var operands = new List<IOperand> { pieceLocals[member][k] };
+                        for (var input = 1; input < definition.Operands.Count; input++)
+                            operands.Add(pieceLocals[(LocalVariable)definition.Operands[input]][k]);
+                        added.Add(new Instruction(definition.Index, OpCode.Phi, operands));
+                    }
+                    break;
+                case { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }:
+                    for (var k = 1; k < pieces.Count; k++)
+                        added.Add(new Instruction(definition.Index, OpCode.Move, pieceLocals[member][k], pieceLocals[copied][k]));
+                    break;
+            }
+
+            block.Instructions.InsertRange(index + 1, added);
+        }
+
+        foreach (var store in stores)
+        {
+            var block = graph.Blocks.First(b => b.Instructions.Contains(store));
+            var destination = (MemoryOperand)store.Operands[0];
+            var value = (LocalVariable)store.Operands[1];
+            var added = new List<Instruction>();
+
+            for (var k = 1; k < pieces.Count; k++)
+                added.Add(new Instruction(store.Index, OpCode.Move,
+                    new MemoryOperand(destination.Base, null, destination.Addend + pieces[k].Offset, 0, pieces[k].Size), pieceLocals[value][k]));
+
+            store.SetOperand(0, new MemoryOperand(destination.Base, null, destination.Addend, 0, pieces[0].Size));
+            block.Instructions.InsertRange(block.Instructions.IndexOf(store) + 1, added);
+        }
+    }
+}

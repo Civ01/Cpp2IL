@@ -1,0 +1,407 @@
+using System.Collections.Generic;
+using System.Linq;
+using Cpp2IL.Core.ISIL;
+using Cpp2IL.Core.Model.Contexts;
+using Cpp2IL.Core.Utils;
+
+namespace Cpp2IL.Core.Analysis;
+
+/// <summary>
+/// MSVC strength-reduces a loop over an array's elements into a pointer that walks them alongside the index:
+/// <code>
+///   lea r8,[array+20h]          ; &amp;array[0]
+/// loop:
+///   ... [r8+4] ...              ; array[i].field
+///   add r8,18h / inc ecx        ; next element
+/// </code>
+/// In SSA that's a pair of phis in the loop header, the pointer starting at the first element and stepping by the
+/// element size while the index starts at 0 and steps by 1. Accesses through the pointer become accesses to
+/// array[index] (for a struct element, through a by-ref local holding its address), and the pointer goes away.
+/// Runs in SSA form, as part of the type/field fixpoint (it needs the array's type).
+/// </summary>
+public static class ArrayPointerLoopRecovery
+{
+    public static System.Action<string>? Debug;
+
+    public static bool Run(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var elementsOffset = 4L * pointerSize;
+
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in graph.Instructions)
+            if (instruction.Destination is LocalVariable defined)
+                definitions[defined] = instruction;
+
+        var changed = false;
+
+        foreach (var block in graph.Blocks)
+        {
+            var phis = block.Instructions.Where(i => i.OpCode == OpCode.Phi && i.Operands[0] is LocalVariable).ToList();
+            if (phis.Count < 2)
+                continue;
+
+            foreach (var pointerPhi in phis)
+            {
+                var pointer = (LocalVariable)pointerPhi.Operands[0];
+                if (pointer.Type is ByRefTypeAnalysisContext)
+                    continue;
+
+                SzArrayTypeAnalysisContext? arrayType = null;
+                LocalVariable? array = null;
+                long elementSize = 0;
+                var initialInputs = new List<int>();
+                var steps = new List<Instruction>();
+                var valid = true;
+
+                for (var input = 1; input < pointerPhi.Operands.Count && valid; input++)
+                {
+                    if (pointerPhi.Operands[input] is not LocalVariable incoming || !definitions.TryGetValue(incoming, out var definition))
+                    {
+                        valid = false;
+                        break;
+                    }
+
+                    switch (definition)
+                    {
+                        // &array[0]
+                        case { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: SzArrayTypeAnalysisContext type } source, Immediate { Value: var offset }] }
+                            when offset == elementsOffset && (array == null || ReferenceEquals(array, source)):
+                            array = source;
+                            arrayType = type;
+                            initialInputs.Add(input);
+                            break;
+                        // pointer += element size
+                        case { OpCode: OpCode.Add, Operands: [_, LocalVariable stepped, Immediate { Value: > 0 and < 0x1000 and var step }] }
+                            when ReferenceEquals(stepped, pointer) && (elementSize == 0 || elementSize == step):
+                            elementSize = step;
+                            steps.Add(definition);
+                            break;
+                        default:
+                            valid = false;
+                            break;
+                    }
+                }
+
+                Debug?.Invoke($"pointer phi {pointerPhi}: valid={valid} array={array} steps={steps.Count} size={elementSize}");
+                if (!valid || array == null || arrayType == null || initialInputs.Count == 0 || steps.Count == 0)
+                    continue;
+
+                var elementType = arrayType.ElementType;
+                var expectedSize = elementType.IsValueType ? TypeSizes.StorageSize(elementType, pointerSize) : pointerSize;
+                if (expectedSize != elementSize)
+                    continue;
+
+                // the matching index: 0 where the pointer starts, +1 where it steps
+                var index = phis.Where(p => p != pointerPhi).Select(p => (LocalVariable?)p.Operands[0]).FirstOrDefault(candidate =>
+                {
+                    var indexPhi = phis.First(p => ReferenceEquals(p.Operands[0], candidate));
+                    if (indexPhi.Operands.Count != pointerPhi.Operands.Count)
+                        return false;
+
+                    for (var input = 1; input < indexPhi.Operands.Count; input++)
+                    {
+                        var operand = indexPhi.Operands[input];
+                        if (initialInputs.Contains(input))
+                        {
+                            if (!(operand is Immediate { Value: 0 } || operand is LocalVariable zero && ChaseCopies(definitions, zero) is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] }))
+                                return false;
+                        }
+                        else if (operand is not LocalVariable next || !definitions.TryGetValue(next, out var nextDefinition)
+                                 || nextDefinition is not { OpCode: OpCode.Add, Operands: [_, LocalVariable incremented, Immediate { Value: 1 }] }
+                                 || !ReferenceEquals(incremented, candidate))
+                            return false;
+                    }
+
+                    return true;
+                });
+
+                Debug?.Invoke($"  index {index}");
+
+                // no counter alongside it (the loop compares against an end pointer): make one
+                if (index == null)
+                {
+                    if (steps.Count != 1 || !UsedOnlyAsElementPointer(graph, pointer, pointerPhi, steps))
+                        continue;
+
+                    var int32 = method.AppContext.SystemTypes.SystemInt32Type;
+                    var synthesized = NewLocal(method, "index", int32);
+                    var next = NewLocal(method, "nextIndex", int32);
+                    var operands = new List<IOperand> { synthesized };
+                    for (var input = 1; input < pointerPhi.Operands.Count; input++)
+                    {
+                        if (initialInputs.Contains(input))
+                        {
+                            var zero = NewLocal(method, "startIndex", int32);
+                            var startDefinition = definitions[(LocalVariable)pointerPhi.Operands[input]];
+                            var startBlock = graph.Blocks.First(b => b.Instructions.Contains(startDefinition));
+                            startBlock.Instructions.Insert(startBlock.Instructions.IndexOf(startDefinition) + 1, new Instruction(startDefinition.Index, OpCode.Move, zero, new Immediate(0)));
+                            operands.Add(zero);
+                        }
+                        else
+                            operands.Add(next);
+                    }
+
+                    block.Instructions.Insert(block.Instructions.IndexOf(pointerPhi) + 1, new Instruction(pointerPhi.Index, OpCode.Phi, operands));
+                    var stepBlock = graph.Blocks.First(b => b.Instructions.Contains(steps[0]));
+                    stepBlock.Instructions.Insert(stepBlock.Instructions.IndexOf(steps[0]) + 1, new Instruction(steps[0].Index, OpCode.Add, next, synthesized, new Immediate(1)));
+                    index = synthesized;
+                }
+
+                if (Rewrite(method, block, pointerPhi, pointer, array, elementType, index, steps))
+                    changed = true;
+            }
+        }
+
+        changed |= RecoverOffsetLoops(method, definitions);
+        return changed;
+    }
+
+    /// <summary>
+    /// The other strength reduction: a byte offset that starts at the first element (0x20) and steps by the element size,
+    /// added to the array at each access (<c>mov rax,[rdi+rcx]</c> with rdi = 20h, 28h, ...). Works for every array the
+    /// loop indexes in step. The accesses become array[i] with a fresh index counting 0, 1, ...
+    /// </summary>
+    private static bool RecoverOffsetLoops(MethodAnalysisContext method, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var elementsOffset = 4L * pointerSize;
+        var changed = false;
+
+        foreach (var block in graph.Blocks.ToList())
+        {
+            foreach (var phi in block.Instructions.Where(i => i.OpCode == OpCode.Phi && i.Operands[0] is LocalVariable).ToList())
+            {
+                var offset = (LocalVariable)phi.Operands[0];
+                long? step = null, start = null;
+                var steps = new List<(Instruction Step, int Input)>();
+                var starts = new List<int>();
+                var startDefinitions = new Dictionary<int, Instruction>();
+                var valid = true;
+
+                for (var input = 1; input < phi.Operands.Count && valid; input++)
+                {
+                    var incoming = phi.Operands[input];
+                    var definition = incoming is LocalVariable local ? definitions.GetValueOrDefault(local) : null;
+                    for (var hops = 0; hops < 4 && definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }; hops++)
+                        definition = definitions.GetValueOrDefault(copied);
+                    switch (definition)
+                    {
+                        case { OpCode: OpCode.Move, Operands: [_, Immediate { Value: var value }] } when value >= elementsOffset && (start == null || start == value):
+                            start = value;
+                            starts.Add(input);
+                            startDefinitions[input] = definition;
+                            break;
+                        case { OpCode: OpCode.Add, Operands: [_, LocalVariable stepped, Immediate { Value: > 0 and < 0x1000 and var by }] }
+                            when ReferenceEquals(stepped, offset) && (step == null || step == by):
+                            step = by;
+                            steps.Add((definition, input));
+                            break;
+                        default:
+                            valid = false;
+                            break;
+                    }
+                }
+
+                if (!valid || start == null || step == null || starts.Count == 0 || steps.Count == 0 || (start - elementsOffset) % step != 0
+                    || steps.Select(s => s.Step).Distinct().Count() > 1)
+                    continue;
+
+                // every access through it must be [array + offset] over an array whose elements are that size
+                var accesses = new List<(Instruction Instruction, int Operand, LocalVariable Array)>();
+                var otherUse = false;
+                foreach (var instruction in graph.Instructions)
+                {
+                    if (instruction == phi || steps.Any(s => s.Step == instruction))
+                        continue;
+
+                    for (var i = 0; i < instruction.Operands.Count; i++)
+                    {
+                        if (instruction.Operands[i] is not MemoryOperand { Scale: 0 or 1, Addend: 0 } memory)
+                            continue;
+
+                        LocalVariable? array = null;
+                        if (ReferenceEquals(memory.Base, offset) && memory.Index is LocalVariable { Type: SzArrayTypeAnalysisContext } indexArray)
+                            array = indexArray;
+                        else if (ReferenceEquals(memory.Index, offset) && memory.Base is LocalVariable { Type: SzArrayTypeAnalysisContext } baseArray)
+                            array = baseArray;
+
+                        if (array?.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType }
+                            || (elementType.IsValueType ? TypeSizes.StorageSize(elementType, pointerSize) : pointerSize) != step
+                            || memory.Size != 0 && memory.Size != step)
+                        {
+                            if (Mentions(memory, offset))
+                                otherUse = true; // used some other way: leave it all alone
+                            continue;
+                        }
+
+                        accesses.Add((instruction, i, array));
+                    }
+                }
+
+                if (accesses.Count == 0 || otherUse)
+                    continue;
+
+                // the index: phi(start / step, index + 1) alongside the offset
+                var index = NewLocal(method, "index", method.AppContext.SystemTypes.SystemInt32Type);
+                var indexOperands = new List<IOperand> { index };
+                var nextIndex = NewLocal(method, "nextIndex", method.AppContext.SystemTypes.SystemInt32Type);
+                for (var input = 1; input < phi.Operands.Count; input++)
+                {
+                    if (starts.Contains(input))
+                    {
+                        var startLocal = NewLocal(method, "startIndex", method.AppContext.SystemTypes.SystemInt32Type);
+                        var startDefinition = startDefinitions[input];
+                        var startBlock = graph.Blocks.First(b => b.Instructions.Contains(startDefinition));
+                        startBlock.Instructions.Insert(startBlock.Instructions.IndexOf(startDefinition) + 1,
+                            new Instruction(startDefinition.Index, OpCode.Move, startLocal, new Immediate((start.Value - elementsOffset) / step.Value)));
+                        indexOperands.Add(startLocal);
+                    }
+                    else
+                        indexOperands.Add(nextIndex);
+                }
+
+                block.Instructions.Insert(block.Instructions.IndexOf(phi) + 1, new Instruction(phi.Index, OpCode.Phi, indexOperands));
+
+                var stepInstruction = steps[0].Step;
+                var stepBlock = graph.Blocks.First(b => b.Instructions.Contains(stepInstruction));
+                stepBlock.Instructions.Insert(stepBlock.Instructions.IndexOf(stepInstruction) + 1,
+                    new Instruction(stepInstruction.Index, OpCode.Add, nextIndex, index, new Immediate(1)));
+
+                foreach (var (instruction, operand, array) in accesses)
+                    instruction.SetOperand(operand, new ArrayAccess(array, index));
+
+                // the offset is dead if all that's left is its own stepping
+                var steppedOffset = (LocalVariable)stepInstruction.Operands[0];
+                if (!graph.Instructions.Any(other => other != phi && other != stepInstruction
+                                                     && other.Operands.Any(o => Mentions(o, offset) || Mentions(o, steppedOffset))))
+                {
+                    stepInstruction.OpCode = OpCode.Nop;
+                    stepInstruction.SetOperands();
+                    phi.OpCode = OpCode.Nop;
+                    phi.SetOperands();
+                }
+
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    // The pointer is only dereferenced (so it can be replaced wholesale) - an end-of-loop compare against another pointer
+    // would still need it
+    private static bool UsedOnlyAsElementPointer(Graphs.ISILControlFlowGraph graph, LocalVariable pointer, Instruction phi, List<Instruction> steps)
+    {
+        var stepped = steps.Select(s => (LocalVariable)s.Operands[0]).ToList();
+        foreach (var instruction in graph.Instructions)
+        {
+            if (instruction == phi || steps.Contains(instruction))
+                continue;
+
+            foreach (var operand in instruction.Operands)
+            {
+                if (operand is MemoryOperand { Base: var memoryBase, Index: null } && ReferenceEquals(memoryBase, pointer))
+                    continue;
+                if (Mentions(operand, pointer) || stepped.Any(n => Mentions(operand, n)))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
+    {
+        var definition = definitions.GetValueOrDefault(local);
+        for (var hops = 0; hops < 4 && definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }; hops++)
+            definition = definitions.GetValueOrDefault(copied);
+        return definition;
+    }
+
+    private static LocalVariable NewLocal(MethodAnalysisContext method, string name, TypeAnalysisContext type)
+    {
+        var local = new LocalVariable($"{name}{method.Locals.Count}", new Register(null, $"{name.ToUpperInvariant()}_{method.Locals.Count}", 0), type);
+        method.Locals.Add(local);
+        return local;
+    }
+
+    private static bool Rewrite(MethodAnalysisContext method, Graphs.Block header, Instruction pointerPhi, LocalVariable pointer, LocalVariable array,
+        TypeAnalysisContext elementType, LocalVariable index, List<Instruction> steps)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        LocalVariable? elementAddress = null;
+        var rewritten = false;
+
+        foreach (var instruction in graph.Instructions.ToList())
+        {
+            if (steps.Contains(instruction) || instruction == pointerPhi)
+                continue;
+
+            for (var i = 0; i < instruction.Operands.Count; i++)
+            {
+                if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable @base, Index: null } memory || !ReferenceEquals(@base, pointer))
+                    continue;
+
+                if (!elementType.IsValueType)
+                {
+                    if (memory.Addend != 0 || memory.Size is not (0 or 8) || pointerSize != 8)
+                        continue;
+
+                    instruction.SetOperand(i, new ArrayAccess(array, index));
+                    rewritten = true;
+                    continue;
+                }
+
+                if (elementAddress == null)
+                {
+                    elementAddress = new LocalVariable($"element{method.Locals.Count}", new Register(null, $"ELEMENT_{method.Locals.Count}", 0),
+                        new ByRefTypeAnalysisContext(elementType));
+                    method.Locals.Add(elementAddress);
+
+                    var insertAt = header.Instructions.FindLastIndex(x => x.OpCode == OpCode.Phi) + 1;
+                    header.Instructions.Insert(insertAt, new Instruction(pointerPhi.Index, OpCode.Move, elementAddress, new AddressOf(new ArrayAccess(array, index))));
+                }
+
+                memory.Base = elementAddress;
+                instruction.SetOperand(i, memory);
+                rewritten = true;
+            }
+        }
+
+        if (!rewritten)
+            return false;
+
+        // it indexes an array, so it's an int whatever it got guessed as
+        if (index.Type?.FullName is not ("System.Int32" or "System.Int64" or "System.UInt32" or "System.IntPtr"))
+            index.Type = method.AppContext.SystemTypes.SystemInt32Type;
+
+        // the pointer is dead if all that's left is its own stepping
+        var stillUsed = graph.Instructions.Any(instruction => instruction != pointerPhi && !steps.Contains(instruction)
+                                                              && instruction.Operands.Any(operand => Mentions(operand, pointer)));
+        if (!stillUsed && steps.All(step => !graph.Instructions.Any(other => other != pointerPhi && other.Operands.Any(operand => Mentions(operand, step.Operands[0])))))
+        {
+            foreach (var step in steps)
+            {
+                step.OpCode = OpCode.Nop;
+                step.SetOperands();
+            }
+
+            pointerPhi.OpCode = OpCode.Nop;
+            pointerPhi.SetOperands();
+        }
+
+        return true;
+    }
+
+    private static bool Mentions(IOperand operand, IOperand local) => operand switch
+    {
+        LocalVariable direct => ReferenceEquals(direct, local),
+        MemoryOperand memory => ReferenceEquals(memory.Base, local) || ReferenceEquals(memory.Index, local),
+        AddressOf { Target: var target } => Mentions(target, local),
+        _ => false
+    };
+}

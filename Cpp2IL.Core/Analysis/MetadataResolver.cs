@@ -19,6 +19,58 @@ public static class MetadataResolver
         ResolveCalls(method);
         ResolveGetter(method);
         ResolveMetadataUsages(method);
+        ResolveInterfaceInvokers(method);
+    }
+
+    /// <summary>
+    /// Calls to an out-of-line interface invoker, (slot, declaringInterface, obj, args...), become calls to the
+    /// interface method itself.
+    /// </summary>
+    private static void ResolveInterfaceInvokers(MethodAnalysisContext method)
+    {
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable defined)
+                definitions[defined] = instruction;
+
+        IOperand? Chase(IOperand operand)
+        {
+            for (var depth = 0; depth < 8 && operand is LocalVariable local && definitions.TryGetValue(local, out var definition) && definition.OpCode == OpCode.Move; depth++)
+                operand = definition.Operands[1];
+
+            return operand;
+        }
+
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            // Unmanaged calls carry [target, rax, rcx, rdx, r8, r9, xmm0, xmm1, xmm2, xmm3]
+            if (instruction.OpCode != OpCode.Call || instruction.Operands.Count < 10 || instruction.Operands[0] is not Immediate target)
+                continue;
+
+            if (NativeHelpers.Classify(method.AppContext, target.UnsignedValue) != NativeHelperKind.InterfaceInvoker)
+                continue;
+
+            if (Chase(instruction.Operands[2]) is not Immediate { Value: >= 0 and <= ushort.MaxValue } slot)
+                continue;
+
+            var declaringInterface = Chase(instruction.Operands[3]) switch
+            {
+                RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+                TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => type,
+                _ => null
+            };
+
+            if (declaringInterface == null || InterfaceDispatchRecovery.ResolveInterfaceSlot(declaringInterface, (int)slot.Value) is not { } resolved)
+                continue;
+
+            var operands = new List<IOperand> { resolved, instruction.Operands[1], instruction.Operands[4] };
+
+            // The invoker takes (slot, interface, obj, p1, ...): the first parameter is the fourth argument slot
+            if (resolved.Parameters.Count > 0)
+                operands.Add(BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[0].ParameterType) ? instruction.Operands[9] : instruction.Operands[5]);
+
+            instruction.SetOperands(operands);
+        }
     }
 
     private static void ResolveStringLiteralAccessors(MethodAnalysisContext method)
@@ -152,47 +204,162 @@ public static class MetadataResolver
 
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
-                var owner = staticOwner ?? local.Type;
+                var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } ? referent : local.Type);
+
+                // a T constrained to a class has (at least) that class's fields
+                if (owner is GenericParameterTypeAnalysisContext constrained && constrained.ConstraintTypes.FirstOrDefault(c => !c.IsInterface && !c.IsValueType) is { } constraint)
+                    owner = constraint;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;
+                var path = new List<FieldAnalysisContext>();
+                var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
                 if (genericOwner != null && staticOwner == null)
                 {
-                    // metadata has all-0 offsets for generic definitions, so recompute layout
-                    // TODO support user-defined value types
-                    if (genericOwner.GenericArguments.Any(a => a.IsValueType))
+                    // metadata has all-0 offsets for generic definitions, so lay the instantiation out ourselves
+                    if (GenericInstanceFieldLayout.FindFieldChain(genericOwner, memory.Addend, memory.Size, pointerSize) is not { } genericChain)
                         continue;
 
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(genericOwner.GenericType, memory.Addend);
+                    var genericField = genericChain[^1];
+                    if (genericChain.Count == 1 && memory.Size > 0 && TypeSizes.StorageSize(genericField.FieldType, pointerSize) is > 0 and var genericFieldSize && memory.Size > genericFieldSize)
+                        continue;
+
+                    instruction.SetOperand(i, new FieldReference(genericField, local, (int)memory.Addend) { Path = genericChain.GetRange(0, genericChain.Count - 1) });
+                    changed = true;
+                    continue;
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(owner, memory.Addend);
+                    // the generic type's own shared code
+                    if (GenericInstanceFieldLayout.FindFieldChainOpen(owner, memory.Addend, memory.Size, pointerSize) is not { } openChain)
+                        continue;
+
+                    field = openChain[^1];
+                    path = openChain.GetRange(0, openChain.Count - 1);
                 }
                 else
                 {
-                    // an inherited field exists on the base type but sits at the same offset in the
-                    // derived layout, so the whole chain is searched
-                    field = null;
-                    for (var candidateOwner = genericOwner?.GenericType ?? owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
-                        field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == (staticOwner != null)
-                            && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
-                            && f.BackingData?.FieldOffset == memory.Addend);
+                    if (FindFieldChain(genericOwner?.GenericType ?? owner, staticOwner != null, memory.Addend, memory.Size, pointerSize) is not { } chain)
+                        continue;
+
+                    field = chain[^1];
+                    path = chain.GetRange(0, chain.Count - 1);
                 }
 
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
+                    continue;
+
+                // A wider access than the field is a copy of several fields at once, which a later pass deals with
+                if (path.Count == 0 && memory.Size > 0 && TypeSizes.StorageSize(field.FieldType, pointerSize) is > 0 and var fieldSize && memory.Size > fieldSize)
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
                 if (genericOwner != null)
                     field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
 
-                instruction.SetOperand(i, new FieldReference(field, local, (int)memory.Addend));
+                var reference = new FieldReference(field, local, (int)memory.Addend) { Path = path };
+
+                instruction.SetOperand(i, reference);
                 changed = true;
             }
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// Finds the (possibly nested) field accessed by a <paramref name="size"/>-byte access at <paramref name="offset"/>
+    /// into an instance of <paramref name="owner"/> (or its static storage), outermost field first. Null if the access
+    /// doesn't correspond to a single field. A size of 0 means unknown, and matches any field starting there.
+    /// </summary>
+    public static List<FieldAnalysisContext>? FindFieldChain(TypeAnalysisContext owner, bool isStatic, long offset, int size, int pointerSize)
+    {
+        // an inherited field exists on the base type but sits at the same offset in the
+        // derived layout, so the whole chain is searched
+        FieldAnalysisContext? field = null;
+        for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+            field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
+                && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
+                && f.BackingData?.FieldOffset == offset);
+
+        long fieldOffset = offset;
+
+        // Not the start of a field - maybe it's inside a struct-typed one (e.g. transform.position.y)
+        if (field == null)
+        {
+            for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+                field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
+                    && (f.Attributes & FieldAttributes.Literal) == 0
+                    && f.BackingData?.FieldOffset is { } start && start < offset
+                    && StackStructRecovery.IsStruct(f.FieldType)
+                    && offset < start + TypeSizes.StorageSize(f.FieldType, pointerSize));
+
+            if (field == null)
+                return null;
+
+            fieldOffset = field.BackingData!.FieldOffset;
+        }
+
+        var path = new List<FieldAnalysisContext>();
+        if (!DescendIntoStructField(ref field, path, offset - fieldOffset, size, pointerSize))
+            return null;
+
+        path.Add(field);
+        return path;
+    }
+
+    /// <summary>
+    /// Given an access at <paramref name="offset"/> bytes into <paramref name="field"/>, narrows it down to the
+    /// innermost field actually accessed, recording the enclosing struct fields in <paramref name="path"/>.
+    /// Returns false if the access doesn't map onto a field (e.g. it spans several fields - a chunked copy).
+    /// </summary>
+    private static bool DescendIntoStructField(ref FieldAnalysisContext field, List<FieldAnalysisContext> path, long offset, int accessSize, int pointerSize)
+    {
+        for (var depth = 0; depth < 16; depth++)
+        {
+            var fieldSize = TypeSizes.StorageSize(field.FieldType, pointerSize);
+
+            // The access is the whole field (or we don't know enough to say otherwise)
+            if (offset == 0 && (accessSize <= 0 || fieldSize <= 0 || accessSize == fieldSize))
+                return true;
+
+            if (offset == 0 && accessSize > fieldSize)
+                return false; // spans several fields
+
+            if (!StackStructRecovery.IsStruct(field.FieldType))
+                return offset == 0; // part of a primitive, e.g. the low byte of an int, is still that field
+
+            var structType = field.FieldType;
+
+            // a generic struct has no offsets in the metadata: its own layout takes it from here
+            if (structType is GenericInstanceTypeAnalysisContext genericStruct)
+            {
+                if (GenericInstanceFieldLayout.FindFieldChain(genericStruct, offset, accessSize, pointerSize) is not { } genericChain)
+                    return false;
+
+                path.Add(field);
+                path.AddRange(genericChain.Take(genericChain.Count - 1));
+                field = genericChain[^1];
+                return true;
+            }
+
+            var nested = structType.Fields.FirstOrDefault(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0
+                && f.BackingData?.FieldOffset is { } start && start <= offset
+                && (start == offset || offset < start + TypeSizes.StorageSize(f.FieldType, pointerSize)));
+
+            // prefer an exact match over a containing one
+            nested = structType.Fields.FirstOrDefault(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0 && f.BackingData?.FieldOffset == offset) ?? nested;
+
+            if (nested == null)
+                return false;
+
+            path.Add(field);
+            offset -= nested.BackingData!.FieldOffset;
+            field = nested;
+        }
+
+        return false;
     }
 
     private static void ResolveCalls(MethodAnalysisContext method)
@@ -225,13 +392,15 @@ public static class MetadataResolver
             }
 
             //Non-key function call. Try to find a single match
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target, out var targetMethods))
+            if (!method.AppContext.TryGetManagedMethodsAt(target, out var targetMethods))
             {
                 // Not a managed method at all. It may be one of the runtime helpers built around an exception
                 // type, which either throw it themselves or build it and hand it back for the caller to raise.
                 if (ThrowHelperRecovery.GetThrownException(method.AppContext, target) is { } thrown)
                 {
-                    if (callInstruction.Destination is LocalVariable produced && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
+                    if (callInstruction.Destination is LocalVariable produced
+                        && !NativeHelpers.NeverReturns(method.AppContext, target)
+                        && method.ControlFlowGraph!.Instructions.Any(i => i.Sources.Any(s => ReferenceEquals(s, produced))))
                     {
                         callInstruction.OpCode = OpCode.Newobj;
                         callInstruction.SetOperands(produced, thrown);
@@ -293,7 +462,7 @@ public static class MetadataResolver
             if (instruction.Operands[0] is not Immediate target)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+            if (!method.AppContext.TryGetManagedMethodsAt(target.UnsignedValue, out var candidates) || candidates.Count < 2)
                 continue;
 
             // e.g. string.Equals and string.op_Equality, identical params, instance type, and bodies are shared
@@ -338,6 +507,66 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    /// <summary>
+    /// Last resort for calls whose address is shared by several methods (identical bodies folded together by the
+    /// linker) that nothing else could tell apart: as the machine code is literally the same, any of them behaves
+    /// the same, so pick the most plausible rather than leave the call unresolved. Prefers, in order, candidates
+    /// whose declaring type fits the receiver, whose parameter count fits the arguments, that share the calling
+    /// method's name (base.Foo() from an override of Foo), then metadata order. Returns whether anything changed.
+    /// </summary>
+    public static bool GuessAmbiguousCalls(MethodAnalysisContext method)
+    {
+        var changed = false;
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (!instruction.IsCall || instruction.Operands[0] is not Immediate target)
+                continue;
+
+            if (!method.AppContext.TryGetManagedMethodsAt(target.UnsignedValue, out var candidates) || candidates.Count < 2)
+                continue;
+
+            IEnumerable<MethodAnalysisContext> pool = candidates;
+
+            if (GetReceiver(instruction) is { Type: { } receiverType })
+            {
+                var fitting = candidates.Where(c => !c.IsStatic && IsInHierarchy(receiverType, c.DeclaringType)).ToList();
+                if (fitting.Count > 0)
+                    pool = fitting;
+            }
+
+            var argumentCount = instruction.Operands.Count - (instruction.OpCode == OpCode.CallVoid ? 1 : 2);
+            var plausible = pool.Where(c => (c.IsStatic ? 0 : 1) + c.Parameters.Count <= argumentCount).ToList();
+            if (plausible.Count > 0)
+                pool = plausible;
+
+            var choice = pool.FirstOrDefault(c => c.Name == method.Name) ?? pool.First();
+
+            instruction.SetOperand(0, choice);
+            choice.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, choice);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    internal static bool IsInHierarchy(TypeAnalysisContext type, TypeAnalysisContext? candidateOwner)
+    {
+        if (candidateOwner == null)
+            return false;
+
+        for (var current = type; current != null; current = current.BaseType)
+        {
+            if (IsSameType(current, candidateOwner))
+                return true;
+
+            if (current is GenericInstanceTypeAnalysisContext instance && ReferenceEquals(instance.GenericType, candidateOwner))
+                return true;
+        }
+
+        return false;
     }
 
     private static bool AreInterchangeable(List<MethodAnalysisContext> candidates)
@@ -423,7 +652,7 @@ public static class MetadataResolver
             if (!instruction.IsCall || instruction.Operands[0] is not Immediate callTarget)
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(callTarget.UnsignedValue, out var candidates))
+            if (!method.AppContext.TryGetManagedMethodsAt(callTarget.UnsignedValue, out var candidates))
                 continue;
 
             if (GetReceiver(instruction) is not { } receiver || AllocatedType(receiver, definitions) is not { } allocatedType)
@@ -499,6 +728,25 @@ public static class MetadataResolver
             if (!instruction.IsCall)
                 continue;
 
+            if (instruction.Operands[0] is MethodAnalysisContext alreadyResolved)
+            {
+                // Shared generic code (List<object>.Add standing in for List<Foo>.Add) is told which instantiation
+                // it's running as by the MethodInfo it's passed, so use that to get the real types
+                if (GetMethodInfoArgument(instruction) is { RepresentedMethod: { } concrete }
+                    && !ReferenceEquals(concrete, alreadyResolved)
+                    && concrete is ConcreteGenericMethodAnalysisContext
+                    && ReferenceEquals(BaseMethodOf(concrete), BaseMethodOf(alreadyResolved))
+                    && concrete.Parameters.Count == alreadyResolved.Parameters.Count
+                    && concrete.IsStatic == alreadyResolved.IsStatic
+                    && concrete.ToString() != alreadyResolved.ToString())
+                {
+                    instruction.SetOperand(0, concrete);
+                    changed = true;
+                }
+
+                continue;
+            }
+
             if (instruction.Operands[0] is not Immediate target)
                 //Already resolved
                 continue;
@@ -507,7 +755,7 @@ public static class MetadataResolver
                 //No MethodInfo to work with
                 continue;
 
-            if (!method.AppContext.MethodsByAddress.TryGetValue(target.UnsignedValue, out var candidates))
+            if (!method.AppContext.TryGetManagedMethodsAt(target.UnsignedValue, out var candidates))
             {
                 // Some shared generic bodies aren't in the address map at all (todo investigate?).
                 // Il2cpp still passes the concrete MethodInfo as the hidden final parameter, so we can use a methodof there if we have one.

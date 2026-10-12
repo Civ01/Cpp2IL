@@ -97,8 +97,30 @@ public static class SsaSimplifier
                 case FieldReference { Local: { } fieldLocal } field when resolved.TryGetValue(fieldLocal, out var fieldValue) && fieldValue is LocalVariable fieldReplacement:
                     field.Local = fieldReplacement;
                     break;
+
+                case ArrayAccess access:
+                    ReplaceInArrayAccess(access, resolved);
+                    break;
+                case AddressOf { Target: ArrayAccess addressedAccess }:
+                    ReplaceInArrayAccess(addressedAccess, resolved);
+                    break;
+                case AddressOf { Target: FieldReference { Local: { } addressedLocal } addressedField }
+                    when resolved.TryGetValue(addressedLocal, out var addressedValue) && addressedValue is LocalVariable addressedReplacement:
+                    addressedField.Local = addressedReplacement;
+                    break;
+                case ArrayLength { Array: var lengthArray } length when resolved.TryGetValue(lengthArray, out var lengthValue) && lengthValue is LocalVariable lengthReplacement:
+                    length.Array = lengthReplacement;
+                    break;
             }
         }
+    }
+
+    private static void ReplaceInArrayAccess(ArrayAccess access, Dictionary<LocalVariable, IOperand> resolved)
+    {
+        if (resolved.TryGetValue(access.Array, out var arrayValue) && arrayValue is LocalVariable arrayReplacement)
+            access.Array = arrayReplacement;
+        if (access.Index is LocalVariable index && resolved.TryGetValue(index, out var indexValue))
+            access.Index = indexValue;
     }
 
     // Every local read by some instruction. The single write position (a plain local destination) is
@@ -127,6 +149,25 @@ public static class SsaSimplifier
                             break;
                         case FieldReference field when field.Local is { } fieldLocal:
                             reads.Add(fieldLocal);
+                            break;
+                        case ArrayAccess access:
+                            reads.Add(access.Array);
+                            if (access.Index is LocalVariable accessIndex)
+                                reads.Add(accessIndex);
+                            break;
+                        case AddressOf { Target: ArrayAccess addressedAccess }:
+                            reads.Add(addressedAccess.Array);
+                            if (addressedAccess.Index is LocalVariable addressedIndex)
+                                reads.Add(addressedIndex);
+                            break;
+                        case AddressOf { Target: FieldReference { Local: { } addressedLocal } }:
+                            reads.Add(addressedLocal);
+                            break;
+                        case AddressOf { Target: LocalVariable addressedVariable }:
+                            reads.Add(addressedVariable);
+                            break;
+                        case ArrayLength length:
+                            reads.Add(length.Array);
                             break;
                     }
                 }

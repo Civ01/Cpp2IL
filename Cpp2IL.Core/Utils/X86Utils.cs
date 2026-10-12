@@ -125,29 +125,48 @@ public static class X86Utils
         return new BinarySlice(binary, (int)rawAddr, span.Length);
     }
 
+    // MSVC x64 puts a switch's jump table (32-bit RVAs) straight after the function's code, and indexes it as
+    // [imagebase_register + index*4 + table_rva]. The function's code ends where the first such table starts.
+    // (Only an instruction that actually indexes a table counts - any 4 bytes of code can look like an RVA.)
     private static bool TryFindJumpTableStart(ReadOnlySpan<byte> methodBytes, ulong methodPtr, ulong nextMethodPtr, out int startIndex, out List<ulong> jumpTableElements)
     {
-        bool foundTable = false;
+        const ulong imageBase = 0x180000000;
         startIndex = 0;
         jumpTableElements = [];
-        for (int i = (int)(methodPtr % 4); i < methodBytes.Length; i += 4)
-        {
-            var result = (ulong)methodBytes.ReadUInt(i);
-            var possibleJumpAddress = result + 0x180000000; // image base
-            if (possibleJumpAddress > methodPtr && possibleJumpAddress < nextMethodPtr)
-            {
-                // Sound the alarms, we've more than likely ran into a jump table  
-                if (!foundTable)
-                {
-                    startIndex = i;
-                    foundTable = true;
-                }
 
-                jumpTableElements.Add(result);
+        var instructions = Iterate(methodBytes, methodPtr, false);
+        var tableStart = ulong.MaxValue;
+
+        foreach (var instruction in instructions)
+        {
+            if (instruction.IP >= tableStart)
+                break;
+
+            for (var operand = 0; operand < instruction.OpCount; operand++)
+            {
+                if (instruction.GetOpKind(operand) != OpKind.Memory || instruction.MemoryIndexScale != 4 || instruction.MemoryBase == Register.None
+                    || instruction.MemoryIndex == Register.None || instruction.IsIPRelativeMemoryOperand)
+                    continue;
+
+                var table = imageBase + (uint)instruction.MemoryDisplacement32;
+                if (table > instruction.IP && table > methodPtr && table < nextMethodPtr && table < tableStart)
+                    tableStart = table;
             }
         }
 
-        return foundTable;
+        if (tableStart == ulong.MaxValue)
+            return false;
+
+        startIndex = (int)(tableStart - methodPtr);
+        for (var i = startIndex; i + 4 <= methodBytes.Length; i += 4)
+        {
+            var entry = imageBase + methodBytes.ReadUInt(i);
+            if (entry < methodPtr || entry >= nextMethodPtr)
+                break;
+            jumpTableElements.Add(entry);
+        }
+
+        return true;
     }
 
     public static InstructionList GetMethodBodyAtVirtAddressNew(ulong addr, bool peek, ApplicationAnalysisContext appContext, int peekLength = DefaultPeekLength) => GetMethodBodyAtVirtAddressNew(addr, peek, appContext, out _, peekLength);

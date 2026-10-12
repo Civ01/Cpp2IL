@@ -38,6 +38,11 @@ public class Instruction : IOperand
             _ => true
         };
 
+    /// <summary>
+    /// Lifted from a scalar single-precision SSE instruction, so it only looks at the low 4 bytes of any xmm register.
+    /// </summary>
+    public bool ScalarSingle;
+
     public bool IsCall => OpCode is OpCode.Call or OpCode.CallVoid;
 
     public bool IsAssignment => Destination != null;
@@ -113,6 +118,8 @@ public class Instruction : IOperand
             case OpCode.CheckLessOrEqual:
             case OpCode.Newobj:
             case OpCode.Box:
+            case OpCode.IsInst:
+            case OpCode.VectorShuffle:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -155,6 +162,8 @@ public class Instruction : IOperand
                 => [_operands[1]],
 
             OpCode.Box => [_operands[2]],
+            OpCode.IsInst => [_operands[2], _operands[1]],
+            OpCode.VectorShuffle => [_operands[1], _operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply
                 or OpCode.Divide or OpCode.Modulo or OpCode.ShiftLeft or OpCode.ShiftRight

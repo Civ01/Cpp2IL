@@ -26,11 +26,19 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!);
+        => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackStructTypes.Keys);
 
-    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo)
+    // Struct-holding stack slots that are only ever accessed piecewise, through memory operands, and so behave as
+    // memory rather than as SSA variables: they're never versioned, and handing out their address doesn't
+    // redefine them.
+    private HashSet<string> _memorySlots = [];
+
+    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo, IEnumerable<string>? memorySlots = null)
     {
         var ssa = new SsaForm();
+        if (memorySlots != null)
+            ssa._memorySlots = [..memorySlots];
+
         ssa.FindClobberingAddressTakes(graph);
 
         graph.BuildUseDefLists(ssa._clobbering);
@@ -53,11 +61,37 @@ public class SsaForm
 
                 foreach (var operand in instruction.Operands)
                 {
-                    if (operand is AddressOf { Target: Register addressed } && IsReadAfter(block, i, addressed))
+                    if (operand is AddressOf { Target: Register addressed } && !_memorySlots.Contains(addressed.Name) && IsReadAfter(block, i, addressed)
+                        && ReachesCall(block, i))
                         _clobbering.Add(instruction);
                 }
             }
         }
+    }
+
+    // Whether the address can be written through: it's a call argument, or held in a register a call in this block
+    // is passed. An address only stored somewhere (lea rax,[rsp+60h] / mov [rsp+30h],rax for a finally block) isn't.
+    private static bool ReachesCall(Block block, int index)
+    {
+        var instruction = block.Instructions[index];
+        if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.IndirectJump)
+            return true;
+
+        if (instruction is not { OpCode: OpCode.Move, Operands: [Register holder, AddressOf] })
+            return true; // something else we don't model: assume the worst
+
+        for (var i = index + 1; i < block.Instructions.Count; i++)
+        {
+            var next = block.Instructions[i];
+            if (next.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.IndirectJump
+                && next.Operands.Any(operand => operand is Register used && used.Name == holder.Name))
+                return true;
+
+            if (next.Destination is Register redefined && redefined.Name == holder.Name)
+                return false;
+        }
+
+        return false;
     }
 
     private static bool IsReadAfter(Block block, int index, Register register)

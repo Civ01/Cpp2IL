@@ -203,6 +203,18 @@ public static class Simplifier
             return counts;
         }
 
+        // Counted from the successor lists rather than trusting Predecessors, which passes don't always keep in sync
+        private int IncomingEdges(Block block)
+        {
+            var count = 0;
+            foreach (var other in _graph.Blocks)
+                foreach (var successor in other.Successors)
+                    if (successor == block)
+                        count++;
+
+            return block == _graph.EntryBlock ? count + 1 : count;
+        }
+
         private void ReplaceLocalsUntilReassignment(Block startBlock, int startIndex, LocalVariable local,
             IOperand replacement, bool stopAtJoins)
         {
@@ -269,7 +281,7 @@ public static class Simplifier
                 {
                     // A join merges this local's other definitions, so for a non-SSA (multiply-defined)
                     // local the replacement must not flow past it - the value there is path-dependent.
-                    if (stopAtJoins && successor.Predecessors.Count > 1)
+                    if (stopAtJoins && IncomingEdges(successor) > 1)
                         continue;
 
                     if (visited.Add(successor))
@@ -287,7 +299,7 @@ public static class Simplifier
             visited.EnsureCapacity(_graph.Blocks.Count);
 #endif
 
-            visited.Add(startBlock);
+            // The start block isn't marked visited: round a loop, its instructions before the start are reached too
             remaining.Push((startBlock, startIndex));
 
             usedByMemory = false;
@@ -333,6 +345,14 @@ public static class Simplifier
                         }
 
                         if (operand is AddressOf { Target: LocalVariable addressed } && addressed == local)
+                        {
+                            usedByMemory = true;
+                            return true;
+                        }
+
+                        // &array[index]
+                        if (operand is AddressOf { Target: ArrayAccess addressedElement }
+                            && (addressedElement.Array == local || addressedElement.Index == local as IOperand))
                         {
                             usedByMemory = true;
                             return true;

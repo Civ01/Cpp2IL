@@ -231,6 +231,7 @@ public static class LocalVariables
         // loads. Applied once up front and, being applied first, they win over anything inferred later.
         PropagateFromReturn(method);
         PropagateFromParameters(method);
+        SeedStackStructTypes(method);
         SeedRuntimeClassTypes(method);
         SeedNewobjResults(method);
         SeedMethodInfoTypes(method);
@@ -245,6 +246,78 @@ public static class LocalVariables
         // lets a field offset resolve, a field load types its result, and any of those can be the
         // receiver/base of the next step. Every pass is monotonic - it only resolves an operand or
         // fills a previously-unknown type - so the loop converges.
+        RunTypeAndFieldFixpoint(method);
+
+        // Calls to folded duplicate bodies that nothing could tell apart get a best guess, which in turn types more
+        if (MetadataResolver.GuessAmbiguousCalls(method))
+            RunTypeAndFieldFixpoint(method);
+
+        // 8/16 byte struct chunks become one value per field
+        if (WideChunkSplitter.Run(method))
+            RunTypeAndFieldFixpoint(method);
+
+        // Whatever's still untyped gets the integer type its definition suggests, rather than object, and that can
+        // in turn type what it flows into
+        if (DefaultUntypedLocals(method))
+            RunTypeAndFieldFixpoint(method);
+    }
+
+    private static bool DefaultUntypedLocals(MethodAnalysisContext method)
+    {
+        var types = method.AppContext.SystemTypes;
+        var changed = false;
+
+        // Anything used as a pointer is better left alone than called an integer
+        var pointers = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            foreach (var operand in instruction.Operands)
+                if (operand is MemoryOperand { Base: LocalVariable pointer })
+                    pointers.Add(pointer);
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction.Destination is not LocalVariable { Type: null } local || pointers.Contains(local))
+                continue;
+
+            if (local.Register.Name is "CF" or "OF" or "SF" or "ZF" or "PF")
+            {
+                local.Type = types.SystemBooleanType;
+                changed = true;
+                continue;
+            }
+
+            TypeAnalysisContext? guess = instruction switch
+            {
+                { OpCode: OpCode.Move, Operands: [_, Immediate { Value: >= int.MinValue and <= int.MaxValue }] } => types.SystemInt32Type,
+                { OpCode: OpCode.Move, Operands: [_, Immediate] } => types.SystemInt64Type,
+                { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Size: var size }] } => SizedInteger(size, method),
+                { OpCode: OpCode.Move, Operands: [_, StackOffset { Size: var size }] } => SizedInteger(size, method),
+                { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
+                    or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.Not or OpCode.Negate } => types.SystemInt64Type,
+                _ => null
+            };
+
+            if (guess == null)
+                continue;
+
+            local.Type = guess;
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    private static TypeAnalysisContext? SizedInteger(int size, MethodAnalysisContext method) => size switch
+    {
+        1 => method.AppContext.SystemTypes.SystemByteType,
+        2 => method.AppContext.SystemTypes.SystemInt16Type,
+        4 => method.AppContext.SystemTypes.SystemInt32Type,
+        8 => method.AppContext.SystemTypes.SystemInt64Type,
+        _ => null
+    };
+
+    private static void RunTypeAndFieldFixpoint(MethodAnalysisContext method)
+    {
         var changed = true;
         var loopCount = 0;
 
@@ -259,10 +332,58 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
+            changed |= ArrayPointerLoopRecovery.Run(method);
             changed |= RgctxResolver.Run(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
+        }
+    }
+
+    // lea rcx,[rax+20h] where +20h is a struct field: the address of that field (e.g. the receiver for a call to one
+    // of the field's struct methods, like obj.position.magnitude)
+    public static bool ResolveFieldAddresses(MethodAnalysisContext method)
+    {
+        var changed = false;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Add, Operands: [LocalVariable destination, LocalVariable { Type: { } baseType } baseLocal, Immediate { Value: > 0 and < 0x10000 } offset] })
+                continue;
+
+            var owner = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element : baseType;
+            if (owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count > 0 || owner is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+                || owner.FullName is "System.Int32" or "System.Int64" or "System.IntPtr" or "System.Object")
+                continue;
+
+            if (MetadataResolver.FindFieldChain(owner, false, offset.Value, 0, pointerSize) is not { } chain || chain[^1].BackingData?.FieldOffset is null)
+                continue;
+
+            // must point at the start of a struct-typed field, anything else is pointer arithmetic we don't understand
+            var field = chain[^1];
+            if (!StackStructRecovery.IsStruct(field.FieldType))
+                continue;
+
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(destination, new AddressOf(new FieldReference(field, baseLocal, (int)offset.Value) { Path = chain.GetRange(0, chain.Count - 1) }));
+            SetTypeIfUnknown(destination, field.FieldType);
+            changed = true;
+        }
+
+        return changed;
+    }
+
+    // Stack regions StackStructRecovery found to hold a whole struct
+    private static void SeedStackStructTypes(MethodAnalysisContext method)
+    {
+        if (method.StackStructTypes.Count == 0)
+            return;
+
+        foreach (var local in method.Locals)
+        {
+            if (local.Type == null && method.StackStructTypes.TryGetValue(local.Register.Name, out var structType))
+                local.Type = structType;
         }
     }
 
@@ -376,11 +497,92 @@ public static class LocalVariables
     // type, once set, is never changed) so the fixpoint terminates. Returns whether it set anything.
     private static bool SetTypeIfUnknown(LocalVariable local, TypeAnalysisContext? type)
     {
-        if (type == null || local.Type != null)
+        if (type == null)
+            return false;
+
+        // object (a shared generic's T, usually) says next to nothing: anything more specific a use knows wins
+        if (local.Type is { FullName: "System.Object" } && type is not { FullName: "System.Object" } && !type.IsValueType
+            && type is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+                or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+            && local.TypeReplacements < MaxTypeReplacements)
+        {
+            local.Type = type;
+            local.TypeReplacements++;
+            return true;
+        }
+
+        if (local.Type != null)
             return false;
 
         local.Type = type;
         return true;
+    }
+
+    // For what defines a value (a field load, a call's return, a copy): a use can have typed the local first with a
+    // less derived type (a field of type Derived passed to op_Inequality(Object, Object) is "an Object"), and the
+    // definition knows better. Moving only ever down the class hierarchy keeps this monotonic.
+    private const int MaxTypeReplacements = 4;
+
+    private static bool SetOrRefineType(LocalVariable local, TypeAnalysisContext? type)
+    {
+        if (type == null)
+            return false;
+
+        if (local.Type == null)
+        {
+            local.Type = type;
+            return true;
+        }
+
+        if (local.TypeReplacements >= MaxTypeReplacements || !IsStrictlyMoreDerived(type, local.Type))
+            return false;
+
+        local.Type = type;
+        local.TypeReplacements++;
+        return true;
+    }
+
+    // For a definition that's ground truth (a field load): it also overrides a type a use guessed that isn't even
+    // related, which happens when a phi of a reused register types all its inputs with whatever came first.
+    private static bool SetFromDefinition(LocalVariable local, TypeAnalysisContext? type)
+    {
+        if (SetOrRefineType(local, type))
+            return true;
+
+        if (type == null || local.Type == null || !IsPlainClass(type) || !IsPlainClass(local.Type))
+            return false;
+
+        if (local.TypeReplacements >= MaxTypeReplacements || MetadataResolver.IsInHierarchy(type, local.Type) || MetadataResolver.IsInHierarchy(local.Type, type))
+            return false;
+
+        local.Type = type;
+        local.TypeReplacements++;
+        return true;
+    }
+
+    private static bool IsPlainClass(TypeAnalysisContext type) =>
+        type is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+            or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext or SzArrayTypeAnalysisContext)
+        && !type.IsValueType && !type.IsInterface && type.FullName != "System.Object";
+
+    private static bool IsStrictlyMoreDerived(TypeAnalysisContext candidate, TypeAnalysisContext current)
+    {
+        if (candidate is RuntimeClassTypeAnalysisContext { RepresentedType: var candidateClass } && current is RuntimeClassTypeAnalysisContext { RepresentedType: var currentClass })
+            return IsStrictlyMoreDerived(candidateClass, currentClass);
+
+        if (ReferenceEquals(candidate, current) || candidate.IsValueType || current.IsValueType)
+            return false;
+
+        if (candidate is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+                or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext
+            || current is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+                or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+            return false;
+
+        if (current.IsInterface)
+            return false;
+
+        return candidate.BaseType is { } baseType && MetadataResolver.IsInHierarchy(baseType, current);
     }
 
     private static bool PropagateStaticFieldStorage(MethodAnalysisContext method)
@@ -424,8 +626,19 @@ public static class LocalVariables
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
                     break;
+                case OpCode.IsInst when instruction.Operands[0] is LocalVariable castResult:
+                    changed |= SetTypeIfUnknown(castResult, instruction.Operands[1] switch
+                    {
+                        LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var checkedType } } => checkedType,
+                        RuntimeClassTypeAnalysisContext { RepresentedType: var checkedType } => checkedType,
+                        TypeAnalysisContext checkedType and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => checkedType,
+                        _ => null
+                    });
+                    if (instruction.Operands[2] is LocalVariable castValue)
+                        changed |= SetTypeIfUnknown(castValue, method.AppContext.SystemTypes.SystemObjectType);
+                    break;
                 case OpCode.Add or OpCode.Subtract or OpCode.Multiply:
-                    changed |= PropagateArithmetic(instruction, method);
+                    changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
                     break;
                 case OpCode.Divide or OpCode.Modulo:
                     changed |= PropagateArithmetic(instruction, method) || PropagateIntegerResult(instruction, method);
@@ -491,6 +704,10 @@ public static class LocalVariables
             _ => null,
         };
 
+        // flags arithmetic on an enum stays that enum
+        if (type is { IsEnumType: true } and not GenericParameterTypeAnalysisContext)
+            return type;
+
         return type?.FullName switch
         {
             "System.Byte" or "System.SByte" or "System.Int16" or "System.UInt16"
@@ -517,16 +734,29 @@ public static class LocalVariables
 
         // Move local, local: copy a known type in whichever direction is missing it.
         if (destination is LocalVariable destLocal && source is LocalVariable sourceLocal)
-            return SetTypeIfUnknown(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
+            return SetOrRefineType(destLocal, sourceLocal.Type) || SetTypeIfUnknown(sourceLocal, destLocal.Type);
 
         // Move local, field: a field load types its result with the field's type. This is the edge
         // that lets the loaded value go on to be the base of a further field access.
         if (destination is LocalVariable loadDest && source is FieldReference loadField)
-            return SetTypeIfUnknown(loadDest, loadField.Field.FieldType);
+            return SetFromDefinition(loadDest, loadField.Field.FieldType);
 
         // Move field, local: a field store types the stored value with the field's type.
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
             return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
+
+        // array elements
+        if (destination is LocalVariable elementLoad && source is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } loadedElement } })
+            return SetFromDefinition(elementLoad, loadedElement);
+        if (destination is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } storedElement } } && source is LocalVariable elementStore)
+            return SetTypeIfUnknown(elementStore, storedElement);
+
+        // the whole of a struct (an 8 byte ValueTuple<int, int> read in one go) is that struct
+        if (destination is LocalVariable { Type: null } wholeDest
+            && source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Size: > 0 and var wholeSize, Base: LocalVariable { Type: { } wholeBaseType } }
+            && (wholeBaseType is ByRefTypeAnalysisContext { ElementType: { } byRefElement } ? byRefElement : wholeBaseType) is var wholeType
+            && StackStructRecovery.IsStruct(wholeType) && TypeSizes.StorageSize(wholeType, pointerSize) == wholeSize)
+            return SetTypeIfUnknown(wholeDest, wholeType);
 
         // An element of T[] is a T, whether we loaded it (reference arrays) or only computed its address
         if (destination is LocalVariable { Type: null } elementDest
@@ -541,11 +771,20 @@ public static class LocalVariables
             return SetTypeIfUnknown(derefDest, referent);
 
         // Move local, [obj]: offset 0 of a reference-typed value is its klass pointer.
-        if (destination is LocalVariable { Type: null } klassDest
+        if (destination is LocalVariable { Type: null or RuntimeClassTypeAnalysisContext } klassDest
             && source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: { } baseType } }
             && baseType is not (RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext or ByRefTypeAnalysisContext)
-            && !baseType.IsValueType)
-            return SetTypeIfUnknown(klassDest, new RuntimeClassTypeAnalysisContext(baseType, baseType.DeclaringAssembly));
+            && !baseType.IsValueType
+            && (klassDest.Type is not RuntimeClassTypeAnalysisContext { RepresentedType: var known }
+                || IsStrictlyMoreDerived(baseType, known)
+                || IsPlainClass(baseType) && IsPlainClass(known) && !MetadataResolver.IsInHierarchy(known, baseType))
+            && klassDest.TypeReplacements < MaxTypeReplacements)
+        {
+            if (klassDest.Type != null)
+                klassDest.TypeReplacements++;
+            klassDest.Type = new RuntimeClassTypeAnalysisContext(baseType, baseType.DeclaringAssembly);
+            return true;
+        }
 
         return false;
     }
@@ -585,6 +824,33 @@ public static class LocalVariables
         return changed;
     }
 
+    /// <summary>
+    /// Whether the type mentions a generic parameter the method can't see (the T of some other generic class, from a
+    /// call resolved to its open definition), which can't be a type in this method's body.
+    /// </summary>
+    internal static bool HasForeignGenericParameters(TypeAnalysisContext type, MethodAnalysisContext method, int depth = 0)
+    {
+        if (depth > 8)
+            return false;
+
+        switch (type)
+        {
+            case GenericParameterTypeAnalysisContext parameter:
+                if (ReferenceEquals(parameter.Owner, method) || method is ConcreteGenericMethodAnalysisContext concrete && ReferenceEquals(parameter.Owner, concrete.BaseMethodContext))
+                    return false;
+                for (var declaring = method.DeclaringType; declaring != null; declaring = declaring.DeclaringType)
+                    if (ReferenceEquals(parameter.Owner, declaring))
+                        return false;
+                return true;
+            case GenericInstanceTypeAnalysisContext instance:
+                return instance.GenericArguments.Any(a => HasForeignGenericParameters(a, method, depth + 1));
+            case WrappedTypeAnalysisContext wrapped:
+                return HasForeignGenericParameters(wrapped.ElementType, method, depth + 1);
+            default:
+                return false;
+        }
+    }
+
     private static bool PropagateFromCallParameters(MethodAnalysisContext method)
     {
         var changed = false;
@@ -620,8 +886,8 @@ public static class LocalVariables
             {
                 var producedType = calledMethod.Name is ".ctor" or ".cctor" ? calledMethod.DeclaringType : calledMethod.ReturnType;
 
-                if (producedType != method.AppContext.SystemTypes.SystemVoidType)
-                    changed |= SetTypeIfUnknown(returnValue, producedType);
+                if (producedType != method.AppContext.SystemTypes.SystemVoidType && !HasForeignGenericParameters(producedType, method))
+                    changed |= SetOrRefineType(returnValue, producedType);
             }
 
 
@@ -666,13 +932,14 @@ public static class LocalVariables
                 var parameterType = calledMethod.Parameters[parameterIndex].ParameterType;
 
                 if (parameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType }
+                    && !HasForeignGenericParameters(referencedType, method)
                     && Addressed(instruction.Operands[i]) is { } referenced)
                 {
                     changed |= SetTypeIfUnknown(referenced, referencedType);
                     continue;
                 }
 
-                if (instruction.Operands[i] is LocalVariable local)
+                if (instruction.Operands[i] is LocalVariable local && !HasForeignGenericParameters(parameterType, method))
                     changed |= SetTypeIfUnknown(local, parameterType);
             }
         }

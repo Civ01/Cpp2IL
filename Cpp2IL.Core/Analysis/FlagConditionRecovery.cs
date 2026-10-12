@@ -127,16 +127,31 @@ public static class FlagConditionRecovery
         return IsSubtraction(AsLocal(def.Operands[1]), defOf, out op0, out op1);
     }
 
-    // local := Subtract(a, b)
+    // local := Subtract(a, b) - a cmp's flags describe a against b. Any other value the flags were computed from
+    // (a test's a & b, or an add/and/or/... result) is compared against zero instead.
     private static bool IsSubtraction(LocalVariable? local, Dictionary<LocalVariable, Instruction> defOf, out IOperand? op0, out IOperand? op1)
     {
         op0 = op1 = null;
         var def = Def(local, defOf);
-        if (def is not { OpCode: OpCode.Subtract })
+        if (def == null)
             return false;
-        op0 = def.Operands[1];
-        op1 = def.Operands[2];
-        return true;
+
+        if (def.OpCode == OpCode.Subtract && def.Operands.Count == 3)
+        {
+            op0 = def.Operands[1];
+            op1 = def.Operands[2];
+            return true;
+        }
+
+        if (def.OpCode is OpCode.And or OpCode.Or or OpCode.Xor or OpCode.Add or OpCode.Subtract or OpCode.Negate or OpCode.Move
+            or OpCode.Multiply or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.Phi)
+        {
+            op0 = local;
+            op1 = new Immediate(0);
+            return true;
+        }
+
+        return false;
     }
 
     // local := CheckEqual(SF, OF) - the signed "not less" test. Operands are taken from the SF side.

@@ -51,13 +51,73 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         }
     }
 
+    // The x86 instructions of the method being lifted so far, for looking back from a jump table dispatch
+    [ThreadStatic] private static List<Instruction>? _recent;
+
+    // jmp rcx after mov ecx,[rdx+rax*4+table] / add rcx,rdx: the index register and the case targets, read from the table
+    private static (Register Index, List<ulong> Targets)? FindJumpTable(Instruction jump, MethodAnalysisContext context)
+    {
+        const ulong imageBase = 0x180000000;
+        if (_recent is not { Count: > 1 })
+            return null;
+
+        var window = _recent.Skip(Math.Max(0, _recent.Count - 10)).ToList();
+        var load = window.LastOrDefault(i => i is { Mnemonic: Mnemonic.Mov or Mnemonic.Movsxd, Op1Kind: OpKind.Memory, MemoryIndexScale: 4 }
+                                             && i.MemoryIndex != Register.None && i.MemoryBase != Register.None);
+        if (load.Mnemonic == Mnemonic.INVALID || load.Code == Code.INVALID)
+            return null;
+
+        var table = imageBase + (uint)load.MemoryDisplacement32;
+        var index = load.MemoryIndex;
+
+        // the bound check before it gives the entry count
+        var count = 0;
+        var bound = _recent.LastOrDefault(i => i is { Mnemonic: Mnemonic.Cmp, Op0Kind: OpKind.Register } && i.Op1Kind is OpKind.Immediate8 or OpKind.Immediate32 or OpKind.Immediate8to32 or OpKind.Immediate8to64 or OpKind.Immediate32to64
+                                               && i.Op0Register.GetFullRegister() == index.GetFullRegister() && i.IP < load.IP && load.IP - i.IP < 64);
+        if (bound.Code != Code.INVALID)
+            count = (int)bound.GetImmediate(1) + 1;
+
+        if (count is <= 0 or > 512 || !context.AppContext.Binary.TryMapVirtualAddressToRaw(table, out var raw))
+            return null;
+
+        var content = context.AppContext.Binary.GetRawBinaryContent();
+        var start = context.UnderlyingPointer;
+        var end = context.AppContext.GetAddressOfNextFunctionStart(start);
+        var targets = new List<ulong>();
+        for (var k = 0; k < count; k++)
+        {
+            if (raw + 4 * k + 4 > content.Length)
+                return null;
+            var target = imageBase + BitConverter.ToUInt32(content.Slice((int)raw + 4 * k, 4).ToArray(), 0);
+            if (target < start || end != 0 && target >= end)
+                return null;
+            targets.Add(target);
+        }
+
+        return (index.GetFullRegister(), targets);
+    }
+
+    private static bool IsScalarSingle(Mnemonic mnemonic) => mnemonic is Mnemonic.Addss or Mnemonic.Subss or Mnemonic.Mulss or Mnemonic.Divss
+        or Mnemonic.Minss or Mnemonic.Maxss or Mnemonic.Sqrtss or Mnemonic.Comiss or Mnemonic.Ucomiss or Mnemonic.Cvtss2sd or Mnemonic.Cvttss2si
+        or Mnemonic.Cvtss2si or Mnemonic.Movss or Mnemonic.Roundss or Mnemonic.Rcpss or Mnemonic.Rsqrtss;
+
     public override List<ISIL.Instruction> GetIsilFromMethod(MethodAnalysisContext context)
     {
         var instructions = new List<ISIL.Instruction>();
         var addresses = new List<ulong>();
 
+        _recent = [];
         foreach (var instruction in X86Utils.Iterate(context))
+        {
+            _recent.Add(instruction);
+            var before = instructions.Count;
             ConvertInstructionStatement(instruction, instructions, addresses, context);
+
+            // Remember what only works on the low float of an xmm register, so a wider load feeding just that can be narrowed
+            if (IsScalarSingle(instruction.Mnemonic))
+                for (var i = before; i < instructions.Count; i++)
+                    instructions[i].ScalarSingle = true;
+        }
 
         // Add return if the function doesn't end with one already
         if (instructions.Count > 0 && instructions[^1].OpCode != ISIL.OpCode.Return)
@@ -97,6 +157,11 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
         return instructions;
     }
+
+    // The calling convention gives stack arguments relative to rsp on entry to the callee, which is one return address
+    // further on than at the call site
+    private static IEnumerable<ISIL.IOperand> AtCallSite(IEnumerable<ISIL.IOperand> arguments)
+        => arguments.Select(a => a is ISIL.StackOffset slot ? new ISIL.StackOffset(slot.Offset - 8) : a);
 
     private static ISIL.Register? ReturnRegisterClobberedBy(MethodAnalysisContext callee)
         => callee.IsVoid ? CallingConventions.ReturnRegister(callee) : null;
@@ -181,11 +246,16 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         var dataReferences = new List<ulong>();
         var callTargets = new List<ulong>();
 
+        var bodyEnd = body.Count > 0 ? body[^1].NextIP : address;
+
         foreach (var insn in body)
         {
             if (insn.Mnemonic == Mnemonic.Lea && insn.IsIPRelativeMemoryOperand)
                 dataReferences.Add(insn.IPRelativeMemoryAddress);
             else if (insn.Mnemonic == Mnemonic.Call && insn.Op0Kind == OpKind.NearBranch64)
+                callTargets.Add(insn.NearBranchTarget);
+            // a tail call (or a thunk's only instruction) leaves the function
+            else if (insn.Mnemonic == Mnemonic.Jmp && insn.Op0Kind == OpKind.NearBranch64 && (insn.NearBranchTarget < address || insn.NearBranchTarget >= bodyEnd))
                 callTargets.Add(insn.NearBranchTarget);
         }
 
@@ -217,6 +287,10 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         {
             var call = Add(source.IP, ISIL.OpCode.IndirectCall, ConvertOperand(source, 0), new ISIL.Register(null, "rax") /* return value */);
             call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, source.IP));
+
+            // We don't know yet whether the callee returns in rax or xmm0. Whichever it turns out to be, the call's
+            // result is what's read afterwards, so let xmm0 carry it too (if it's an integer return, nothing reads xmm0).
+            Add(source.IP, ISIL.OpCode.Move, new ISIL.Register(null, "xmm0"), new ISIL.Register(null, "rax"));
         }
         
         // Preserve all the argument registers as we don't know which ones are used
@@ -245,10 +319,44 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.Movdqu: // DEST[127:0] := SRC[127:0]
                 Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
                 break;
+            case Mnemonic.Movss when instruction.Op0Kind == OpKind.Register && instruction.Op1Kind == OpKind.Register:
+                AddShuffle(4, 1, 2, 3); // merges the low lane only
+                break;
             case Mnemonic.Movss: // scalar single - as a move, but a load from a constant address is a float literal
             case Mnemonic.Movsd: // scalar double
                 Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, instruction.Mnemonic == Mnemonic.Movss, context));
                 break;
+            // Conversions between float, double and integers. The conversion itself is implied by the types of the
+            // source and destination, which the IL generator reconciles.
+            case Mnemonic.Cvtss2sd:
+            case Mnemonic.Cvttss2si:
+            case Mnemonic.Cvtss2si:
+                Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, true, context));
+                break;
+            case Mnemonic.Cvtsd2ss:
+            case Mnemonic.Cvtsd2si:
+                Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
+            case Mnemonic.Cvtsi2ss:
+            case Mnemonic.Cvtsi2sd:
+                Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                break;
+            case Mnemonic.Sqrtss:
+            case Mnemonic.Sqrtsd:
+            case Mnemonic.Sqrtpd: // inlined Math.Sqrt works on the low lane only
+            case Mnemonic.Sqrtps:
+            {
+                if (context?.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName("System.Math")?.Methods
+                        .FirstOrDefault(m => m.Name == "Sqrt" && m.Parameters.Count == 1) is { } sqrt)
+                {
+                    var single = instruction.Mnemonic is Mnemonic.Sqrtss or Mnemonic.Sqrtps;
+                    Add(instruction.IP, ISIL.OpCode.Call, sqrt, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, single, context));
+                }
+                else
+                    goto default;
+
+                break;
+            }
             case Mnemonic.Cbw: // AX := sign-extend AL
                 Add(instruction.IP, ISIL.OpCode.Move, new ISIL.Register(null, X86Utils.GetRegisterName(Register.AX)),
                     new ISIL.Register(null, X86Utils.GetRegisterName(Register.AL)));
@@ -356,7 +464,11 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 if (instruction.Op0Kind == OpKind.Register && instruction.Op1Kind == OpKind.Register && instruction.Op0Register == instruction.Op1Register)
                     Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), Imm(0));
                 else
+                {
                     Add(instruction.IP, ISIL.OpCode.Xor, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                    if (instruction.Mnemonic == Mnemonic.Xor)
+                        AddLogicalResultFlags(instruction.IP, ConvertOperand(instruction, 0));
+                }
                 break;
             case Mnemonic.Shl: // unsigned shift
             case Mnemonic.Sal: // signed shift
@@ -369,10 +481,14 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.And:
             case Mnemonic.Andps: //Floating point and
                 Add(instruction.IP, ISIL.OpCode.And, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction.Mnemonic == Mnemonic.And)
+                    AddLogicalResultFlags(instruction.IP, ConvertOperand(instruction, 0));
                 break;
             case Mnemonic.Or:
             case Mnemonic.Orps: //Floating point or
                 Add(instruction.IP, ISIL.OpCode.Or, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction.Mnemonic == Mnemonic.Or)
+                    AddLogicalResultFlags(instruction.IP, ConvertOperand(instruction, 0));
                 break;
             case Mnemonic.Bts: // CF = old bit, then set it
                 {
@@ -402,6 +518,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 break;
             case Mnemonic.Neg: // dest := -dest
                 Add(instruction.IP, ISIL.OpCode.Negate, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0));
+                AddArithmeticResultFlags(instruction.IP, ConvertOperand(instruction, 0), true);
                 break;
             case Mnemonic.Imul:
                 if (instruction.OpCount == 1)
@@ -456,6 +573,16 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     Add(instruction.IP, ISIL.OpCode.Modulo, remainder, dividend, divisor);
                     break;
                 }
+            case Mnemonic.Mulsd:
+            case Mnemonic.Divsd:
+                Add(instruction.IP, instruction.Mnemonic == Mnemonic.Mulsd ? ISIL.OpCode.Multiply : ISIL.OpCode.Divide,
+                    ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
+            case Mnemonic.Addsd:
+            case Mnemonic.Subsd:
+                Add(instruction.IP, instruction.Mnemonic == Mnemonic.Addsd ? ISIL.OpCode.Add : ISIL.OpCode.Subtract,
+                    ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
             case Mnemonic.Mulss:
             case Mnemonic.Vmulss:
                 if (instruction.OpCount == 3)
@@ -513,9 +640,16 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 var left = ConvertOperand(instruction, 0);
                 var right = ConvertOperand(instruction, 1);
                 if (isSubtract)
+                {
+                    // sub sets the flags exactly as cmp of the same operands would (e.g. a sub rdx,1 / jne loop counter)
+                    AddCompareInstruction(instruction.IP, left, right);
                     Add(instruction.IP, ISIL.OpCode.Subtract, left, left, right);
+                }
                 else
+                {
                     Add(instruction.IP, ISIL.OpCode.Add, left, left, right);
+                    AddArithmeticResultFlags(instruction.IP, left, true);
+                }
 
                 break;
             case Mnemonic.Addss:
@@ -553,75 +687,68 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             // The following pair of instructions does not update the Carry Flag (CF):
             case Mnemonic.Dec:
                 Add(instruction.IP, ISIL.OpCode.Subtract, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), Imm(1));
+                AddArithmeticResultFlags(instruction.IP, ConvertOperand(instruction, 0), false);
                 break;
             case Mnemonic.Inc:
                 Add(instruction.IP, ISIL.OpCode.Add, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), Imm(1));
+                AddArithmeticResultFlags(instruction.IP, ConvertOperand(instruction, 0), false);
                 break;
 
-            case Mnemonic.Shufps: // Packed Interleave Shuffle of Quadruplets of Single Precision Floating-Point Values
-                {
-                    if (instruction.Op1Kind == OpKind.Memory)
-                        goto default;
-
-                    var imm = instruction.Immediate8;
-                    var src1 = X86Utils.GetRegisterName(instruction.Op0Register);
-                    var src2 = X86Utils.GetRegisterName(instruction.Op1Register);
-
-                    // Element selection
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, "XMM_TEMP" + "_0"),
-                        new ISIL.Register(null, $"{src1}_{imm & 0b11}"));
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, "XMM_TEMP" + "_1"),
-                        new ISIL.Register(null, $"{src1}_{(imm >> 2) & 0b11}"));
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, "XMM_TEMP" + "_2"),
-                        new ISIL.Register(null, $"{src2}_{(imm >> 4) & 0b11}"));
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, "XMM_TEMP" + "_3"),
-                        new ISIL.Register(null, $"{src2}_{(imm >> 6) & 0b11}"));
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        ConvertOperand(instruction, 0),
-                        new ISIL.Register(null, "XMM_TEMP"));
-
-                    break;
-                }
-
-            case Mnemonic.Unpcklps: // Unpack and Interleave Low Packed Single Precision Floating-Point Values
-                {
-                    if (instruction.Op1Kind == OpKind.Memory)
-                        goto default;
-
-                    var src1 = X86Utils.GetRegisterName(instruction.Op0Register);
-                    var src2 = X86Utils.GetRegisterName(instruction.Op1Register);
-
-                    // Interleaving lanes
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, (string?)"XMM_TEMP" + "_0"),
-                        new ISIL.Register(null, $"{src1}_0")); // SRC1[31:0]
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, (string?)"XMM_TEMP" + "_1"),
-                        new ISIL.Register(null, $"{src2}_0")); // SRC2[31:0]
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, (string?)"XMM_TEMP" + "_2"),
-                        new ISIL.Register(null, $"{src1}_1")); // SRC1[63:32]
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        new ISIL.Register(null, (string?)"XMM_TEMP" + "_3"),
-                        new ISIL.Register(null, $"{src2}_1")); // SRC2[63:32]
-
-                    Add(instruction.IP, ISIL.OpCode.Move,
-                        ConvertOperand(instruction, 0),
-                        new ISIL.Register(null, (string?)"XMM_TEMP"));
-
-                    break;
-                }
+            // Lane shuffles. Each becomes a VectorShuffle naming, per result lane, which lane of which source it takes;
+            // VectorLaneRecovery turns those into scalar moves of the lanes code actually reads.
+            case Mnemonic.Shufps:
+            {
+                var imm = instruction.Immediate8;
+                AddShuffle(imm & 3, (imm >> 2) & 3, 4 + ((imm >> 4) & 3), 4 + ((imm >> 6) & 3));
+                break;
+            }
+            case Mnemonic.Pshufd:
+            {
+                var imm = instruction.Immediate8;
+                AddShuffle(4 + (imm & 3), 4 + ((imm >> 2) & 3), 4 + ((imm >> 4) & 3), 4 + ((imm >> 6) & 3));
+                break;
+            }
+            case Mnemonic.Unpcklps:
+                AddShuffle(0, 4, 1, 5);
+                break;
+            case Mnemonic.Unpckhps:
+                AddShuffle(2, 6, 3, 7);
+                break;
+            case Mnemonic.Movlhps:
+                AddShuffle(0, 1, 4, 5);
+                break;
+            case Mnemonic.Movhlps:
+                AddShuffle(6, 7, 2, 3);
+                break;
+            case Mnemonic.Movshdup:
+                AddShuffle(5, 5, 7, 7);
+                break;
+            case Mnemonic.Movsldup:
+                AddShuffle(4, 4, 6, 6);
+                break;
+            case Mnemonic.Psrldq when instruction.Immediate8 % 4 == 0:
+            {
+                var by = instruction.Immediate8 / 4;
+                AddShuffle(by > 3 ? 8 : by, by + 1 > 3 ? 8 : by + 1, by + 2 > 3 ? 8 : by + 2, by + 3 > 3 ? 8 : by + 3, sameSource: true);
+                break;
+            }
+            case Mnemonic.Pslldq when instruction.Immediate8 % 4 == 0:
+            {
+                var by = instruction.Immediate8 / 4;
+                AddShuffle(0 - by < 0 ? 8 : 0, 1 - by < 0 ? 8 : 1 - by, 2 - by < 0 ? 8 : 2 - by, 3 - by < 0 ? 8 : 3 - by, sameSource: true);
+                break;
+            }
+            case Mnemonic.Insertps:
+            {
+                var imm = instruction.Immediate8;
+                var lanes = new[] { 0, 1, 2, 3 };
+                lanes[(imm >> 4) & 3] = 4 + (instruction.Op1Kind == OpKind.Memory ? 0 : (imm >> 6) & 3);
+                for (var lane = 0; lane < 4; lane++)
+                    if ((imm & (1 << lane)) != 0)
+                        lanes[lane] = 8;
+                AddShuffle(lanes[0], lanes[1], lanes[2], lanes[3]);
+                break;
+            }
 
             case Mnemonic.Call:
                 // We don't try and resolve which method is being called, but we do need to know how many parameters it has
@@ -633,7 +760,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 {
                     AddIndirectCall(instruction);
                 }
-                else if (context.AppContext.MethodsByAddress.TryGetValue(target, out var possibleMethods))
+                else if (context.AppContext.TryGetManagedMethodsAt(target, out var possibleMethods))
                 {
                     if (possibleMethods.Count == 1)
                     {
@@ -644,7 +771,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                         else
                             call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), CallingConventions.ReturnRegister(possibleMethods[0]));
 
-                        call.AddOperands(CallingConventions.ResolveForManaged(possibleMethods[0]));
+                        call.AddOperands(AtCallSite(CallingConventions.ResolveForManaged(possibleMethods[0])));
                         call.ImplicitDefinition = ReturnRegisterClobberedBy(possibleMethods[0]);
                     }
                     else
@@ -674,7 +801,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                         else
                             call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), CallingConventions.ReturnRegister(ctx));
 
-                        call.AddOperands(CallingConventions.ResolveForManaged(ctx));
+                        call.AddOperands(AtCallSite(CallingConventions.ResolveForManaged(ctx)));
                         call.ImplicitDefinition = ReturnRegisterClobberedBy(ctx);
                     }
                 }
@@ -686,6 +813,10 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
                     var call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), new ISIL.Register(null, "rax") /* return value */);
                     call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
+
+                    // as for indirect calls, the result may really be in xmm0
+                    if (!callNoReturn && context != null)
+                        Add(instruction.IP, ISIL.OpCode.Move, new ISIL.Register(null, "xmm0"), new ISIL.Register(null, "rax"));
                 }
 
                 if (callNoReturn)
@@ -718,6 +849,26 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.Ucomiss: // same, but unsigned
                 AddCompareInstruction(instruction.IP, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, true, context));
                 break;
+            case Mnemonic.Comisd:
+            case Mnemonic.Ucomisd:
+                AddCompareInstruction(instruction.IP, ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, false, context));
+                break;
+            case Mnemonic.Jp: // parity after a float compare means unordered (NaN). Treated as never happening.
+                if (instruction.Op0Kind != OpKind.Register)
+                {
+                    Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(instruction.NearBranchTarget), Imm(0));
+                    break;
+                }
+
+                goto default;
+            case Mnemonic.Jnp:
+                if (instruction.Op0Kind != OpKind.Register)
+                {
+                    Add(instruction.IP, ISIL.OpCode.Jump, Imm(instruction.NearBranchTarget));
+                    break;
+                }
+
+                goto default;
 
             case Mnemonic.Cmove: // move if condition
             case Mnemonic.Cmovne:
@@ -923,8 +1074,35 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 }
                 if (instruction.Op0Kind == OpKind.Register) // ex: jmp rax
                 {
-                    AddIndirectJmp(instruction);
-                    break;
+                    // A switch's jump table dispatch (jmp to an address read out of a table indexed by the case) stays a jump
+                    var isJumpTable = instructions.Skip(Math.Max(0, instructions.Count - 8))
+                        .Any(i => i.Operands.Any(o => o is ISIL.MemoryOperand { Index: not null, Scale: 4 }));
+
+                    // a switch: compare the index against each case in turn
+                    if (isJumpTable && context != null && FindJumpTable(instruction, context) is { } jumpTable)
+                    {
+                        var indexRegister = new ISIL.Register(null, X86Utils.GetRegisterName(jumpTable.Index));
+                        for (var k = 0; k < jumpTable.Targets.Count - 1; k++)
+                        {
+                            var caseFlag = new ISIL.Register(null, "TEMP");
+                            Add(instruction.IP, ISIL.OpCode.CheckEqual, caseFlag, indexRegister, Imm(k));
+                            Add(instruction.IP, ISIL.OpCode.ConditionalJump, Imm(jumpTable.Targets[k]), caseFlag);
+                        }
+
+                        Add(instruction.IP, ISIL.OpCode.Jump, Imm(jumpTable.Targets[^1]));
+                        break;
+                    }
+
+                    if (isJumpTable || context == null)
+                    {
+                        AddIndirectJmp(instruction);
+                        break;
+                    }
+
+                    // Otherwise it's a tail call (typically a delegate's invoke or a virtual method), so make it a call
+                    // and return what it returns, which the call resolution passes understand
+                    AddIndirectCall(instruction);
+                    goto case Mnemonic.Ret;
                 }
 
                 goto default;
@@ -1047,6 +1225,15 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 break;
         }
 
+        void AddShuffle(int lane0, int lane1, int lane2, int lane3, bool sameSource = false)
+        {
+            var destination = ConvertOperand(instruction, 0);
+            var second = sameSource ? destination : ConvertOperand(instruction, 1);
+            // byte shifts are as likely to move integers (a qword out of a 16 byte struct) as floats
+            var byteShift = instruction.Mnemonic is Mnemonic.Psrldq or Mnemonic.Pslldq ? 0x10000 : 0;
+            Add(instruction.IP, ISIL.OpCode.VectorShuffle, destination, destination, second, Imm((ulong)(lane0 | lane1 << 4 | lane2 << 8 | lane3 << 12 | byteShift)));
+        }
+
         void AddCompareInstruction(ulong ip, ISIL.IOperand op0, ISIL.IOperand op1)
         {
             var temp1 = new ISIL.Register(null, "TEMP1");
@@ -1066,6 +1253,19 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             Add(ip, ISIL.OpCode.And, temp5, temp2, Imm(1)); // temp5 = tmp2 & 1
             Add(ip, ISIL.OpCode.CheckEqual, new ISIL.Register(null, "PF"), temp5, Imm(0)); // PF = temp5 == 0
         }
+
+        // ZF/SF from a result, for instructions other than cmp/test/sub that set flags. CF/OF are approximated
+        // as clear (they're rarely consumed after these), which beats leaving the previous compare's values.
+        void AddArithmeticResultFlags(ulong ip, ISIL.IOperand result, bool affectsCarry)
+        {
+            Add(ip, ISIL.OpCode.CheckEqual, new ISIL.Register(null, "ZF"), result, Imm(0)); // ZF = result == 0
+            Add(ip, ISIL.OpCode.CheckLess, new ISIL.Register(null, "SF"), result, Imm(0)); // SF = result < 0
+            Add(ip, ISIL.OpCode.Move, new ISIL.Register(null, "OF"), Imm(0));
+            if (affectsCarry)
+                Add(ip, ISIL.OpCode.Move, new ISIL.Register(null, "CF"), Imm(0));
+        }
+
+        void AddLogicalResultFlags(ulong ip, ISIL.IOperand result) => AddArithmeticResultFlags(ip, result, true); // and/or/xor clear CF and OF
 
         void AddTestInstruction(ulong ip, ISIL.IOperand op0, ISIL.IOperand op1)
         {
@@ -1117,6 +1317,23 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
     private ISIL.IOperand ConvertOperand(Instruction instruction, int operand, bool isLeaAddress = false)
     {
+        var converted = ConvertOperandInternal(instruction, operand, isLeaAddress);
+
+        if (isLeaAddress || instruction.GetOpKind(operand) != OpKind.Memory)
+            return converted;
+
+        // Record the access width so multi-field copies (e.g. movsd of a Vector3's x and y) can be told apart from single fields
+        var size = instruction.MemorySize.GetSize();
+        return converted switch
+        {
+            ISIL.MemoryOperand memory => new ISIL.MemoryOperand(memory.Base, memory.Index, memory.Addend, memory.Scale, size),
+            ISIL.StackOffset slot => new ISIL.StackOffset(slot.Offset, size),
+            _ => converted
+        };
+    }
+
+    private ISIL.IOperand ConvertOperandInternal(Instruction instruction, int operand, bool isLeaAddress = false)
+    {
         var kind = instruction.GetOpKind(operand);
 
         if (kind == OpKind.Register)
@@ -1140,7 +1357,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         {
             var mBase = new ISIL.Register(null, X86Utils.GetRegisterName(instruction.MemoryBase));
             var mIndex = new ISIL.Register(null, X86Utils.GetRegisterName(instruction.MemoryIndex));
-            return new ISIL.MemoryOperand(mBase, mIndex, instruction.MemoryDisplacement32, instruction.MemoryIndexScale);
+            return new ISIL.MemoryOperand(mBase, mIndex, (long)instruction.MemoryDisplacement64, instruction.MemoryIndexScale);
         }
 
         //No addend
@@ -1155,7 +1372,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         if (instruction.MemoryIndex != Register.None && instruction.MemoryDisplacement64 != 0)
         {
             var mIndex = new ISIL.Register(null, X86Utils.GetRegisterName(instruction.MemoryIndex));
-            return new ISIL.MemoryOperand(null, mIndex, instruction.MemoryDisplacement32, instruction.MemoryIndexScale);
+            return new ISIL.MemoryOperand(null, mIndex, (long)instruction.MemoryDisplacement64, instruction.MemoryIndexScale);
         }
 
         //No index (and so no scale)
