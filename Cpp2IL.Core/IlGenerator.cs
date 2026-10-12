@@ -138,6 +138,18 @@ public static class IlGenerator
         Dictionary<Block, CilInstruction> blockEntryMap = [];
         List<(CilInstruction BranchInstruction, Block TargetBlock)> pendingBlockBranchFixups = [];
 
+        // IL starts executing at the first block emitted, which isn't necessarily where the method starts (a pass may
+        // have replaced the start with a block that sits later in the list, like a collapsed copy loop): jump there
+        var cfg = context.ControlFlowGraph!;
+        var firstEmitted = cfg.Blocks.FirstOrDefault(b => b != cfg.EntryBlock && b != cfg.ExitBlock && b.Instructions.Count > 0);
+        var realStart = cfg.EntryBlock.Successors.FirstOrDefault(s => s != cfg.ExitBlock);
+        if (realStart != null && firstEmitted != null && realStart != firstEmitted)
+        {
+            var startBridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
+            definition.CilMethodBody!.Instructions.Add(startBridge);
+            pendingBlockBranchFixups.Add((startBridge, realStart));
+        }
+
         foreach (var block in context.ControlFlowGraph!.Blocks)
         {
             if (block == context.ControlFlowGraph.EntryBlock || block == context.ControlFlowGraph.ExitBlock)
