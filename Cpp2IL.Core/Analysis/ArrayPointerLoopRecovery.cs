@@ -155,7 +155,89 @@ public static class ArrayPointerLoopRecovery
         }
 
         changed |= RecoverOffsetLoops(method, definitions);
+        changed |= RecoverScaledOffsets(method, definitions);
         return changed;
+    }
+
+    /// <summary>
+    /// An element whose size isn't a scale x86 addressing has (12, 56, ...) is reached through a byte offset computed
+    /// separately: <c>off = i * 56; [array + off + 0x20 + k]</c>. That's element i (plus however many whole elements k
+    /// spans), or a field of it.
+    /// </summary>
+    private static bool RecoverScaledOffsets(MethodAnalysisContext method, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var elementsOffset = 4L * pointerSize;
+        var changed = false;
+
+        foreach (var block in graph.Blocks)
+        {
+            for (var at = 0; at < block.Instructions.Count; at++)
+            {
+                var instruction = block.Instructions[at];
+                for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
+                {
+                    if (instruction.Operands[operandIndex] is not MemoryOperand { Scale: 0 or 1, Base: LocalVariable first, Index: LocalVariable second } memory)
+                        continue;
+
+                    var (array, offset) = first.Type is SzArrayTypeAnalysisContext ? (first, second) : second.Type is SzArrayTypeAnalysisContext ? (second, first) : (null, null);
+                    if (array?.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType } || offset == null
+                        || ScaledIndex(offset, definitions) is not var (index, scale))
+                        continue;
+
+                    var elementSize = elementType.IsValueType ? TypeSizes.StorageSize(elementType, pointerSize) : pointerSize;
+                    if (elementSize <= 0 || scale != elementSize)
+                        continue;
+
+                    var position = memory.Addend - elementsOffset;
+                    var element = FloorDiv(position, elementSize);
+                    var inner = position - element * elementSize;
+                    var whole = inner == 0 && (memory.Size == 0 || memory.Size == elementSize);
+                    var field = elementType.IsValueType && memory.Size > 0 && inner + memory.Size <= elementSize && !whole;
+                    if (!whole && !field)
+                        continue;
+
+                    IOperand elementIndex = index;
+                    if (element != 0)
+                    {
+                        var shifted = NewLocal(method, "elementIndex", method.AppContext.SystemTypes.SystemInt32Type);
+                        block.Instructions.Insert(at++, new Instruction(instruction.Index, OpCode.Add, shifted, index, new Immediate(element)));
+                        elementIndex = shifted;
+                    }
+
+                    var access = new ArrayAccess(array, elementIndex);
+                    if (whole)
+                        instruction.SetOperand(operandIndex, access);
+                    else
+                    {
+                        var reference = NewLocal(method, "element", elementType.MakeByReferenceType());
+                        block.Instructions.Insert(at++, new Instruction(instruction.Index, OpCode.Move, reference, new AddressOf(access)));
+                        instruction.SetOperand(operandIndex, new MemoryOperand(reference, null, inner, 0, memory.Size));
+                    }
+
+                    changed = true;
+                }
+            }
+        }
+
+        return changed;
+    }
+
+    // offset = index * scale (or index << n), possibly through copies or a widening
+    private static (IOperand Index, long Scale)? ScaledIndex(LocalVariable offset, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var definition = definitions.GetValueOrDefault(offset);
+        for (var hops = 0; hops < 4 && definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }; hops++)
+            definition = definitions.GetValueOrDefault(copied);
+
+        return definition switch
+        {
+            { OpCode: OpCode.Multiply, Operands: [_, LocalVariable index, Immediate { Value: > 1 and < 0x10000 and var by }] } => (index, by),
+            { OpCode: OpCode.Multiply, Operands: [_, Immediate { Value: > 1 and < 0x10000 and var by }, LocalVariable index] } => (index, by),
+            { OpCode: OpCode.ShiftLeft, Operands: [_, LocalVariable index, Immediate { Value: > 0 and < 16 and var shift }] } => (index, 1L << (int)shift),
+            _ => null,
+        };
     }
 
     /// <summary>
