@@ -126,6 +126,7 @@ public static class LocalVariables
                 continue;
 
             local.Name = method.Parameters[i].ParameterName;
+            local.ParameterIndex = i;
             paramLocals.Add(local);
         }
 
@@ -978,18 +979,13 @@ public static class LocalVariables
         if (method.Parameters.Count == 0)
             return;
 
-        // Normal params
-        var paramIndex = 0;
+        // Normal params (by the index each was named from: a parameter the body never reads has no local)
         foreach (var local in method.ParameterLocals)
         {
-            if (local.IsThis || local.IsMethodInfo)
+            if (local.IsThis || local.IsMethodInfo || local.ParameterIndex < 0 || local.ParameterIndex >= method.Parameters.Count)
                 continue;
 
-            if (paramIndex >= method.Parameters.Count)
-                break;
-
-            local.Type = method.Parameters[paramIndex].ParameterType;
-            paramIndex++;
+            local.Type = method.Parameters[local.ParameterIndex].ParameterType;
         }
     }
 
