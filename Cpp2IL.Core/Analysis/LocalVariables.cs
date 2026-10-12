@@ -261,6 +261,10 @@ public static class LocalVariables
         // in turn type what it flows into
         if (DefaultUntypedLocals(method))
             RunTypeAndFieldFixpoint(method);
+
+        // two neighbouring int fields read as one long
+        if (WideChunkSplitter.SplitIntegerPairs(method))
+            RunTypeAndFieldFixpoint(method);
     }
 
     private static bool DefaultUntypedLocals(MethodAnalysisContext method)

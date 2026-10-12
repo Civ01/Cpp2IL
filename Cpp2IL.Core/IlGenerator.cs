@@ -585,6 +585,11 @@ public static class IlGenerator
                 LoadOperand(instruction.Operands[1], method, locals, writeLine);
                 if (floatConversion is { } conv1)
                     instructions.Add(conv1);
+                // a 32 bit value shifted into a 64 bit result has to be widened first, or the shift wraps
+                else if (instruction.OpCode == OpCode.ShiftLeft
+                         && DestinationType(instruction.Operands[0]) is { Namespace: "System", Name: "Int64" or "UInt64" }
+                         && SourceType(instruction.Operands[1], context) is { Namespace: "System", Name: "Int32" or "UInt32" or "Int16" or "UInt16" or "Byte" or "SByte" } narrow)
+                    instructions.Add(narrow.Name.StartsWith("U") || narrow.Name == "Byte" ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8);
                 LoadOperand(instruction.Operands[2], method, locals, writeLine);
                 if (floatConversion is { } conv2)
                     instructions.Add(conv2);

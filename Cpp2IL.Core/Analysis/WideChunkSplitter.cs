@@ -66,6 +66,70 @@ public static class WideChunkSplitter
         return changed;
     }
 
+    /// <summary>
+    /// An 8 byte read of two adjacent 4 byte integer fields used as one 64 bit integer: MSVC folds
+    /// <c>((long)b << 32) | (uint)a</c> over neighbouring fields into a single load. Becomes exactly that expression.
+    /// </summary>
+    public static bool SplitIntegerPairs(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var types = method.AppContext.SystemTypes;
+        var changed = false;
+
+        foreach (var block in graph.Blocks)
+        {
+            for (var index = 0; index < block.Instructions.Count; index++)
+            {
+                var load = block.Instructions[index];
+                if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable { Type: var resultType } result, MemoryOperand { Base: LocalVariable { Type: { } baseType }, Index: null, Size: 8 } memory] }
+                    || resultType != types.SystemInt64Type && resultType != types.SystemUInt64Type)
+                    continue;
+
+                var owner = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element : baseType;
+                if (owner is GenericInstanceTypeAnalysisContext or GenericParameterTypeAnalysisContext or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
+                        or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext or PointerTypeAnalysisContext or SzArrayTypeAnalysisContext
+                    || MetadataResolver.FindFieldChain(owner, false, memory.Addend, 4, pointerSize) is not { } low
+                    || MetadataResolver.FindFieldChain(owner, false, memory.Addend + 4, 4, pointerSize) is not { } high
+                    || !IsFourByteInteger(low[^1].FieldType) || !IsFourByteInteger(high[^1].FieldType))
+                    continue;
+
+                LocalVariable Temp(string name, TypeAnalysisContext type)
+                {
+                    var local = new LocalVariable($"{name}{method.Locals.Count}", new Register(null, $"{name.ToUpperInvariant()}_{method.Locals.Count}", 0), type);
+                    method.Locals.Add(local);
+                    return local;
+                }
+
+                var lowValue = Temp("low", low[^1].FieldType);
+                var highValue = Temp("high", high[^1].FieldType);
+                var lowWide = Temp("lowWide", types.SystemInt64Type);
+                var lowBits = Temp("lowBits", types.SystemInt64Type);
+                var highWide = Temp("highWide", types.SystemInt64Type);
+                var highBits = Temp("highBits", types.SystemInt64Type);
+
+                block.Instructions.InsertRange(index, [
+                    new Instruction(load.Index, OpCode.Move, lowValue, new MemoryOperand(memory.Base, null, memory.Addend, 0, 4)),
+                    new Instruction(load.Index, OpCode.Move, highValue, new MemoryOperand(memory.Base, null, memory.Addend + 4, 0, 4)),
+                    new Instruction(load.Index, OpCode.Move, lowWide, lowValue),
+                    new Instruction(load.Index, OpCode.And, lowBits, lowWide, new Immediate(0xFFFFFFFF)),
+                    new Instruction(load.Index, OpCode.Move, highWide, highValue),
+                    new Instruction(load.Index, OpCode.ShiftLeft, highBits, highWide, new Immediate(32)),
+                ]);
+                load.OpCode = OpCode.Or;
+                load.SetOperands(result, highBits, lowBits);
+                index += 6;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static bool IsFourByteInteger(TypeAnalysisContext type) =>
+        type.IsEnumType ? type.Fields.FirstOrDefault(f => !f.IsStatic) is { FieldType: var underlying } && IsFourByteInteger(underlying)
+            : type.Namespace == "System" && type.Name is "Int32" or "UInt32";
+
     private static IEnumerable<LocalVariable> Reads(Instruction instruction)
     {
         var destination = instruction.Destination;
