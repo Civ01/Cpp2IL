@@ -93,8 +93,7 @@ public static class SmallStructRecovery
                 var high = highMove.Operands[1];
 
                 // the two halves of one struct of that type, taken apart and put back together: that struct
-                if (WholeOf(low, first, definitions) is { } lowOwner && ReferenceEquals(lowOwner, WholeOf(high, second, definitions))
-                    && lowOwner.Type == structType)
+                if (WholeOf(low, first, structType, definitions) is { } lowOwner && SameWhole(lowOwner, WholeOf(high, second, structType, definitions)))
                 {
                     highMove.OpCode = OpCode.Nop;
                     highMove.SetOperands();
@@ -147,15 +146,21 @@ public static class SmallStructRecovery
         return changed;
     }
 
-    // x where it is (a copy of) owner.field for the field chain given
-    private static LocalVariable? WholeOf(IOperand half, List<FieldAnalysisContext> chain, Dictionary<LocalVariable, Instruction> definitions)
+    // The struct a half was taken from: owner (a local) for owner.x, or owner.a.b for owner.a.b.x, as long as it is of
+    // the given type; null otherwise
+    private static IOperand? WholeOf(IOperand half, List<FieldAnalysisContext> chain, TypeAnalysisContext structType, Dictionary<LocalVariable, Instruction> definitions)
     {
         for (var hops = 0; hops < 4; hops++)
         {
             switch (half)
             {
                 case FieldReference { Local: { } owner } field when field.Field == chain[^1] && field.Path.Count == chain.Count - 1:
-                    return owner;
+                    return owner.Type == structType ? owner : null;
+                case FieldReference { Local: { } owner } field when field.Field == chain[^1] && field.Path.Count >= chain.Count
+                                                                     && field.Path[field.Path.Count - chain.Count] is { } container
+                                                                     && container.FieldType == structType:
+                    var outer = field.Path.Count - chain.Count;
+                    return new FieldReference(container, owner, 0) { Path = field.Path.GetRange(0, outer) };
                 case LocalVariable local when definitions.TryGetValue(local, out var definition) && definition is { OpCode: OpCode.Move, Operands: [_, var from] }:
                     half = from;
                     continue;
@@ -164,6 +169,13 @@ public static class SmallStructRecovery
         }
         return null;
     }
+
+    private static bool SameWhole(IOperand? a, IOperand? b) => (a, b) switch
+    {
+        (LocalVariable x, LocalVariable y) => ReferenceEquals(x, y),
+        (FieldReference x, FieldReference y) => x.Field == y.Field && ReferenceEquals(x.Local, y.Local) && x.Path.SequenceEqual(y.Path),
+        _ => false,
+    };
 
     private static void RetypeHalfArithmetic(Graphs.ISILControlFlowGraph graph, int pointerSize)
     {

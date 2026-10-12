@@ -50,6 +50,9 @@ public class Instruction : IOperand
     /// <summary>A move out of a general register into a vector lane that reads its low / high 4 bytes (movq xmm,rax).</summary>
     public bool ReadsLowHalf, ReadsHighHalf;
 
+    /// <summary>movd r32,xmm: only the low 4 bytes of the vector register are read.</summary>
+    public bool ReadsLowDword;
+
     public bool ScalarSingle;
 
     public bool IsCall => OpCode is OpCode.Call or OpCode.CallVoid;

@@ -36,6 +36,7 @@ public static class VectorLaneRecovery
         public Register? Materialized;
         public bool HighHalf; // the high 4 bytes of the general register in Value
         public List<(Block Predecessor, Lane Source)>? MergeOf; // at a join: whichever lane each predecessor had
+        public bool OfUnsplitLoads; // a join of lanes of different wide loads nobody has taken apart yet
         public bool WholeRegisterZero; // an upper lane of a register zeroed as a whole (xorps x,x), so the low lane is 0 too
     }
 
@@ -44,6 +45,7 @@ public static class VectorLaneRecovery
     {
         public required Block Block;
         public required Instruction Instruction;
+        public required IOperand Source; // as loaded, before any split
         public bool Split;
         public readonly List<(Block Block, Instruction Store)> PendingStores = [];
         public readonly Lane?[] Lanes = new Lane?[4];
@@ -77,7 +79,8 @@ public static class VectorLaneRecovery
         var context = new Context(method);
         var endStates = new Dictionary<Block, Dictionary<string, Lane?[]>>();
 
-        foreach (var block in graph.Blocks)
+        // predecessors first (reverse postorder), so lanes reach blocks the list happens to place before their predecessors
+        foreach (var block in ReversePostorder(graph))
         {
             var predecessors = block.Predecessors.Distinct().ToList();
             var singlePredecessor = predecessors is [{ } only] && endStates.ContainsKey(only) ? only : null;
@@ -179,7 +182,7 @@ public static class VectorLaneRecovery
             case { OpCode: OpCode.Move, Operands: [var destination, var source] } when IsVector(destination, out var name)
                                                                                      && WideLoadSource(source) is { } wide:
             {
-                var load = new WideLoad { Block = block, Instruction = instruction };
+                var load = new WideLoad { Block = block, Instruction = instruction, Source = source };
                 context.Loads.Add(load);
                 var lanes = new Lane?[4];
                 for (var lane = 1; lane < 4; lane++)
@@ -205,9 +208,25 @@ public static class VectorLaneRecovery
                 StoreLanes(context, block, instruction, destination, stored);
                 return;
 
+            // movq rax,xmm6 taking 8 bytes of a wide load that was never taken apart (a struct's Vector2 field passed on, say):
+            // the same 8 bytes, read where the load was
+            case { OpCode: OpCode.Move, Operands: [Register { Name: var gprName }, var source], ReadsLowDword: false } when !gprName.StartsWith("xmm", StringComparison.Ordinal)
+                                                                                                    && !gprName.EndsWith(HighSuffix, StringComparison.Ordinal)
+                                                                                                    && IsVector(source, out var wholeName)
+                                                                                                    && state.TryGetValue(wholeName, out var whole)
+                                                                                                    && UnsplitPair(whole) is var (pairLoad, pairOffset)
+                                                                                                    && Offset(pairLoad.Source, pairOffset, 8) is { } pairSource:
+            {
+                var copy = new Register(null, $"LANE_{context.Temporaries++}");
+                var loadIndex = pairLoad.Block.Instructions.IndexOf(pairLoad.Instruction);
+                pairLoad.Block.Instructions.Insert(loadIndex + 1, new Instruction(pairLoad.Instruction.Index, OpCode.Move, copy, pairSource));
+                instruction.SetOperand(1, copy);
+                return;
+            }
+
             // movq rax,xmm1 with two floats packed in it (a Vector2 being returned or passed in a register): the high one
             // goes along in rax_hi, for whoever turns out to need the pair (SmallStructRecovery)
-            case { OpCode: OpCode.Move, Operands: [Register { Name: var gprName }, var source] } when !gprName.StartsWith("xmm", StringComparison.Ordinal)
+            case { OpCode: OpCode.Move, Operands: [Register { Name: var gprName }, var source], ReadsLowDword: false } when !gprName.StartsWith("xmm", StringComparison.Ordinal)
                                                                                                     && !gprName.EndsWith(HighSuffix, StringComparison.Ordinal)
                                                                                                     && IsVector(source, out var packedName)
                                                                                                     && state.TryGetValue(packedName, out var packed)
@@ -377,19 +396,17 @@ public static class VectorLaneRecovery
                 if (sources.Any(source => source == null || source == UnknownLow))
                     continue;
 
-                // part of a wide load not (yet) known to be floats: a whole copy, which a join doesn't take apart
-                if (sources.Any(source => source!.Load is { Split: false }) && sources.Distinct().Count() > 1)
-                    continue;
-
                 if (sources.Distinct().Count() == 1)
                     lanes[lane] = sources[0];
-                else if (sources.All(source => source!.Load == null && source.Value is FloatLiteral or Immediate) && sources.Select(source => source!.Value).Distinct().Count() == 1)
+                else if (sources.All(source => source!.Load == null && source.MergeOf == null && source.Value is FloatLiteral or Immediate) && sources.Select(source => source!.Value).Distinct().Count() == 1)
                     lanes[lane] = sources[0]; // the same constant everywhere (a zeroed lane, typically)
                 else
                     lanes[lane] = new Lane
                     {
                         Block = block, Anchor = null!, Value = new FloatLiteral(0),
                         MergeOf = incoming.Select((i, n) => (i.Predecessor, sources[n]!)).ToList(),
+                        // lanes of wide loads not (yet) known to be floats: if all that happens is a whole copy, it's a copy
+                        OfUnsplitLoads = sources.Any(source => source!.Load is { Split: false }),
                     };
             }
 
@@ -460,6 +477,47 @@ public static class VectorLaneRecovery
         }
     }
 
+    // The low 8 bytes of a register being lanes (0, 1) or (2, 3) of one wide load nobody has taken apart yet
+    private static (WideLoad Load, int Offset)? UnsplitPair(Lane?[] lanes)
+    {
+        if (lanes[1] is not { Load: { Split: false } load } high)
+            return null;
+
+        var highIndex = Array.IndexOf(load.Lanes, high);
+        if (highIndex == 1 && lanes[0] == null && load.Lanes.Skip(1).Zip(lanes.Skip(1)).All(pair => ReferenceEquals(pair.First, pair.Second)))
+            return (load, 0); // the register as loaded
+        if (highIndex == 3 && ReferenceEquals(lanes[0], load.Lanes[2]))
+            return (load, 8);
+        return null;
+    }
+
+    private static List<Block> ReversePostorder(ISILControlFlowGraph graph)
+    {
+        var visited = new HashSet<Block>();
+        var postorder = new List<Block>();
+        var stack = new Stack<(Block Block, int Next)>();
+        stack.Push((graph.EntryBlock, 0));
+        visited.Add(graph.EntryBlock);
+        while (stack.Count > 0)
+        {
+            var (block, next) = stack.Pop();
+            if (next < block.Successors.Count)
+            {
+                stack.Push((block, next + 1));
+                var successor = block.Successors[next];
+                if (visited.Add(successor))
+                    stack.Push((successor, 0));
+                continue;
+            }
+            postorder.Add(block);
+        }
+
+        postorder.Reverse();
+        // anything unreachable from the entry keeps its place at the end
+        postorder.AddRange(graph.Blocks.Where(b => !visited.Contains(b)));
+        return postorder;
+    }
+
     private static Register Materialize(Context context, Lane lane)
     {
         if (lane.Materialized is { } done)
@@ -499,6 +557,10 @@ public static class VectorLaneRecovery
 
         if (Enumerable.Range(1, count - 1).Any(lane => lanes[lane] == null))
             return; // something we can't account for
+
+        // a join of different wide loads, stored whole: a copy, which keeps to whole registers
+        if (Enumerable.Range(1, count - 1).Any(lane => lanes[lane]!.OfUnsplitLoads))
+            return;
 
         // storing a register zeroed as a whole is zeroing that memory, which is clearer left as one store
         if (Enumerable.Range(1, count - 1).All(lane => lanes[lane]!.WholeRegisterZero))
@@ -552,7 +614,7 @@ public static class VectorLaneRecovery
 
             return instruction switch
             {
-                { OpCode: OpCode.Move, Operands: [Register { Name: var to }, _] } when !to.StartsWith("xmm", StringComparison.Ordinal) => 8,
+                { OpCode: OpCode.Move, Operands: [Register { Name: var to }, _], ReadsLowDword: false } when !to.StartsWith("xmm", StringComparison.Ordinal) => 8,
                 { OpCode: OpCode.Move, Operands: [var store, _] } when StoreSize(store) is 8 or 16 => StoreSize(store),
                 _ => 4
             };
@@ -624,7 +686,7 @@ public static class VectorLaneRecovery
             0 when firstLanes != null => firstLanes[0] == UnknownLow ? null : first,
             4 when secondLanes != null => secondLanes[0] == UnknownLow ? null : second,
             _ => SourceLane(low) is { } known
-                ? known.Value is MemoryOperand or StackOffset or FloatLiteral or Immediate && known.Load == null ? known.Value : Materialize(context, known)
+                ? known.Value is MemoryOperand or StackOffset or FloatLiteral or Immediate && known.Load == null && known.MergeOf == null ? known.Value : Materialize(context, known)
                 : null
         };
 
