@@ -619,6 +619,12 @@ public static class LocalVariables
     {
         var changed = false;
 
+        // locals holding null (or 0): no type of their own to give a phi
+        var nulls = new HashSet<LocalVariable>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable zero, Immediate { Value: 0 }] })
+                nulls.Add(zero);
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             switch (instruction.OpCode)
@@ -628,6 +634,7 @@ public static class LocalVariables
                     break;
                 case OpCode.Phi:
                     changed |= PropagatePhi(instruction);
+                    changed |= RefinePhi(instruction, nulls);
                     break;
                 case OpCode.IsInst when instruction.Operands[0] is LocalVariable castResult:
                     changed |= SetTypeIfUnknown(castResult, instruction.Operands[1] switch
@@ -835,6 +842,37 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    // A phi typed early by a use (or by a null input typed by one) can be refined once its real inputs are known: to the
+    // most derived class all of its non-null inputs share
+    private static bool RefinePhi(Instruction phi, HashSet<LocalVariable> nulls)
+    {
+        if (phi.Operands[0] is not LocalVariable { Type: { } current } destination || !IsPlainClass(current) && current.FullName != "System.Object")
+            return false;
+
+        TypeAnalysisContext? common = null;
+        for (var i = 1; i < phi.Operands.Count; i++)
+        {
+            if (phi.Operands[i] is not LocalVariable input || ReferenceEquals(input, destination) || nulls.Contains(input))
+                continue;
+            if (input.Type is not { } inputType || !IsPlainClass(inputType))
+                return false;
+
+            common = common == null ? inputType : CommonBase(common, inputType);
+            if (common == null)
+                return false;
+        }
+
+        return common != null && SetOrRefineType(destination, common);
+    }
+
+    private static TypeAnalysisContext? CommonBase(TypeAnalysisContext a, TypeAnalysisContext b)
+    {
+        for (var candidate = a; candidate != null; candidate = candidate.BaseType)
+            if (MetadataResolver.IsInHierarchy(b, candidate))
+                return IsPlainClass(candidate) ? candidate : null;
+        return null;
     }
 
     /// <summary>
