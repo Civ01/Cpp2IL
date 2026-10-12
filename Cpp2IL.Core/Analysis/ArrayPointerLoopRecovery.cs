@@ -189,7 +189,8 @@ public static class ArrayPointerLoopRecovery
                         definition = definitions.GetValueOrDefault(copied);
                     switch (definition)
                     {
-                        case { OpCode: OpCode.Move, Operands: [_, Immediate { Value: var value }] } when value >= elementsOffset && (start == null || start == value):
+                        // the element header (0x20) is in the start, or in each access ([offset + array + 0x20])
+                        case { OpCode: OpCode.Move, Operands: [_, Immediate { Value: var value }] } when value >= 0 && (start == null || start == value):
                             start = value;
                             starts.Add(input);
                             startDefinitions[input] = definition;
@@ -205,12 +206,17 @@ public static class ArrayPointerLoopRecovery
                     }
                 }
 
-                if (!valid || start == null || step == null || starts.Count == 0 || steps.Count == 0 || (start - elementsOffset) % step != 0
+                if (!valid || start == null || step == null || starts.Count == 0 || steps.Count == 0
                     || steps.Select(s => s.Step).Distinct().Count() > 1)
                     continue;
 
-                // every access through it must be [array + offset] over an array whose elements are that size
-                var accesses = new List<(Instruction Instruction, int Operand, LocalVariable Array)>();
+                // the element the offset starts at, and how far into it
+                var firstElement = FloorDiv(start.Value - elementsOffset, step.Value);
+                var firstRemainder = start.Value - elementsOffset - firstElement * step.Value;
+
+                // every access through it must be [array + offset + k] over an array whose elements are that size: the whole of
+                // element (i + n), or a field inside it when the elements are structs
+                var accesses = new List<(Instruction Instruction, int Operand, LocalVariable Array, long Element, long Inner, int Size)>();
                 var otherUse = false;
                 foreach (var instruction in graph.Instructions)
                 {
@@ -219,7 +225,7 @@ public static class ArrayPointerLoopRecovery
 
                     for (var i = 0; i < instruction.Operands.Count; i++)
                     {
-                        if (instruction.Operands[i] is not MemoryOperand { Scale: 0 or 1, Addend: 0 } memory)
+                        if (instruction.Operands[i] is not MemoryOperand { Scale: 0 or 1 } memory)
                             continue;
 
                         LocalVariable? array = null;
@@ -228,23 +234,37 @@ public static class ArrayPointerLoopRecovery
                         else if (ReferenceEquals(memory.Index, offset) && memory.Base is LocalVariable { Type: SzArrayTypeAnalysisContext } baseArray)
                             array = baseArray;
 
-                        if (array?.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType }
-                            || (elementType.IsValueType ? TypeSizes.StorageSize(elementType, pointerSize) : pointerSize) != step
-                            || memory.Size != 0 && memory.Size != step)
+                        // relative to the element the offset is at: rel bytes on (an access may also reach back, a[i - 1])
+                        var rel = firstRemainder + memory.Addend;
+                        var delta = FloorDiv(rel, step.Value);
+                        var inner = rel - delta * step.Value;
+                        var elementType = (array?.Type as SzArrayTypeAnalysisContext)?.ElementType;
+                        var elementSize = elementType == null ? 0 : elementType.IsValueType ? TypeSizes.StorageSize(elementType, pointerSize) : pointerSize;
+                        var whole = inner == 0 && (memory.Size == 0 || memory.Size == step);
+                        var field = elementType is { IsValueType: true } && memory.Size > 0 && inner + memory.Size <= step && !whole;
+
+                        if (array == null || elementSize != step || !(whole || field))
                         {
                             if (Mentions(memory, offset))
                                 otherUse = true; // used some other way: leave it all alone
                             continue;
                         }
 
-                        accesses.Add((instruction, i, array));
+                        accesses.Add((instruction, i, array, delta, whole ? -1 : inner, memory.Size));
                     }
                 }
 
                 if (accesses.Count == 0 || otherUse)
                     continue;
 
-                // the index: phi(start / step, index + 1) alongside the offset
+                // the index: phi(first, index + 1) alongside the offset. When every access is to the same element, the index
+                // starts there; otherwise at 0, with each access adding its own element number
+                // the index counts from the element most accesses are to, the others reaching relative to it
+                var usual = accesses.GroupBy(a => a.Element).OrderByDescending(g => g.Count()).ThenBy(g => System.Math.Abs(g.Key)).First().Key;
+                var firstIndex = firstElement + usual;
+                for (var k = 0; k < accesses.Count; k++)
+                    accesses[k] = accesses[k] with { Element = accesses[k].Element - usual };
+                var sameElement = accesses.All(a => a.Element == 0);
                 var index = NewLocal(method, "index", method.AppContext.SystemTypes.SystemInt32Type);
                 var indexOperands = new List<IOperand> { index };
                 var nextIndex = NewLocal(method, "nextIndex", method.AppContext.SystemTypes.SystemInt32Type);
@@ -256,7 +276,7 @@ public static class ArrayPointerLoopRecovery
                         var startDefinition = startDefinitions[input];
                         var startBlock = graph.Blocks.First(b => b.Instructions.Contains(startDefinition));
                         startBlock.Instructions.Insert(startBlock.Instructions.IndexOf(startDefinition) + 1,
-                            new Instruction(startDefinition.Index, OpCode.Move, startLocal, new Immediate((start.Value - elementsOffset) / step.Value)));
+                            new Instruction(startDefinition.Index, OpCode.Move, startLocal, new Immediate(firstIndex)));
                         indexOperands.Add(startLocal);
                     }
                     else
@@ -270,8 +290,32 @@ public static class ArrayPointerLoopRecovery
                 stepBlock.Instructions.Insert(stepBlock.Instructions.IndexOf(stepInstruction) + 1,
                     new Instruction(stepInstruction.Index, OpCode.Add, nextIndex, index, new Immediate(1)));
 
-                foreach (var (instruction, operand, array) in accesses)
-                    instruction.SetOperand(operand, new ArrayAccess(array, index));
+                foreach (var (instruction, operand, array, element, inner, size) in accesses)
+                {
+                    var accessBlock = graph.Blocks.First(b => b.Instructions.Contains(instruction));
+                    var at = accessBlock.Instructions.IndexOf(instruction);
+
+                    IOperand elementIndex = index;
+                    if (!sameElement && element != 0)
+                    {
+                        var shifted = NewLocal(method, "elementIndex", method.AppContext.SystemTypes.SystemInt32Type);
+                        accessBlock.Instructions.Insert(at++, new Instruction(instruction.Index, OpCode.Add, shifted, index, new Immediate(element)));
+                        elementIndex = shifted;
+                    }
+
+                    var access = new ArrayAccess(array, elementIndex);
+                    if (inner < 0)
+                    {
+                        instruction.SetOperand(operand, access);
+                        continue;
+                    }
+
+                    // a field of a struct element, through a reference to the element
+                    var elementType = ((SzArrayTypeAnalysisContext)array.Type!).ElementType;
+                    var reference = NewLocal(method, "element", elementType.MakeByReferenceType());
+                    accessBlock.Instructions.Insert(at, new Instruction(instruction.Index, OpCode.Move, reference, new AddressOf(access)));
+                    instruction.SetOperand(operand, new MemoryOperand(reference, null, inner, 0, size));
+                }
 
                 // the offset is dead if all that's left is its own stepping
                 var steppedOffset = (LocalVariable)stepInstruction.Operands[0];
@@ -320,6 +364,8 @@ public static class ArrayPointerLoopRecovery
             definition = definitions.GetValueOrDefault(copied);
         return definition;
     }
+
+    private static long FloorDiv(long value, long by) => value >= 0 ? value / by : -((-value + by - 1) / by);
 
     private static LocalVariable NewLocal(MethodAnalysisContext method, string name, TypeAnalysisContext type)
     {
