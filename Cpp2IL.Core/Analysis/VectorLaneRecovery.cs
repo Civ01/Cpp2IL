@@ -35,6 +35,8 @@ public static class VectorLaneRecovery
         public WideLoad? Load;
         public Register? Materialized;
         public bool HighHalf; // the high 4 bytes of the general register in Value
+        public List<(Block Predecessor, Lane Source)>? MergeOf; // at a join: whichever lane each predecessor had
+        public bool WholeRegisterZero; // an upper lane of a register zeroed as a whole (xorps x,x), so the low lane is 0 too
     }
 
     // A wide load into an xmm register, which might yet turn out to be packed floats
@@ -75,10 +77,13 @@ public static class VectorLaneRecovery
 
         foreach (var block in graph.Blocks)
         {
-            var singlePredecessor = block.Predecessors.Distinct().ToList() is [{ } only] && endStates.ContainsKey(only) ? only : null;
+            var predecessors = block.Predecessors.Distinct().ToList();
+            var singlePredecessor = predecessors is [{ } only] && endStates.ContainsKey(only) ? only : null;
             var state = singlePredecessor != null
                 ? endStates[singlePredecessor].ToDictionary(kv => kv.Key, kv => (Lane?[])kv.Value.Clone())
-                : new Dictionary<string, Lane?[]>();
+                : predecessors.Count > 1 && predecessors.All(endStates.ContainsKey)
+                    ? Merge(block, predecessors.Select(p => (p, endStates[p])).ToList())
+                    : new Dictionary<string, Lane?[]>();
             if (singlePredecessor == null)
                 context.PendingStackCopies.Clear();
 
@@ -228,9 +233,10 @@ public static class VectorLaneRecovery
             var zeroesUpper = instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Size: 4 } or StackOffset { Size: 4 } or FloatLiteral or Immediate] }
                               || instruction is { OpCode: OpCode.Move, Operands: [_, Register { Name: var fromRegister }] } && !fromRegister.StartsWith("xmm", StringComparison.Ordinal);
             var lanes = new Lane?[4];
+            var wholeZero = instruction is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 } or FloatLiteral { Value: 0 }] };
             if (zeroesUpper)
                 for (var lane = 1; lane < 4; lane++)
-                    lanes[lane] = new Lane { Block = block, Anchor = instruction, Value = new FloatLiteral(0) };
+                    lanes[lane] = new Lane { Block = block, Anchor = instruction, Value = new FloatLiteral(0), WholeRegisterZero = wholeZero };
             if (instruction is { OpCode: OpCode.Move, Operands: [_, Register { Name: var gpr } gprRegister] } && !gpr.StartsWith("xmm", StringComparison.Ordinal))
             {
                 // movq: the high half of the GPR (what it is - the y of a Vector2, say - is worked out once types are known)
@@ -353,10 +359,66 @@ public static class VectorLaneRecovery
                 context.PendingStackCopies.Remove(offset);
     }
 
+    // A join's lanes: what every predecessor agrees on, or (lazily) a temporary each of them sets
+    private static Dictionary<string, Lane?[]> Merge(Block block, List<(Block Predecessor, Dictionary<string, Lane?[]> State)> incoming)
+    {
+        var merged = new Dictionary<string, Lane?[]>();
+        foreach (var name in incoming[0].State.Keys)
+        {
+            if (!incoming.All(i => i.State.ContainsKey(name)))
+                continue;
+
+            var lanes = new Lane?[4];
+            for (var lane = 1; lane < 4; lane++)
+            {
+                var sources = incoming.Select(i => i.State[name][lane]).ToList();
+                if (sources.Any(source => source == null || source == UnknownLow))
+                    continue;
+
+                // part of a wide load not (yet) known to be floats: a whole copy, which a join doesn't take apart
+                if (sources.Any(source => source!.Load is { Split: false }) && sources.Distinct().Count() > 1)
+                    continue;
+
+                if (sources.Distinct().Count() == 1)
+                    lanes[lane] = sources[0];
+                else if (sources.All(source => source!.Load == null && source.Value is FloatLiteral or Immediate) && sources.Select(source => source!.Value).Distinct().Count() == 1)
+                    lanes[lane] = sources[0]; // the same constant everywhere (a zeroed lane, typically)
+                else
+                    lanes[lane] = new Lane
+                    {
+                        Block = block, Anchor = null!, Value = new FloatLiteral(0),
+                        MergeOf = incoming.Select((i, n) => (i.Predecessor, sources[n]!)).ToList(),
+                    };
+            }
+
+            // the low lane is the register itself: SSA joins it
+            merged[name] = lanes;
+        }
+
+        return merged;
+    }
+
     private static Register Materialize(Context context, Lane lane)
     {
         if (lane.Materialized is { } done)
             return done;
+
+        if (lane.MergeOf is { } merges)
+        {
+            var joined = new Register(null, $"LANE_{context.Temporaries++}");
+            lane.Materialized = joined;
+            foreach (var (predecessor, source) in merges)
+            {
+                var value = Materialize(context, source);
+                var instructions = predecessor.Instructions;
+                var at = instructions.Count > 0 && instructions[^1].OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return
+                    ? instructions.Count - 1
+                    : instructions.Count;
+                instructions.Insert(at, new Instruction(at > 0 ? instructions[at - 1].Index : 0, OpCode.Move, joined, value));
+            }
+
+            return joined;
+        }
 
         if (lane.Load != null)
             Split(context, lane.Load);
@@ -375,6 +437,10 @@ public static class VectorLaneRecovery
 
         if (Enumerable.Range(1, count - 1).Any(lane => lanes[lane] == null))
             return; // something we can't account for
+
+        // storing a register zeroed as a whole is zeroing that memory, which is clearer left as one store
+        if (Enumerable.Range(1, count - 1).All(lane => lanes[lane]!.WholeRegisterZero))
+            return;
 
         // only lanes of a load not yet known to be floats: an ordinary copy, unless it turns out otherwise
         var loads = Enumerable.Range(1, count - 1).Select(lane => lanes[lane]!.Load).ToList();
