@@ -819,6 +819,13 @@ public static class MetadataResolver
 
         foreach (var instruction in method.ControlFlowGraph.Instructions)
         {
+            if (instruction is { OpCode: OpCode.Call, Operands: [Immediate invoker, ..] } && instruction.Operands.Count >= 10
+                && NativeHelpers.Classify(method.AppContext, invoker.UnsignedValue) == NativeHelperKind.VirtualInvoker)
+            {
+                changed |= ResolveVirtualInvoker(method, instruction, loads);
+                continue;
+            }
+
             if (instruction.OpCode != OpCode.IndirectCall)
                 continue;
 
@@ -861,6 +868,39 @@ public static class MetadataResolver
             LocalVariable local when loads.TryGetValue(local, out var load) => load,
             _ => null
         };
+    }
+
+    // An out-of-line virtual invoker, (slot, obj, args...) in the raw registers [target, rax, rcx, rdx, r8, r9, xmm0-3]
+    private static bool ResolveVirtualInvoker(MethodAnalysisContext method, Instruction call, Dictionary<LocalVariable, MemoryOperand> loads)
+    {
+        var slotOperand = call.Operands[2];
+        for (var depth = 0; depth < 4 && slotOperand is LocalVariable local; depth++)
+        {
+            var definition = method.ControlFlowGraph!.Instructions.FirstOrDefault(i => ReferenceEquals(i.Destination, local));
+            if (definition is not { OpCode: OpCode.Move })
+                break;
+            slotOperand = definition.Operands[1];
+        }
+
+        if (slotOperand is not Immediate { Value: >= 0 and < 0x10000 } slot
+            || call.Operands[3] is not LocalVariable { Type: { } receiverType } receiver
+            || receiverType is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext || receiverType.IsValueType
+            || ResolveVTableSlot(method.AppContext, receiverType, (int)slot.Value) is not { } resolved
+            || resolved.Parameters.Count > 2)
+            return false;
+
+        var operands = new List<IOperand> { resolved };
+        if (!resolved.IsVoid)
+            operands.Add(call.Operands[1]);
+        operands.Add(receiver);
+
+        // the invoker's own args start at the third register
+        for (var i = 0; i < resolved.Parameters.Count; i++)
+            operands.Add(BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[i].ParameterType) ? call.Operands[8 + i] : call.Operands[4 + i]);
+
+        call.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
+        call.SetOperands(operands);
+        return true;
     }
 
     private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)

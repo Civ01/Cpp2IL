@@ -33,6 +33,7 @@ public enum NativeHelperKind
     /// tail-calls it with (obj, args..., methodInfo).
     /// </summary>
     InterfaceInvoker,
+    VirtualInvoker,
 }
 
 /// <summary>
@@ -61,7 +62,7 @@ public static class NativeHelpers
 
     private static NativeHelperKind ClassifyUncached(ApplicationAnalysisContext app, ulong address)
     {
-        var body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, app, 128);
+        var body = X86Utils.GetMethodBodyAtVirtAddressNew(address, true, app, 320);
         if (body.Count == 0)
             return NativeHelperKind.Unknown;
 
@@ -103,8 +104,15 @@ public static class NativeHelpers
         // Interface invokers scan klass->interfaceOffsets (count at 0x12E) and finish with a register tail-jump
         if (body.Take(16).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Memory, MemoryDisplacement64: 0x12E, MemorySize: MemorySize.UInt16 })
             && body.Take(8).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })
-            && body.Any(i => i is { Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.Register }))
+            && body.Any(i => i is { Mnemonic: Mnemonic.Jmp or Mnemonic.Call, Op0Kind: OpKind.Register }))
             return NativeHelperKind.InterfaceInvoker;
+
+        // Virtual invokers (slot, obj, args...): index obj->klass->vtable by the slot in cx, then call through it
+        if (body.Take(12).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })
+            && body.Take(12).Any(i => i.Op1Kind == OpKind.Memory && i.MemoryBase == Register.RDX && i.MemoryIndex == Register.None && i.MemoryDisplacement64 == 0)
+            && body.Any(i => (i.Op0Kind == OpKind.Memory || i.Op1Kind == OpKind.Memory) && i.MemoryDisplacement64 is 0x138 or 0x140)
+            && !body.Take(16).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Memory, MemoryDisplacement64: 0x12E }))
+            return NativeHelperKind.VirtualInvoker;
 
         // RaiseInvalidCastException(obj, klass): reads the object's klass for the message, then raises
         if (body.Take(4).Any(i => i is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RDX, Op1Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryDisplacement64: 0 })
