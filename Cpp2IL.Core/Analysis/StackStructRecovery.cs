@@ -106,6 +106,26 @@ public static class StackStructRecovery
             }
         }
 
+        // A call through an interface (the slow path: GetInterfaceInvokeData(obj, interface, slot), then call [rax]) has
+        // no callee yet, but the interface and slot it looks up name it: struct arguments to it are passed by pointer too
+        foreach (var block in graph.Blocks)
+        {
+            var last = block.Instructions.FindLastIndex(i => i is { OpCode: OpCode.IndirectCall or OpCode.Call or OpCode.CallVoid, Operands: [Register, ..] });
+            if (last < 0 || block.Instructions[last] is not { Operands: [Register target, ..] } call
+                || InterfaceCallee(app, block, target.Name, last) is not { } callee)
+                continue;
+
+            string[] registers = ["rdx", "r8", "r9"];
+            for (var i = 0; i < callee.Parameters.Count && i < registers.Length; i++)
+            {
+                var parameterType = callee.Parameters[i].ParameterType;
+                if (parameterType is ByRefTypeAnalysisContext { ElementType: { } element })
+                    AddRoot(block, call, AddressedSlot(block, last, registers[i]), element, true, true);
+                else if (IsStruct(parameterType) && TypeSizes.UnboxedSize(parameterType, 8) is not (1 or 2 or 4 or 8))
+                    AddRoot(block, call, AddressedSlot(block, last, registers[i]), parameterType, true, false);
+            }
+        }
+
         AddParameterCopyRoots(method, graph, roots);
 
         if (roots.Count == 0)
@@ -377,6 +397,78 @@ public static class StackStructRecovery
                 return false;
 
         return true;
+    }
+
+    // call r9 where r9 = [rax] and rax came back from the interface lookup called just before, with rdx = the
+    // interface's class and r8 = the slot
+    private static MethodAnalysisContext? InterfaceCallee(ApplicationAnalysisContext app, Block block, string targetRegister, int callIndex)
+    {
+        var definition = block.Instructions.Take(callIndex).LastOrDefault(i => i.Destination is Register { } written && written.Name == targetRegister);
+        if (definition is not { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register { Name: "rax" }, Index: null, Addend: 0 }] }
+            || block.Instructions.Take(block.Instructions.IndexOf(definition)).Any(i => i.Destination is Register { Name: "rax" }))
+            return null;
+
+        // up through blocks that don't touch rax to the one ending in the lookup call
+        Block? lookup = null;
+        for (var (current, hops) = (block, 0); hops < 3 && current.Predecessors is [var predecessor]; current = predecessor, hops++)
+        {
+            if (predecessor.Instructions is [.., { IsCall: true, Operands: [Immediate, ..] }])
+            {
+                lookup = predecessor;
+                break;
+            }
+
+            if (predecessor.Instructions.Any(i => i.Destination is Register { Name: "rax" }))
+                return null;
+        }
+
+        if (lookup == null)
+            return null;
+
+        var lookupCall = lookup.Instructions.Count - 1;
+        var interfaceAddress = LastWrite(lookup, lookupCall, "rdx") is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: null, Index: null } global] } ? (ulong?)global.Addend : null;
+        var slot = LastWrite(lookup, lookupCall, "r8") is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: var value }] } ? (long?)value : null;
+
+        if (interfaceAddress is null or 0 || slot is null or < 0
+            || app.LibCpp2IlContext.GetTypeGlobalByAddress(interfaceAddress.Value) is not { } typeGlobal)
+            return null;
+
+        try
+        {
+            return app.ResolveIl2CppType(typeGlobal) is { IsInterface: true } declaringInterface
+                ? InterfaceDispatchRecovery.ResolveInterfaceSlot(declaringInterface, (int)slot.Value)
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // The write of a register reaching a point: within the block, else the same one along every path into it
+    private static Instruction? LastWrite(Block block, int before, string register, int depth = 0, HashSet<Block>? visited = null)
+    {
+        for (var i = before - 1; i >= 0; i--)
+            if (block.Instructions[i].Destination is Register { } written && written.Name == register)
+                return block.Instructions[i];
+
+        visited ??= [];
+        if (depth > 8 || !visited.Add(block) || block.Predecessors.Count == 0)
+            return null;
+
+        Instruction? found = null;
+        foreach (var predecessor in block.Predecessors)
+        {
+            if (visited.Contains(predecessor))
+                continue; // a loop back edge: whatever reaches the loop
+
+            var write = LastWrite(predecessor, predecessor.Instructions.Count, register, depth + 1, visited);
+            if (write == null || found != null && found != write)
+                return null;
+            found = write;
+        }
+
+        return found;
     }
 
     private static (int Offset, Instruction Definition)? AddressedSlot(Block block, int callIndex, IOperand argument)
