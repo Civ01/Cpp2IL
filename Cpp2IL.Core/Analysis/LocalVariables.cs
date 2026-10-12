@@ -336,6 +336,7 @@ public static class LocalVariables
             changed |= ArrayPointerLoopRecovery.Run(method);
             changed |= RgctxResolver.Run(method);
             changed |= KeyFunctionRecovery.RewriteUnboxes(method);
+            changed |= CastNarrowing.Run(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
@@ -567,7 +568,7 @@ public static class LocalVariables
             or ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext or SzArrayTypeAnalysisContext)
         && !type.IsValueType && !type.IsInterface && type.FullName != "System.Object";
 
-    private static bool IsStrictlyMoreDerived(TypeAnalysisContext candidate, TypeAnalysisContext current)
+    internal static bool IsStrictlyMoreDerived(TypeAnalysisContext candidate, TypeAnalysisContext current)
     {
         if (candidate is RuntimeClassTypeAnalysisContext { RepresentedType: var candidateClass } && current is RuntimeClassTypeAnalysisContext { RepresentedType: var currentClass })
             return IsStrictlyMoreDerived(candidateClass, currentClass);
