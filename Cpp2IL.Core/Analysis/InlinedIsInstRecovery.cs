@@ -32,6 +32,7 @@ public static class InlinedIsInstRecovery
             return;
 
         var temporaryCounter = 0;
+        var deadLoads = new List<Instruction>();
 
         foreach (var block in graph.Blocks)
         {
@@ -47,17 +48,31 @@ public static class InlinedIsInstRecovery
                 if (left is MemoryOperand { Base: Register hierarchy, Index: Register, Scale: 8, Addend: -8 }
                     && right is Register targetClass
                     && Trace(graph, block, i, hierarchy.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register klassRegister, Index: null, Addend: TypeHierarchyOffset }] } hierarchyLoad
-                    && Trace(graph, block, i, klassRegister.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register objectRegister, Index: null, Addend: 0 }] } klassLoad
-                    && !RedefinedBetween(graph, klassLoad, block, i, objectRegister.Name)
-                    && !RedefinedBetween(graph, klassLoad, block, i, targetClass.Name))
+                    && graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(hierarchyLoad)) is { } hierarchyBlock
+                    // the class as it was when the hierarchy was read from it (its register may be reused since)
+                    && Trace(graph, hierarchyBlock, hierarchyBlock.Instructions.IndexOf(hierarchyLoad), klassRegister.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register objectRegister, Index: null, Addend: 0 }] } klassLoad
+                    && graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(klassLoad)) is { } klassBlock)
                 {
                     var instance = new Register(null, $"ISINST_{temporaryCounter}");
                     var notInstance = new Register(null, $"ISINST_NULL_{temporaryCounter}");
+
+                    // the object register is often reused for the class data in between: test a copy taken with its class
+                    IOperand tested = objectRegister;
+                    if (RedefinedBetween(graph, klassLoad, block, i, objectRegister.Name))
+                    {
+                        var copy = new Register(null, $"ISINST_OBJ_{temporaryCounter}");
+                        klassBlock.Instructions.Insert(klassBlock.Instructions.IndexOf(klassLoad), new Instruction(klassLoad.Index, OpCode.Move, copy, objectRegister));
+                        if (klassBlock == block)
+                            i++;
+                        tested = copy;
+                    }
                     temporaryCounter++;
 
                     ReplaceInCluster(block, i, left, right, notInstance, new Immediate(0));
+                    // the hierarchy pointer only served the check (it can linger as an operand of a call not yet resolved)
+                    deadLoads.Add(hierarchyLoad);
                     block.Instructions.Insert(i, new Instruction(block.Instructions[i].Index, OpCode.CheckEqual, notInstance, instance, new Immediate(0)));
-                    block.Instructions.Insert(i, new Instruction(block.Instructions[i].Index, OpCode.IsInst, instance, targetClass, objectRegister));
+                    block.Instructions.Insert(i, new Instruction(block.Instructions[i].Index, OpCode.IsInst, instance, targetClass, tested));
                     i += 2;
                     continue;
                 }
@@ -65,12 +80,21 @@ public static class InlinedIsInstRecovery
                 // the depth check: klass->typeHierarchyDepth vs T->typeHierarchyDepth. The hierarchy check does the job.
                 if (left is MemoryOperand { Base: Register, Index: null, Addend: TypeHierarchyDepthOffset, Size: 1 }
                     && right is Register depth
-                    && Trace(graph, block, i, depth.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register, Index: null, Addend: TypeHierarchyDepthOffset, Size: 1 }] })
+                    && Trace(graph, block, i, depth.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register, Index: null, Addend: TypeHierarchyDepthOffset, Size: 1 }] } depthLoad)
                 {
                     ReplaceInCluster(block, i, left, right, new Immediate(1), new Immediate(0));
+                    deadLoads.Add(depthLoad);
                 }
             }
         }
+
+        // The class data those checks read is otherwise unused (it can linger as operands of calls not yet resolved), unless
+        // a check we couldn't recognise shares it
+        var unrecognised = graph.Blocks.SelectMany(b => b.Instructions).Any(instruction => instruction.Operands.Any(o =>
+            o is MemoryOperand { Index: Register, Scale: 8, Addend: -8 }));
+        if (!unrecognised)
+            foreach (var load in deadLoads)
+                load.SetOperand(1, new Immediate(0));
     }
 
     // Substitutes the compared operands throughout the flag computation the lifter emitted for one cmp
