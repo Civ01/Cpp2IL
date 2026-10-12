@@ -389,6 +389,22 @@ public static class IlGenerator
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
+            case OpCode.Unbox:
+            {
+                var unboxedType = instruction.Operands[1] switch
+                {
+                    LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } } => represented,
+                    RuntimeClassTypeAnalysisContext { RepresentedType: var represented } => represented,
+                    _ => null,
+                };
+
+                LoadOperand(instruction.Operands[2], method, locals, writeLine);
+                if (unboxedType != null)
+                    instructions.Add(CilOpCodes.Unbox, unboxedType.ToTypeSignature().ToTypeDefOrRef());
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                break;
+            }
+
             case OpCode.IsInst:
             {
                 var checkedType = instruction.Operands[1] switch
@@ -978,6 +994,8 @@ public static class IlGenerator
             LocalVariable local => local.Type,
             FieldReference field => field.Field.FieldType,
             ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            // a store through a managed pointer writes its referent
+            MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } referent } } } => referent,
             _ => null
         };
 

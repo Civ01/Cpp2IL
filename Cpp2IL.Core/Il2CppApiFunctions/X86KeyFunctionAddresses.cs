@@ -114,6 +114,14 @@ public class X86KeyFunctionAddresses : BaseKeyFunctionAddresses
             return 0;
         }
 
+        // Newer class libraries implement IsInstanceOfType in managed code (IsAssignableFrom(o.GetType())), whose last
+        // call is a managed method, not the icall's IsInst
+        if (_appContext.MethodsByAddress.ContainsKey(lastCall.NearBranchTarget))
+        {
+            Logger.VerboseNewline($"Last call (0x{lastCall.NearBranchTarget:X}) is a managed method, not IsInst. Aborting.");
+            return 0;
+        }
+
         Logger.VerboseNewline($"Success. IsInst found at 0x{lastCall.NearBranchTarget:X}");
         return lastCall.NearBranchTarget;
     }

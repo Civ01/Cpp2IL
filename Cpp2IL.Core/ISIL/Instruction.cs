@@ -119,6 +119,7 @@ public class Instruction : IOperand
             case OpCode.Newobj:
             case OpCode.Box:
             case OpCode.IsInst:
+            case OpCode.Unbox:
             case OpCode.VectorShuffle:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
@@ -162,7 +163,7 @@ public class Instruction : IOperand
                 => [_operands[1]],
 
             OpCode.Box => [_operands[2]],
-            OpCode.IsInst => [_operands[2], _operands[1]],
+            OpCode.IsInst or OpCode.Unbox => [_operands[2], _operands[1]],
             OpCode.VectorShuffle => [_operands[1], _operands[2]],
 
             OpCode.Add or OpCode.Subtract or OpCode.Multiply

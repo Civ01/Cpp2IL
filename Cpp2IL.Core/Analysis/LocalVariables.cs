@@ -334,6 +334,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= ArrayPointerLoopRecovery.Run(method);
             changed |= RgctxResolver.Run(method);
+            changed |= KeyFunctionRecovery.RewriteUnboxes(method);
             changed |= PropagateStaticFieldStorage(method);
             changed |= TypeAddressedLocals(method);
             changed |= PropagateTypesOnce(method);
@@ -764,6 +765,16 @@ public static class LocalVariables
             && (elementAccess.Index != null || elementAccess.Addend >= 4L * pointerSize))
             return SetTypeIfUnknown(elementDest, elementType);
 
+        // the whole value behind a pointer to a primitive or enum (ref/out parameters, unboxed values) is of that type
+        if (destination is LocalVariable { Type: null } primitiveLoad
+            && source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } loadedPointee } } } primitiveSource
+            && MetadataResolver.IsPrimitiveOrEnum(loadedPointee) && primitiveSource.Size == TypeSizes.StorageSize(loadedPointee, pointerSize))
+            return SetTypeIfUnknown(primitiveLoad, loadedPointee);
+        if (source is LocalVariable { Type: null } primitiveStore
+            && destination is MemoryOperand { Index: null, Scale: 0, Addend: 0, Base: LocalVariable { Type: ByRefTypeAnalysisContext { ElementType: { } storedPointee } } } primitiveDestination
+            && MetadataResolver.IsPrimitiveOrEnum(storedPointee) && primitiveDestination.Size == TypeSizes.StorageSize(storedPointee, pointerSize))
+            return SetTypeIfUnknown(primitiveStore, storedPointee);
+
         // Move local, [byref]: dereferencing a managed pointer to a reference type yields that referent
         // (a struct byref accesses fields directly with no deref, so this only fires for class referents).
         if (destination is LocalVariable { Type: null } derefDest
@@ -904,8 +915,10 @@ public static class LocalVariables
             var thisParamIndex = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
 
             // 'this' param
+            // (anything can be the receiver of a System.Object method, e.g. GetType, so that says nothing)
             if (!calledMethod.IsStatic
-                && instruction.Operands[thisParamIndex] is LocalVariable thisParam)
+                && instruction.Operands[thisParamIndex] is LocalVariable thisParam
+                && calledMethod.DeclaringType != method.AppContext.SystemTypes.SystemObjectType)
             {
                 changed |= SetTypeIfUnknown(thisParam, calledMethod.DeclaringType);
             }

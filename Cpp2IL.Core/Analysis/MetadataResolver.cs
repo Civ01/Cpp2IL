@@ -205,6 +205,12 @@ public static class MetadataResolver
                 if (memory.Base is not LocalVariable local || local?.Type == null)
                     continue;
 
+                // the whole value behind a pointer to a primitive or an enum is just that value (unboxed, or a ref
+                // parameter), not its m_value / value__ field
+                if (memory.Addend == 0 && local.Type is ByRefTypeAnalysisContext { ElementType: { } pointee } && IsPrimitiveOrEnum(pointee)
+                    && (memory.Size == 0 || memory.Size == TypeSizes.StorageSize(pointee, method.AppContext.Binary.PointerSizeBytes)))
+                    continue;
+
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } ? referent : local.Type);
@@ -270,6 +276,10 @@ public static class MetadataResolver
 
         return changed;
     }
+
+    internal static bool IsPrimitiveOrEnum(TypeAnalysisContext type) =>
+        type.IsEnumType || type.Namespace == "System" && type.Name is "Boolean" or "Byte" or "SByte" or "Int16" or "UInt16" or "Char"
+            or "Int32" or "UInt32" or "Int64" or "UInt64" or "Single" or "Double" or "IntPtr" or "UIntPtr";
 
     /// <summary>
     /// Finds the (possibly nested) field accessed by a <paramref name="size"/>-byte access at <paramref name="offset"/>
