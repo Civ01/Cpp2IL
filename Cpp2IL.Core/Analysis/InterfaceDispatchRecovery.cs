@@ -35,6 +35,8 @@ public static class InterfaceDispatchRecovery
 
         var changed = false;
         var slowCalls = new List<Instruction>();
+        var app = method.AppContext;
+        helperClassifier = address => NativeHelpers.Classify(app, address);
 
         foreach (var block in cfg.Blocks.ToList())
         {
@@ -45,6 +47,11 @@ public static class InterfaceDispatchRecovery
 
                 if (MatchGenericVirtual(instruction, definitions) is { } genericVirtual)
                 {
+                    // the lookup takes (vtable method, generic method) only; its raw argument list would otherwise keep
+                    // whatever happens to be in r8/r9 alive
+                    while (genericVirtual.SlowCall.Operands.Count > 4)
+                        genericVirtual.SlowCall.RemoveOperandAt(genericVirtual.SlowCall.Operands.Count - 1);
+
                     RewriteDispatch(method, instruction, block, genericVirtual, definitions);
                     ReplaceUsesOf(cfg, genericVirtual.SlowCall, new RuntimeMethodInfoAnalysisContext(genericVirtual.Resolved,
                         genericVirtual.Resolved.DeclaringType?.DeclaringAssembly ?? method.DeclaringType!.DeclaringAssembly));
@@ -164,8 +171,12 @@ public static class InterfaceDispatchRecovery
         if (ChaseLocalCopies(definitions, invokeData) is not { OpCode: OpCode.Call, Operands: [Immediate, _, _, LocalVariable interfaceArg, LocalVariable slotArg, ..] } slowCall)
             return null;
 
-        if (ChaseCopies(definitions, interfaceArg) is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext declaringInterface] }
-            || declaringInterface is RuntimeMethodInfoAnalysisContext
+        if (ChaseCopies(definitions, interfaceArg) is not { OpCode: OpCode.Move, Operands: [_, TypeAnalysisContext loadedInterface] })
+            return null;
+
+        // read out of the rgctx, it's the class pointer of the interface
+        var declaringInterface = loadedInterface is RuntimeClassTypeAnalysisContext { RepresentedType: var represented } ? represented : loadedInterface;
+        if (declaringInterface is RuntimeMethodInfoAnalysisContext
             || !(declaringInterface is GenericInstanceTypeAnalysisContext { GenericType.IsInterface: true } || declaringInterface.IsInterface))
             return null;
 
@@ -310,6 +321,9 @@ public static class InterfaceDispatchRecovery
     private static Instruction? Definition(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
         => definitions.TryGetValue(local, out var definition) ? definition : null;
 
+    // set per run, so chasing can see through runtime helpers
+    [System.ThreadStatic] private static System.Func<ulong, NativeHelperKind>? helperClassifier;
+
     private static Instruction? ChaseCopies(Dictionary<LocalVariable, Instruction> definitions, LocalVariable local)
         => ChaseCopies(definitions, local, []);
 
@@ -324,6 +338,14 @@ public static class InterfaceDispatchRecovery
             if (definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable source] })
             {
                 local = source;
+                continue;
+            }
+
+            // class/rgctx initialisation hands back the class it was given
+            if (definition is { OpCode: OpCode.Call, Operands: [Immediate helper, _, LocalVariable initialised, ..] } && helperClassifier != null
+                && helperClassifier(helper.UnsignedValue) == NativeHelperKind.ReturnsFirstArgument)
+            {
+                local = initialised;
                 continue;
             }
 

@@ -160,6 +160,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
     // The calling convention gives stack arguments relative to rsp on entry to the callee, which is one return address
     // further on than at the call site
+    public const int InvokerStackArguments = 6;
+
     private static IEnumerable<ISIL.IOperand> AtCallSite(IEnumerable<ISIL.IOperand> arguments)
         => arguments.Select(a => a is ISIL.StackOffset slot ? new ISIL.StackOffset(slot.Offset - 8) : a);
 
@@ -813,6 +815,27 @@ public class X86InstructionSet : Cpp2IlInstructionSet
 
                     var call = Add(instruction.IP, ISIL.OpCode.Call, Imm(target), new ISIL.Register(null, "rax") /* return value */);
                     call.AddOperands(CallingConventions.ResolveForUnmanaged(context.AppContext, target));
+
+                    // invokers pass the method's further arguments on, some of them on the stack: keep those slots too
+                    // ([target, rax, 4 int registers, 4 float registers, then rsp+20h, +28h, ...])
+                    // (only the slots the caller just stored to, so nothing else on the stack looks used)
+                    if (context != null && Utils.NativeHelpers.Classify(context.AppContext, target) is Utils.NativeHelperKind.VirtualInvoker or Utils.NativeHelperKind.InterfaceInvoker)
+                    {
+                        var stored = new HashSet<int>();
+                        for (var back = instructions.Count - 2; back >= 0; back--)
+                        {
+                            var previous = instructions[back];
+                            if (previous.OpCode is ISIL.OpCode.Call or ISIL.OpCode.CallVoid or ISIL.OpCode.IndirectCall or ISIL.OpCode.Jump or ISIL.OpCode.ConditionalJump or ISIL.OpCode.Return)
+                                break;
+                            if (previous is { OpCode: ISIL.OpCode.Move, Operands: [ISIL.StackOffset { Offset: >= 0x20 and < 0x20 + InvokerStackArguments * 8 } argument, _] } && (argument.Offset - 0x20) % 8 == 0)
+                                stored.Add((argument.Offset - 0x20) / 8);
+                        }
+
+                        var count = 0;
+                        while (stored.Contains(count))
+                            count++;
+                        call.AddOperands(Enumerable.Range(0, count).Select(i => (ISIL.IOperand)new ISIL.StackOffset(0x20 + i * 8)));
+                    }
 
                     // as for indirect calls, the result may really be in xmm0
                     if (!callNoReturn && context != null)

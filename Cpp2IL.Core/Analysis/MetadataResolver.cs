@@ -63,11 +63,14 @@ public static class MetadataResolver
             if (declaringInterface == null || InterfaceDispatchRecovery.ResolveInterfaceSlot(declaringInterface, (int)slot.Value) is not { } resolved)
                 continue;
 
+            if (resolved.Parameters.Count > 0 && InvokerArgument(instruction, 3, resolved.Parameters.Count - 1, false) == null)
+                continue;
+
             var operands = new List<IOperand> { resolved, instruction.Operands[1], instruction.Operands[4] };
 
-            // The invoker takes (slot, interface, obj, p1, ...): the first parameter is the fourth argument slot
-            if (resolved.Parameters.Count > 0)
-                operands.Add(BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[0].ParameterType) ? instruction.Operands[9] : instruction.Operands[5]);
+            // The invoker takes (slot, interface, obj, p1, ...): the parameters start at its fourth argument
+            for (var i = 0; i < resolved.Parameters.Count; i++)
+                operands.Add(InvokerArgument(instruction, 3, i, BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[i].ParameterType))!);
 
             instruction.SetOperands(operands);
         }
@@ -870,6 +873,15 @@ public static class MetadataResolver
         };
     }
 
+    // Argument n (0-based) of the invoker's managed method's parameters, which start at invoker argument 'first', in an
+    // unmanaged call's raw operands [target, rax, rcx, rdx, r8, r9, xmm0-3, stack args...]
+    private static IOperand? InvokerArgument(Instruction call, int first, int parameter, bool floating)
+    {
+        var position = first + parameter;
+        var index = position < 4 ? (floating ? 6 + position : 2 + position) : 10 + (position - 4);
+        return index < call.Operands.Count ? call.Operands[index] : null;
+    }
+
     // An out-of-line virtual invoker, (slot, obj, args...) in the raw registers [target, rax, rcx, rdx, r8, r9, xmm0-3]
     private static bool ResolveVirtualInvoker(MethodAnalysisContext method, Instruction call, Dictionary<LocalVariable, MemoryOperand> loads)
     {
@@ -886,7 +898,7 @@ public static class MetadataResolver
             || call.Operands[3] is not LocalVariable { Type: { } receiverType } receiver
             || receiverType is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext || receiverType.IsValueType
             || ResolveVTableSlot(method.AppContext, receiverType, (int)slot.Value) is not { } resolved
-            || resolved.Parameters.Count > 2)
+            || InvokerArgument(call, 2, resolved.Parameters.Count - 1, false) == null && resolved.Parameters.Count > 0)
             return false;
 
         var operands = new List<IOperand> { resolved };
@@ -894,9 +906,9 @@ public static class MetadataResolver
             operands.Add(call.Operands[1]);
         operands.Add(receiver);
 
-        // the invoker's own args start at the third register
+        // the invoker's own args start at its third argument
         for (var i = 0; i < resolved.Parameters.Count; i++)
-            operands.Add(BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[i].ParameterType) ? call.Operands[8 + i] : call.Operands[4 + i]);
+            operands.Add(InvokerArgument(call, 2, i, BaseCallingConventionResolver.IsFloatingPoint(resolved.Parameters[i].ParameterType))!);
 
         call.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
         call.SetOperands(operands);

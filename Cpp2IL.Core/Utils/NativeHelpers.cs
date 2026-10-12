@@ -34,6 +34,10 @@ public enum NativeHelperKind
     /// </summary>
     InterfaceInvoker,
     VirtualInvoker,
+    /// <summary>Hands back its first argument, after some runtime side effect (class or rgctx initialisation).</summary>
+    ReturnsFirstArgument,
+    /// <summary>(obj, FieldInfo*) -> the address of that field of obj: shared generic code reading a field whose offset depends on T.</summary>
+    FieldAddress,
 }
 
 /// <summary>
@@ -106,6 +110,28 @@ public static class NativeHelpers
             && body.Take(8).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })
             && body.Any(i => i is { Mnemonic: Mnemonic.Jmp or Mnemonic.Call, Op0Kind: OpKind.Register }))
             return NativeHelperKind.InterfaceInvoker;
+
+        // thunk to: mov rax,[rdx+10h] (field->parent) / movsxd r8,[rdx+18h] (field->offset) / add r8,rcx ...
+        var fieldAddressBody = first is { Mnemonic: Mnemonic.Jmp, Op0Kind: OpKind.NearBranch64 } thunk
+            ? X86Utils.GetMethodBodyAtVirtAddressNew(thunk.NearBranchTarget, true, app, 32)
+            : body;
+        if (fieldAddressBody.Count >= 3
+            && fieldAddressBody[0] is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RAX, MemoryBase: Register.RDX, MemoryDisplacement64: 0x10 }
+            && fieldAddressBody[1] is { Mnemonic: Mnemonic.Movsxd, Op0Register: Register.R8, MemoryBase: Register.RDX, MemoryDisplacement64: 0x18 }
+            && fieldAddressBody[2] is { Mnemonic: Mnemonic.Add, Op0Register: Register.R8, Op1Register: Register.RCX })
+            return NativeHelperKind.FieldAddress;
+
+        // push rbx / mov rbx,rcx / call init / mov rax,rbx / ret: runtime class or rgctx initialisation, which hands
+        // back the class it was given
+        var firstReturn = body.ToList().FindIndex(i => i.Mnemonic == Mnemonic.Ret);
+        if (firstReturn is > 2 and < 12
+            && !body.Take(firstReturn).Any(i => i.Op0Kind == OpKind.Memory && i.MemoryBase is Register.RBX or Register.RCX)
+            && body.Take(4).Any(i => i is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RBX, Op1Register: Register.RCX })
+            && body.Take(firstReturn).Skip(1).Any(i => i.Mnemonic == Mnemonic.Call)
+            && body.Take(firstReturn).Reverse().SkipWhile(i => i is { Mnemonic: Mnemonic.Pop } or { Mnemonic: Mnemonic.Add, Op0Register: Register.RSP }).FirstOrDefault()
+                is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RAX, Op1Register: Register.RBX }
+            && !body.Take(firstReturn).Any(i => i.Op0Register == Register.RBX && i.Mnemonic is not (Mnemonic.Push or Mnemonic.Pop) && !(i is { Mnemonic: Mnemonic.Mov, Op1Register: Register.RCX })))
+            return NativeHelperKind.ReturnsFirstArgument;
 
         // Virtual invokers (slot, obj, args...): index obj->klass->vtable by the slot in cx, then call through it
         if (body.Take(12).Any(i => i is { Mnemonic: Mnemonic.Movzx, Op1Kind: OpKind.Register, Op1Register: Register.CX })

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
 using Cpp2IL.Core.ISIL;
@@ -151,6 +152,81 @@ public static class NativeHelperRecovery
                 continue;
 
             return instruction is { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: StackOffset slot }] } ? slot.Offset : null;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Class/rgctx initialisation calls the init guards didn't account for hand back the class they're given: say so.
+    /// </summary>
+    public static void LowerIdentityHelpers(MethodAnalysisContext method)
+    {
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction.Destination is LocalVariable defined)
+                definitions[defined] = instruction;
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is { OpCode: OpCode.Call, Operands: [Immediate fieldHelper, LocalVariable address, LocalVariable owner, LocalVariable fieldInfo, ..] }
+                && NativeHelpers.Classify(method.AppContext, fieldHelper.UnsignedValue) == NativeHelperKind.FieldAddress
+                && FieldFromInfo(owner, fieldInfo, definitions) is { } field)
+            {
+                instruction.OpCode = OpCode.Move;
+                instruction.SetOperands(address, new AddressOf(new FieldReference(field, owner, 0)));
+                address.Type = new ByRefTypeAnalysisContext(field.FieldType);
+                continue;
+            }
+
+            if (instruction is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands: [Immediate target, ..] }
+                || NativeHelpers.Classify(method.AppContext, target.UnsignedValue) != NativeHelperKind.ReturnsFirstArgument)
+                continue;
+
+            if (instruction.OpCode == OpCode.Call && instruction.Operands.Count > 2)
+                instruction.SetOperands(instruction.Operands[1], instruction.Operands[2]);
+            else
+            {
+                instruction.SetOperands();
+                instruction.OpCode = OpCode.Nop;
+                continue;
+            }
+
+            instruction.OpCode = OpCode.Move;
+        }
+    }
+
+    // FieldInfo* as klass->fields + n * sizeof(FieldInfo): the nth field of the object's type
+    private static FieldAnalysisContext? FieldFromInfo(LocalVariable owner, LocalVariable fieldInfo, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        const int fieldInfoSize = 0x20;
+        const long fieldsOffset = 0x80;
+        var index = 0L;
+        var current = fieldInfo;
+
+        for (var depth = 0; depth < 6; depth++)
+        {
+            if (!definitions.TryGetValue(current, out var definition))
+                return null;
+
+            switch (definition)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }:
+                    current = copied;
+                    continue;
+                case { OpCode: OpCode.Add, Operands: [_, LocalVariable added, Immediate { Value: var by }] } when by % fieldInfoSize == 0:
+                    index += by / fieldInfoSize;
+                    current = added;
+                    continue;
+                case { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Addend: fieldsOffset }] }:
+                    var ownerType = owner.Type is GenericInstanceTypeAnalysisContext generic ? generic.GenericType : owner.Type;
+                    if (ownerType == null || index >= ownerType.Fields.Count)
+                        return null;
+                    var field = ownerType.Fields[(int)index];
+                    return owner.Type is GenericInstanceTypeAnalysisContext instance ? new ConcreteGenericFieldAnalysisContext(field, instance) : field;
+                default:
+                    return null;
+            }
         }
 
         return null;
