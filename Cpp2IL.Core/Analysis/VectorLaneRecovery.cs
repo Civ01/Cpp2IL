@@ -22,6 +22,9 @@ public static class VectorLaneRecovery
 {
     private const int Zero = 8;
 
+    /// <summary>Suffix of the register carrying the high half of a GPR filled from two packed floats.</summary>
+    public const string HighSuffix = "_hi";
+
     // The scalar some lane holds, made available as a temporary register the first time it's needed
     private sealed class Lane
     {
@@ -31,6 +34,7 @@ public static class VectorLaneRecovery
         public required IOperand Value;
         public WideLoad? Load;
         public Register? Materialized;
+        public bool HighHalf; // the high 4 bytes of the general register in Value
     }
 
     // A wide load into an xmm register, which might yet turn out to be packed floats
@@ -193,6 +197,21 @@ public static class VectorLaneRecovery
                                                                                      && StoreSize(destination) is 8 or 16 && state.TryGetValue(sourceName, out var stored):
                 StoreLanes(context, block, instruction, destination, stored);
                 return;
+
+            // movq rax,xmm1 with two floats packed in it (a Vector2 being returned or passed in a register): the high one
+            // goes along in rax_hi, for whoever turns out to need the pair (SmallStructRecovery)
+            case { OpCode: OpCode.Move, Operands: [Register { Name: var gprName }, var source] } when !gprName.StartsWith("xmm", StringComparison.Ordinal)
+                                                                                                    && !gprName.EndsWith(HighSuffix, StringComparison.Ordinal)
+                                                                                                    && IsVector(source, out var packedName)
+                                                                                                    && state.TryGetValue(packedName, out var packed)
+                                                                                                    && packed[1] is { } high && high != UnknownLow
+                                                                                                    && high.Load is not { Split: false }:
+            {
+                var highValue = Materialize(context, high);
+                block.Instructions.Insert(block.Instructions.IndexOf(instruction) + 1,
+                    new Instruction(instruction.Index, OpCode.Move, new Register(null, gprName + HighSuffix), highValue) { KeepAlive = true });
+                return;
+            }
         }
 
         if (instruction.IsCall || instruction.OpCode == OpCode.IndirectCall)
@@ -212,8 +231,12 @@ public static class VectorLaneRecovery
             if (zeroesUpper)
                 for (var lane = 1; lane < 4; lane++)
                     lanes[lane] = new Lane { Block = block, Anchor = instruction, Value = new FloatLiteral(0) };
-            if (instruction is { OpCode: OpCode.Move, Operands: [_, Register { Name: var gpr }] } && !gpr.StartsWith("xmm", StringComparison.Ordinal))
-                lanes[1] = null; // movq: the high half of the GPR
+            if (instruction is { OpCode: OpCode.Move, Operands: [_, Register { Name: var gpr } gprRegister] } && !gpr.StartsWith("xmm", StringComparison.Ordinal))
+            {
+                // movq: the high half of the GPR (what it is - the y of a Vector2, say - is worked out once types are known)
+                lanes[1] = new Lane { Block = block, Anchor = instruction, After = true, Value = gprRegister, HighHalf = true };
+                instruction.ReadsLowHalf = true;
+            }
             state[writtenName] = lanes;
         }
     }
@@ -340,7 +363,7 @@ public static class VectorLaneRecovery
 
         var temporary = new Register(null, $"LANE_{context.Temporaries++}");
         var index = lane.Block.Instructions.IndexOf(lane.Anchor);
-        lane.Block.Instructions.Insert(lane.After ? index + 1 : index, new Instruction(lane.Anchor.Index, OpCode.Move, temporary, lane.Value));
+        lane.Block.Instructions.Insert(lane.After ? index + 1 : index, new Instruction(lane.Anchor.Index, OpCode.Move, temporary, lane.Value) { ReadsHighHalf = lane.HighHalf });
         lane.Materialized = temporary;
         return temporary;
     }
