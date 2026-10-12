@@ -123,7 +123,148 @@ public static class ArrayPointerLoopRecovery
             }
         }
 
+        changed |= RecoverOffsetLoops(method, definitions);
         return changed;
+    }
+
+    /// <summary>
+    /// The other strength reduction: a byte offset that starts at the first element (0x20) and steps by the element size,
+    /// added to the array at each access (<c>mov rax,[rdi+rcx]</c> with rdi = 20h, 28h, ...). Works for every array the
+    /// loop indexes in step. The accesses become array[i] with a fresh index counting 0, 1, ...
+    /// </summary>
+    private static bool RecoverOffsetLoops(MethodAnalysisContext method, Dictionary<LocalVariable, Instruction> definitions)
+    {
+        var graph = method.ControlFlowGraph!;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var elementsOffset = 4L * pointerSize;
+        var changed = false;
+
+        foreach (var block in graph.Blocks.ToList())
+        {
+            foreach (var phi in block.Instructions.Where(i => i.OpCode == OpCode.Phi && i.Operands[0] is LocalVariable).ToList())
+            {
+                var offset = (LocalVariable)phi.Operands[0];
+                long? step = null, start = null;
+                var steps = new List<(Instruction Step, int Input)>();
+                var starts = new List<int>();
+                var startDefinitions = new Dictionary<int, Instruction>();
+                var valid = true;
+
+                for (var input = 1; input < phi.Operands.Count && valid; input++)
+                {
+                    var incoming = phi.Operands[input];
+                    var definition = incoming is LocalVariable local ? definitions.GetValueOrDefault(local) : null;
+                    for (var hops = 0; hops < 4 && definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }; hops++)
+                        definition = definitions.GetValueOrDefault(copied);
+                    switch (definition)
+                    {
+                        case { OpCode: OpCode.Move, Operands: [_, Immediate { Value: var value }] } when value >= elementsOffset && (start == null || start == value):
+                            start = value;
+                            starts.Add(input);
+                            startDefinitions[input] = definition;
+                            break;
+                        case { OpCode: OpCode.Add, Operands: [_, LocalVariable stepped, Immediate { Value: > 0 and < 0x1000 and var by }] }
+                            when ReferenceEquals(stepped, offset) && (step == null || step == by):
+                            step = by;
+                            steps.Add((definition, input));
+                            break;
+                        default:
+                            valid = false;
+                            break;
+                    }
+                }
+
+                if (!valid || start == null || step == null || starts.Count == 0 || steps.Count == 0 || (start - elementsOffset) % step != 0
+                    || steps.Select(s => s.Step).Distinct().Count() > 1)
+                    continue;
+
+                // every access through it must be [array + offset] over an array whose elements are that size
+                var accesses = new List<(Instruction Instruction, int Operand, LocalVariable Array)>();
+                var otherUse = false;
+                foreach (var instruction in graph.Instructions)
+                {
+                    if (instruction == phi || steps.Any(s => s.Step == instruction))
+                        continue;
+
+                    for (var i = 0; i < instruction.Operands.Count; i++)
+                    {
+                        if (instruction.Operands[i] is not MemoryOperand { Scale: 0 or 1, Addend: 0 } memory)
+                            continue;
+
+                        LocalVariable? array = null;
+                        if (ReferenceEquals(memory.Base, offset) && memory.Index is LocalVariable { Type: SzArrayTypeAnalysisContext } indexArray)
+                            array = indexArray;
+                        else if (ReferenceEquals(memory.Index, offset) && memory.Base is LocalVariable { Type: SzArrayTypeAnalysisContext } baseArray)
+                            array = baseArray;
+
+                        if (array?.Type is not SzArrayTypeAnalysisContext { ElementType: var elementType }
+                            || (elementType.IsValueType ? TypeSizes.StorageSize(elementType, pointerSize) : pointerSize) != step
+                            || memory.Size != 0 && memory.Size != step)
+                        {
+                            if (Mentions(memory, offset))
+                                otherUse = true; // used some other way: leave it all alone
+                            continue;
+                        }
+
+                        accesses.Add((instruction, i, array));
+                    }
+                }
+
+                if (accesses.Count == 0 || otherUse)
+                    continue;
+
+                // the index: phi(start / step, index + 1) alongside the offset
+                var index = NewLocal(method, "index", method.AppContext.SystemTypes.SystemInt32Type);
+                var indexOperands = new List<IOperand> { index };
+                var nextIndex = NewLocal(method, "nextIndex", method.AppContext.SystemTypes.SystemInt32Type);
+                for (var input = 1; input < phi.Operands.Count; input++)
+                {
+                    if (starts.Contains(input))
+                    {
+                        var startLocal = NewLocal(method, "startIndex", method.AppContext.SystemTypes.SystemInt32Type);
+                        var startDefinition = startDefinitions[input];
+                        var startBlock = graph.Blocks.First(b => b.Instructions.Contains(startDefinition));
+                        startBlock.Instructions.Insert(startBlock.Instructions.IndexOf(startDefinition) + 1,
+                            new Instruction(startDefinition.Index, OpCode.Move, startLocal, new Immediate((start.Value - elementsOffset) / step.Value)));
+                        indexOperands.Add(startLocal);
+                    }
+                    else
+                        indexOperands.Add(nextIndex);
+                }
+
+                block.Instructions.Insert(block.Instructions.IndexOf(phi) + 1, new Instruction(phi.Index, OpCode.Phi, indexOperands));
+
+                var stepInstruction = steps[0].Step;
+                var stepBlock = graph.Blocks.First(b => b.Instructions.Contains(stepInstruction));
+                stepBlock.Instructions.Insert(stepBlock.Instructions.IndexOf(stepInstruction) + 1,
+                    new Instruction(stepInstruction.Index, OpCode.Add, nextIndex, index, new Immediate(1)));
+
+                foreach (var (instruction, operand, array) in accesses)
+                    instruction.SetOperand(operand, new ArrayAccess(array, index));
+
+                // the offset is dead if all that's left is its own stepping
+                var steppedOffset = (LocalVariable)stepInstruction.Operands[0];
+                if (!graph.Instructions.Any(other => other != phi && other != stepInstruction
+                                                     && other.Operands.Any(o => Mentions(o, offset) || Mentions(o, steppedOffset))))
+                {
+                    stepInstruction.OpCode = OpCode.Nop;
+                    stepInstruction.SetOperands();
+                    phi.OpCode = OpCode.Nop;
+                    phi.SetOperands();
+                }
+
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private static LocalVariable NewLocal(MethodAnalysisContext method, string name, TypeAnalysisContext type)
+    {
+        var local = new LocalVariable($"{name}{method.Locals.Count}", new Register(null, $"{name.ToUpperInvariant()}_{method.Locals.Count}", 0), type);
+        method.Locals.Add(local);
+        return local;
     }
 
     private static bool Rewrite(MethodAnalysisContext method, Graphs.Block header, Instruction pointerPhi, LocalVariable pointer, LocalVariable array,

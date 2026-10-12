@@ -44,36 +44,61 @@ public static class GenericInstanceFieldLayout
     /// sequentially with its type arguments substituted, since the metadata has no offsets for generic types.
     /// </summary>
     public static List<FieldAnalysisContext>? FindFieldChain(GenericInstanceTypeAnalysisContext owner, long targetOffset, int size, int pointerSize, int depth = 0)
+        => FindFieldChain(owner.GenericType, owner.GenericArguments, owner, targetOffset, size, pointerSize, depth);
+
+    /// <summary>
+    /// The same for an open generic type, as seen by its own (shared) code: its type parameters are references.
+    /// </summary>
+    public static List<FieldAnalysisContext>? FindFieldChainOpen(TypeAnalysisContext definition, long targetOffset, int size, int pointerSize)
+        => FindFieldChain(definition, null, null, targetOffset, size, pointerSize, 0);
+
+    private static List<FieldAnalysisContext>? FindFieldChain(TypeAnalysisContext definition, List<TypeAnalysisContext>? arguments, GenericInstanceTypeAnalysisContext? concreteOwner,
+        long targetOffset, int size, int pointerSize, int depth)
     {
         if (depth > 6)
             return null;
 
-        var definition = owner.GenericType;
-        for (var baseType = definition.BaseType; baseType != null; baseType = baseType.BaseType)
-            if (baseType.Fields.Any(f => !f.IsStatic))
+        long offset;
+        if (definition.IsValueType)
+            offset = 0;
+        else if (definition.BaseType is not { } baseType || !HasInstanceFields(baseType))
+            offset = 2L * pointerSize;
+        else
+        {
+            // fields of the base class come first; a non-generic base has real offsets in the metadata
+            if (baseType is GenericInstanceTypeAnalysisContext || baseType.GenericParameters.Count > 0
+                || baseType.Definition?.RawSizes is not { instance_size: var baseSize and > 0 })
                 return null;
 
-        var offset = definition.IsValueType ? 0L : 2L * pointerSize;
+            if (targetOffset < baseSize)
+                return MetadataResolver.FindFieldChain(baseType, false, targetOffset, size, pointerSize);
+
+            offset = baseSize;
+        }
 
         foreach (var field in definition.Fields)
         {
             if (field.IsStatic || (field.Attributes & System.Reflection.FieldAttributes.Literal) != 0)
                 continue;
 
-            if (TypeSizes.SizeAndAlignment(field.FieldType, pointerSize, owner.GenericArguments, 0) is not var (fieldSize, alignment))
+            // shared code sees its type parameters as references
+            var sizing = arguments == null && field.FieldType is GenericParameterTypeAnalysisContext
+                ? ((long)pointerSize, (long)pointerSize)
+                : TypeSizes.SizeAndAlignment(field.FieldType, pointerSize, arguments, 0);
+            if (sizing is not var (fieldSize, alignment))
                 return null;
 
             offset = (offset + alignment - 1) & ~(alignment - 1);
 
             if (targetOffset >= offset && targetOffset < offset + fieldSize)
             {
-                var concrete = new ConcreteGenericFieldAnalysisContext(field, owner);
-                var fieldType = concrete.FieldType;
+                FieldAnalysisContext resolved = concreteOwner != null ? new ConcreteGenericFieldAnalysisContext(field, concreteOwner) : field;
+                var fieldType = resolved.FieldType;
                 var inner = targetOffset - offset;
 
                 // the whole field
                 if (inner == 0 && (size == 0 || size == fieldSize || !Analysis.StackStructRecovery.IsStruct(fieldType)))
-                    return [concrete];
+                    return [resolved];
 
                 // inside a struct field
                 if (!Analysis.StackStructRecovery.IsStruct(fieldType))
@@ -83,13 +108,21 @@ public static class GenericInstanceFieldLayout
                     ? FindFieldChain(genericField, inner, size, pointerSize, depth + 1)
                     : MetadataResolver.FindFieldChain(fieldType, false, inner, size, pointerSize);
 
-                return nested == null ? null : [concrete, ..nested];
+                return nested == null ? null : [resolved, ..nested];
             }
 
             offset += fieldSize;
         }
 
         return null;
+    }
+
+    private static bool HasInstanceFields(TypeAnalysisContext type)
+    {
+        for (var current = type; current != null; current = current.BaseType)
+            if (current.Fields.Any(f => !f.IsStatic))
+                return true;
+        return false;
     }
 
     private static (long Size, long Alignment)? GetSizeAndAlignment(TypeAnalysisContext fieldType, int pointerSize)

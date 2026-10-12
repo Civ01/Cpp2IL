@@ -205,6 +205,10 @@ public static class MetadataResolver
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } ? referent : local.Type);
+
+                // a T constrained to a class has (at least) that class's fields
+                if (owner is GenericParameterTypeAnalysisContext constrained && constrained.ConstraintTypes.FirstOrDefault(c => !c.IsInterface && !c.IsValueType) is { } constraint)
+                    owner = constraint;
                 var genericOwner = owner as GenericInstanceTypeAnalysisContext;
 
                 FieldAnalysisContext? field;
@@ -227,7 +231,12 @@ public static class MetadataResolver
                 }
                 else if (staticOwner == null && owner.GenericParameters.Count > 0)
                 {
-                    field = GenericInstanceFieldLayout.FindFieldAtOffset(owner, memory.Addend);
+                    // the generic type's own shared code
+                    if (GenericInstanceFieldLayout.FindFieldChainOpen(owner, memory.Addend, memory.Size, pointerSize) is not { } openChain)
+                        continue;
+
+                    field = openChain[^1];
+                    path = openChain.GetRange(0, openChain.Count - 1);
                 }
                 else
                 {

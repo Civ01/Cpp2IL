@@ -745,6 +745,12 @@ public static class LocalVariables
         if (destination is FieldReference storeField && source is LocalVariable storeSource)
             return SetTypeIfUnknown(storeSource, storeField.Field.FieldType);
 
+        // array elements
+        if (destination is LocalVariable elementLoad && source is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } loadedElement } })
+            return SetFromDefinition(elementLoad, loadedElement);
+        if (destination is ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: { } storedElement } } && source is LocalVariable elementStore)
+            return SetTypeIfUnknown(elementStore, storedElement);
+
         // the whole of a struct (an 8 byte ValueTuple<int, int> read in one go) is that struct
         if (destination is LocalVariable { Type: null } wholeDest
             && source is MemoryOperand { Index: null, Scale: 0, Addend: 0, Size: > 0 and var wholeSize, Base: LocalVariable { Type: { } wholeBaseType } }
