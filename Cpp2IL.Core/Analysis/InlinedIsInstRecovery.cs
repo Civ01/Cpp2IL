@@ -48,7 +48,9 @@ public static class InlinedIsInstRecovery
                 if (left is MemoryOperand { Base: Register hierarchy, Index: Register, Scale: 8, Addend: -8 }
                     && right is Register targetClass
                     && Trace(graph, block, i, hierarchy.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register klassRegister, Index: null, Addend: TypeHierarchyOffset }] } hierarchyLoad
-                    && Trace(graph, block, i, klassRegister.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register objectRegister, Index: null, Addend: 0 }] } klassLoad
+                    && graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(hierarchyLoad)) is { } hierarchyBlock
+                    // the class as it was when the hierarchy was read from it (its register may be reused since)
+                    && Trace(graph, hierarchyBlock, hierarchyBlock.Instructions.IndexOf(hierarchyLoad), klassRegister.Name) is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register objectRegister, Index: null, Addend: 0 }] } klassLoad
                     && graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(klassLoad)) is { } klassBlock)
                 {
                     var instance = new Register(null, $"ISINST_{temporaryCounter}");
