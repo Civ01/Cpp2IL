@@ -377,7 +377,13 @@ public static class IlGenerator
                 break;
 
             case OpCode.Box:
-                if (instruction.Operands is [_, TypeAnalysisContext boxedType, var boxedValue])
+                if (instruction.Operands is [_, var boxedClass, var boxedValue] && boxedClass switch
+                    {
+                        RuntimeClassTypeAnalysisContext { RepresentedType: var represented } => represented,
+                        LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } } => represented,
+                        TypeAnalysisContext type and not (RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext) => type,
+                        _ => null,
+                    } is { } boxedType)
                 {
                     // il2cpp_value_box takes the value by address, but IL boxes it by value
                     LoadOperand(boxedValue is AddressOf { Target: LocalVariable byRef } ? byRef : boxedValue, method, locals, writeLine, boxedType);
@@ -455,11 +461,29 @@ public static class IlGenerator
                 var importedMethod = targetMethod.ToMethodDescriptor();
 
                 var thisParamIndex = instruction.OpCode == OpCode.Call ? 2 : 1;
+                TypeAnalysisContext? constrainedTo = null;
 
                 if (!targetMethod.IsStatic) // Load 'this' param
                 {
                     if ((instruction.Operands.Count - 1) >= thisParamIndex)
                     {
+                        // a struct's address handed to a method of object/Enum/an interface (ToString on an enum, MoveNext through
+                        // IEnumerator): that's a constrained virtual call on the struct
+                        if (targetMethod.DeclaringType is { IsValueType: false } && instruction.Operands[thisParamIndex] switch
+                            {
+                                AddressOf { Target: LocalVariable { Type: { IsValueType: true } addressedType } } when addressedType is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext) => addressedType,
+                                AddressOf { Target: FieldReference { Field.FieldType: { IsValueType: true } fieldType } } => fieldType,
+                                _ => null,
+                            } is { } valueReceiverType)
+                        {
+                            if (instruction.Operands[thisParamIndex] is AddressOf { Target: FieldReference constrainedField })
+                                LoadFieldAddress(constrainedField, method, locals);
+                            else
+                                LoadLocalAddress((LocalVariable)((AddressOf)instruction.Operands[thisParamIndex]).Target, method, locals);
+                            constrainedTo = valueReceiverType;
+                            goto receiverLoaded;
+                        }
+
                         // A value type's instance method takes 'this' as a managed pointer
                         if (targetMethod.DeclaringType is { IsValueType: true } && instruction.Operands[thisParamIndex] is AddressOf { Target: FieldReference receiverField })
                         {
@@ -505,7 +529,13 @@ public static class IlGenerator
                         PushDefaultOf(parameterType, instructions);
                 }
 
-                instructions.Add(CilOpCodes.Call, importedMethod);
+                if (constrainedTo != null)
+                {
+                    instructions.Add(CilOpCodes.Constrained, constrainedTo.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(CilOpCodes.Callvirt, importedMethod);
+                }
+                else
+                    instructions.Add(CilOpCodes.Call, importedMethod);
 
                 // the lifter's guess at whether the callee returns anything can disagree with the
                 // signature we later resolved, so go by the signature and balance the stack

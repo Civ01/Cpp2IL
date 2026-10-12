@@ -552,6 +552,7 @@ public static class MetadataResolver
     public static bool GuessAmbiguousCalls(MethodAnalysisContext method)
     {
         var changed = false;
+        Dictionary<LocalVariable, Instruction>? definitions = null;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -563,7 +564,8 @@ public static class MetadataResolver
 
             IEnumerable<MethodAnalysisContext> pool = candidates;
 
-            if (GetReceiver(instruction) is { Type: { } receiverType })
+            definitions ??= method.ControlFlowGraph.Instructions.Where(i => i.Destination is LocalVariable).GroupBy(i => (LocalVariable)i.Destination!).ToDictionary(g => g.Key, g => g.First());
+            if (ReceiverType(instruction, definitions, method.AppContext.Binary.PointerSizeBytes) is { } receiverType)
             {
                 var fitting = candidates.Where(c => !c.IsStatic && IsInHierarchy(receiverType, c.DeclaringType)).ToList();
                 if (fitting.Count > 0)
@@ -631,6 +633,32 @@ public static class MetadataResolver
     // The receiver ('this') of a call is the first integer-slot argument: operand 1 for CallVoid
     // (after the target), operand 2 for Call (after the target and the return value).
     // A value type receiver is passed byref, so it arrives as an AddressOf over the local.
+    // What the receiver is, also when it's the address of a struct field still being computed (lea rcx,[r8+0Ch])
+    private static TypeAnalysisContext? ReceiverType(Instruction call, Dictionary<LocalVariable, Instruction> definitions, int pointerSize)
+    {
+        var index = call.OpCode == OpCode.CallVoid ? 1 : 2;
+        if (index >= call.Operands.Count)
+            return null;
+
+        switch (call.Operands[index])
+        {
+            case AddressOf { Target: FieldReference field }:
+                return field.Field.FieldType;
+            case AddressOf { Target: LocalVariable { Type: { } addressedType } }:
+                return addressedType;
+            case LocalVariable { Type: { } type }:
+                return type is ByRefTypeAnalysisContext { ElementType: { } element } ? element : type;
+            case LocalVariable receiver when definitions.TryGetValue(receiver, out var definition)
+                                             && definition is { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: { } baseType }, Immediate { Value: > 0 and var offset }] }:
+                var owner = baseType is ByRefTypeAnalysisContext { ElementType: { } pointee } ? pointee : baseType;
+                return owner is GenericInstanceTypeAnalysisContext genericOwner
+                    ? GenericInstanceFieldLayout.FindFieldChain(genericOwner, offset, 0, pointerSize)?[^1].FieldType
+                    : FindFieldChain(owner, false, offset, 0, pointerSize)?[^1].FieldType;
+            default:
+                return null;
+        }
+    }
+
     private static LocalVariable? GetReceiver(Instruction call)
     {
         var index = call.OpCode == OpCode.CallVoid ? 1 : 2;

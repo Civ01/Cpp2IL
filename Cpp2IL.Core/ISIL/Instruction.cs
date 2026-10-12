@@ -162,7 +162,7 @@ public class Instruction : IOperand
                 or OpCode.Newobj
                 => [_operands[1]],
 
-            OpCode.Box => [_operands[2]],
+            OpCode.Box => [_operands[2], _operands[1]],
             OpCode.IsInst or OpCode.Unbox => [_operands[2], _operands[1]],
             OpCode.VectorShuffle => [_operands[1], _operands[2]],
 

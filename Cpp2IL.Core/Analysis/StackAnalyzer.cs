@@ -50,6 +50,7 @@ public class StackAnalyzer
         InlinedIsInstRecovery.Run(method, graph);
         InlinedInterfaceLookupRemoval.Run(method, graph);
         InlineMemcpyRecovery.Run(method, graph);
+        FakeBoxRecovery.Run(method, graph);
         VectorLaneRecovery.Run(method, graph);
         StackStructRecovery.Run(method, graph);
         ReplaceStackWithRegisters(method);
