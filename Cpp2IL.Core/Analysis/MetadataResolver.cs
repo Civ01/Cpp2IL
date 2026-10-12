@@ -211,6 +211,10 @@ public static class MetadataResolver
                     && (memory.Size == 0 || memory.Size == TypeSizes.StorageSize(pointee, method.AppContext.Binary.PointerSizeBytes)))
                     continue;
 
+                // a primitive held by value is no pointer: a read through it isn't its m_value, the local is mistyped
+                if (IsPrimitiveOrEnum(local.Type))
+                    continue;
+
                 // check if static field access
                 var staticOwner = (local.Type as StaticFieldStorageTypeAnalysisContext)?.OwnerType;
                 var owner = staticOwner ?? (local.Type is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } ? referent : local.Type);

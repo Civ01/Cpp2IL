@@ -54,6 +54,7 @@ public static class ArrayPointerLoopRecovery
                 var initialInputs = new List<int>();
                 var steps = new List<Instruction>();
                 var valid = true;
+                long? startOffset = null;
 
                 for (var input = 1; input < pointerPhi.Operands.Count && valid; input++)
                 {
@@ -65,11 +66,12 @@ public static class ArrayPointerLoopRecovery
 
                     switch (definition)
                     {
-                        // &array[0]
+                        // &array[k]
                         case { OpCode: OpCode.Add, Operands: [_, LocalVariable { Type: SzArrayTypeAnalysisContext type } source, Immediate { Value: var offset }] }
-                            when offset == elementsOffset && (array == null || ReferenceEquals(array, source)):
+                            when offset >= elementsOffset && (array == null || ReferenceEquals(array, source)) && (startOffset == null || startOffset == offset):
                             array = source;
                             arrayType = type;
+                            startOffset = offset;
                             initialInputs.Add(input);
                             break;
                         // pointer += element size
@@ -90,10 +92,13 @@ public static class ArrayPointerLoopRecovery
 
                 var elementType = arrayType.ElementType;
                 var expectedSize = elementType.IsValueType ? TypeSizes.StorageSize(elementType, pointerSize) : pointerSize;
-                if (expectedSize != elementSize)
+                if (expectedSize != elementSize || startOffset == null || (startOffset.Value - elementsOffset) % elementSize != 0)
                     continue;
 
-                // the matching index: 0 where the pointer starts, +1 where it steps
+                // the element the pointer starts at
+                var startIndex = (startOffset.Value - elementsOffset) / elementSize;
+
+                // the matching index: the start element where the pointer starts, +1 where it steps
                 var index = phis.Where(p => p != pointerPhi).Select(p => (LocalVariable?)p.Operands[0]).FirstOrDefault(candidate =>
                 {
                     var indexPhi = phis.First(p => ReferenceEquals(p.Operands[0], candidate));
@@ -105,7 +110,8 @@ public static class ArrayPointerLoopRecovery
                         var operand = indexPhi.Operands[input];
                         if (initialInputs.Contains(input))
                         {
-                            if (!(operand is Immediate { Value: 0 } || operand is LocalVariable zero && ChaseCopies(definitions, zero) is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] }))
+                            if (!(operand is Immediate { Value: var immediate } && immediate == startIndex
+                                  || operand is LocalVariable first && ChaseCopies(definitions, first) is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: var copied }] } && copied == startIndex))
                                 return false;
                         }
                         else if (operand is not LocalVariable next || !definitions.TryGetValue(next, out var nextDefinition)
@@ -136,7 +142,7 @@ public static class ArrayPointerLoopRecovery
                             var zero = NewLocal(method, "startIndex", int32);
                             var startDefinition = definitions[(LocalVariable)pointerPhi.Operands[input]];
                             var startBlock = graph.Blocks.First(b => b.Instructions.Contains(startDefinition));
-                            startBlock.Instructions.Insert(startBlock.Instructions.IndexOf(startDefinition) + 1, new Instruction(startDefinition.Index, OpCode.Move, zero, new Immediate(0)));
+                            startBlock.Instructions.Insert(startBlock.Instructions.IndexOf(startDefinition) + 1, new Instruction(startDefinition.Index, OpCode.Move, zero, new Immediate(startIndex)));
                             operands.Add(zero);
                         }
                         else

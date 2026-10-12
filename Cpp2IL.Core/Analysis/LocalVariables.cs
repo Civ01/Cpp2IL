@@ -640,6 +640,17 @@ public static class LocalVariables
                     changed |= PropagatePhi(instruction);
                     changed |= RefinePhi(instruction, nulls);
                     break;
+                // a new T[], before it's rewritten into NewArr: typed by the array class it's given
+                case OpCode.Call when instruction.Operands is [StringLiteral { Value: var allocator }, LocalVariable allocated, var arrayClass, ..]
+                                      && ArrayRecovery.ArrayNewFunctions.Contains(allocator):
+                    changed |= SetTypeIfUnknown(allocated, arrayClass switch
+                    {
+                        LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: SzArrayTypeAnalysisContext arrayType } } => arrayType,
+                        RuntimeClassTypeAnalysisContext { RepresentedType: SzArrayTypeAnalysisContext arrayType } => arrayType,
+                        SzArrayTypeAnalysisContext arrayType => arrayType,
+                        _ => null,
+                    });
+                    break;
                 case OpCode.IsInst when instruction.Operands[0] is LocalVariable castResult:
                     changed |= SetTypeIfUnknown(castResult, instruction.Operands[1] switch
                     {
