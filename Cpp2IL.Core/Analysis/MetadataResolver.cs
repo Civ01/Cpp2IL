@@ -278,10 +278,26 @@ public static class MetadataResolver
     /// </summary>
     public static List<FieldAnalysisContext>? FindFieldChain(TypeAnalysisContext owner, bool isStatic, long offset, int size, int pointerSize)
     {
+        // a generic base class has no offsets in the metadata: its fields come first, laid out like any generic instance
+        TypeAnalysisContext? genericBase = null;
+        if (!isStatic)
+        {
+            for (var candidateOwner = owner.BaseType; candidateOwner != null; candidateOwner = candidateOwner.BaseType)
+            {
+                if (candidateOwner is GenericInstanceTypeAnalysisContext instance)
+                {
+                    genericBase = instance;
+                    if (GenericInstanceFieldLayout.InstanceEnd(instance, pointerSize) is { } baseEnd && offset < baseEnd)
+                        return GenericInstanceFieldLayout.FindFieldChain(instance, offset, size, pointerSize);
+                    break;
+                }
+            }
+        }
+
         // an inherited field exists on the base type but sits at the same offset in the
         // derived layout, so the whole chain is searched
         FieldAnalysisContext? field = null;
-        for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+        for (var candidateOwner = owner; candidateOwner != null && candidateOwner != genericBase && field == null; candidateOwner = candidateOwner.BaseType)
             field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
                 && (f.Attributes & FieldAttributes.Literal) == 0 // consts have no storage but their metadata offset is 0, which would match
                 && f.BackingData?.FieldOffset == offset);
@@ -291,7 +307,7 @@ public static class MetadataResolver
         // Not the start of a field - maybe it's inside a struct-typed one (e.g. transform.position.y)
         if (field == null)
         {
-            for (var candidateOwner = owner; candidateOwner != null && field == null; candidateOwner = candidateOwner.BaseType)
+            for (var candidateOwner = owner; candidateOwner != null && candidateOwner != genericBase && field == null; candidateOwner = candidateOwner.BaseType)
                 field = candidateOwner.Fields.FirstOrDefault(f => f.IsStatic == isStatic
                     && (f.Attributes & FieldAttributes.Literal) == 0
                     && f.BackingData?.FieldOffset is { } start && start < offset

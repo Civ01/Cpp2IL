@@ -63,11 +63,21 @@ public static class GenericInstanceFieldLayout
             offset = 0;
         else if (definition.BaseType is not { } baseType || !HasInstanceFields(baseType))
             offset = 2L * pointerSize;
+        else if (BaseAsSeenBy(baseType, arguments) is { } genericBase)
+        {
+            // a generic base is laid out the same way, with this type's arguments substituted into it
+            if (InstanceEnd(genericBase.GenericType, SizingArguments(genericBase, arguments == null), pointerSize, depth + 1) is not { } baseEnd)
+                return null;
+
+            if (targetOffset < baseEnd)
+                return FindFieldChain(genericBase.GenericType, SizingArguments(genericBase, arguments == null), genericBase, targetOffset, size, pointerSize, depth + 1);
+
+            offset = baseEnd;
+        }
         else
         {
             // fields of the base class come first; a non-generic base has real offsets in the metadata
-            if (baseType is GenericInstanceTypeAnalysisContext || baseType.GenericParameters.Count > 0
-                || baseType.Definition?.RawSizes is not { instance_size: var baseSize and > 0 })
+            if (baseType.GenericParameters.Count > 0 || baseType.Definition?.RawSizes is not { instance_size: var baseSize and > 0 })
                 return null;
 
             if (targetOffset < baseSize)
@@ -115,6 +125,81 @@ public static class GenericInstanceFieldLayout
         }
 
         return null;
+    }
+
+    // The base type of a generic definition is written in terms of the definition's own parameters
+    private static GenericInstanceTypeAnalysisContext? BaseAsSeenBy(TypeAnalysisContext baseType, List<TypeAnalysisContext>? arguments)
+    {
+        if (baseType is not GenericInstanceTypeAnalysisContext genericBase)
+            return null;
+
+        if (arguments == null || !genericBase.GenericArguments.Any(MentionsTypeParameter))
+            return genericBase;
+
+        try
+        {
+            return GenericInstantiation.Instantiate(genericBase, arguments, []) as GenericInstanceTypeAnalysisContext;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool MentionsTypeParameter(TypeAnalysisContext type) => type switch
+    {
+        GenericParameterTypeAnalysisContext => true,
+        GenericInstanceTypeAnalysisContext instance => instance.GenericArguments.Any(MentionsTypeParameter),
+        _ => false,
+    };
+
+    // shared code sees its type parameters as references, which object sizes as
+    private static List<TypeAnalysisContext> SizingArguments(GenericInstanceTypeAnalysisContext instance, bool shared) =>
+        shared
+            ? instance.GenericArguments.Select(a => a is GenericParameterTypeAnalysisContext ? a.AppContext.SystemTypes.SystemObjectType : a).ToList()
+            : instance.GenericArguments;
+
+    /// <summary>
+    /// Where the fields of a type deriving from this generic class instance start: the end of its own fields, padded to
+    /// the object's alignment (il2cpp lays a derived class out as a C++ struct deriving from the base's).
+    /// </summary>
+    public static long? InstanceEnd(GenericInstanceTypeAnalysisContext instance, int pointerSize)
+        => InstanceEnd(instance.GenericType, instance.GenericArguments, pointerSize, 0);
+
+    private static long? InstanceEnd(TypeAnalysisContext definition, List<TypeAnalysisContext> arguments, int pointerSize, int depth)
+    {
+        if (depth > 6 || definition.IsValueType)
+            return null;
+
+        long offset;
+        if (definition.BaseType is not { } baseType || !HasInstanceFields(baseType))
+            offset = 2L * pointerSize;
+        else if (BaseAsSeenBy(baseType, arguments) is { } genericBase)
+        {
+            if (InstanceEnd(genericBase.GenericType, genericBase.GenericArguments, pointerSize, depth + 1) is not { } baseEnd)
+                return null;
+            offset = baseEnd;
+        }
+        else if (baseType.GenericParameters.Count == 0 && baseType.Definition?.RawSizes is { instance_size: var baseSize and > 0 })
+            offset = baseSize;
+        else
+            return null;
+
+        long alignment = pointerSize;
+        foreach (var field in definition.Fields)
+        {
+            if (field.IsStatic || (field.Attributes & System.Reflection.FieldAttributes.Literal) != 0)
+                continue;
+
+            if (TypeSizes.SizeAndAlignment(field.FieldType, pointerSize, arguments, 0) is not var (fieldSize, fieldAlignment))
+                return null;
+
+            offset = (offset + fieldAlignment - 1) & ~(fieldAlignment - 1);
+            offset += fieldSize;
+            alignment = System.Math.Max(alignment, fieldAlignment);
+        }
+
+        return (offset + alignment - 1) & ~(alignment - 1);
     }
 
     private static bool HasInstanceFields(TypeAnalysisContext type)
