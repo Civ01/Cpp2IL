@@ -24,6 +24,7 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        RecoverElementCopies(method);
         RecoverAccesses(method);
         RecoverStructElementFields(method);
         RecoverStructElementAddresses(method);
@@ -124,6 +125,97 @@ public static class ArrayRecovery
         }
     }
 
+    // keys[0] = keyframe for a 28 byte Keyframe is copied in chunks (16 + 8 + 4 bytes) from the local into the element.
+    // Chunks from one struct local that together cover exactly one element become that one element store.
+    private static void RecoverElementCopies(MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var elementsOffset = ElementsOffset(pointerSize);
+
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        {
+            for (var start = 0; start < block.Instructions.Count; start++)
+            {
+                if (ElementChunk(block.Instructions[start], pointerSize, elementsOffset) is not var (array, element, source, elementSize, _, _))
+                    continue;
+
+                var covered = new SortedDictionary<long, long>();
+                var chunks = new List<Instruction>();
+                for (var at = start; at < block.Instructions.Count && at < start + 12; at++)
+                {
+                    var instruction = block.Instructions[at];
+                    if (ElementChunk(instruction, pointerSize, elementsOffset) is var (chunkArray, chunkElement, chunkSource, _, offset, size)
+                        && ReferenceEquals(chunkArray, array) && chunkElement == element && ReferenceEquals(chunkSource, source))
+                    {
+                        if (covered.ContainsKey(offset))
+                            break;
+                        covered[offset] = size;
+                        chunks.Add(instruction);
+                        continue;
+                    }
+
+                    // anything else touching the struct or the array ends the run
+                    if (instruction.Operands.Any(o => ReferencesLocal(o, source) || ReferencesLocal(o, array)) || instruction.IsCall)
+                        break;
+                }
+
+                // the chunks tile the element exactly
+                long position = 0;
+                foreach (var (offset, size) in covered)
+                {
+                    if (offset != position)
+                        break;
+                    position += size;
+                }
+                if (position != elementSize || covered.Values.Sum() != elementSize)
+                    continue;
+
+                chunks[0].SetOperands(new ArrayAccess(array, new Immediate(element)), source);
+                foreach (var chunk in chunks.Skip(1))
+                {
+                    chunk.OpCode = OpCode.Nop;
+                    chunk.SetOperands();
+                }
+            }
+        }
+    }
+
+    private static bool ReferencesLocal(IOperand operand, LocalVariable local) => operand switch
+    {
+        LocalVariable l => ReferenceEquals(l, local),
+        MemoryOperand m => ReferenceEquals(m.Base, local) || ReferenceEquals(m.Index, local),
+        FieldReference f => ReferenceEquals(f.Local, local),
+        AddressOf { Target: var target } => ReferencesLocal(target, local),
+        _ => false,
+    };
+
+    // Move [arr + 0x20 + k*size + offset]:n, (a piece of) struct local: (arr, k, local, element size, offset, n)
+    private static (LocalVariable Array, long Element, LocalVariable Source, long ElementSize, long Offset, long Size)? ElementChunk(Instruction instruction, int pointerSize, long elementsOffset)
+    {
+        if (instruction is not { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { IsValueType: true } elementType } } array, Index: null, Size: > 0 } destination, var value] }
+            || MetadataResolver.IsPrimitiveOrEnum(elementType))
+            return null;
+
+        var elementSize = MetadataElementSize(elementType, pointerSize);
+        if (elementSize <= 0 || destination.Addend < elementsOffset)
+            return null;
+
+        var element = (destination.Addend - elementsOffset) / elementSize;
+        var offset = (destination.Addend - elementsOffset) % elementSize;
+
+        switch (value)
+        {
+            case MemoryOperand { Base: LocalVariable { Type: { } sourceType } source, Index: null } piece
+                when sourceType == elementType && piece.Addend == offset && piece.Size == destination.Size:
+                return (array, element, source, elementSize, offset, destination.Size);
+            case FieldReference { Local: { Type: { } fieldOwner } source, Path.Count: 0 } field
+                when fieldOwner == elementType && field.Offset == offset && TypeSizes.StorageSize(field.Field.FieldType, pointerSize) == destination.Size:
+                return (array, element, source, elementSize, offset, destination.Size);
+            default:
+                return null;
+        }
+    }
+
     // Group initializers after an array allocation together so ILSpy decompiles them better
     private static void GroupInitialisers(ISILControlFlowGraph cfg)
     {
@@ -179,7 +271,16 @@ public static class ArrayRecovery
                         var moved = new List<Instruction> { allocation };
                         moved.AddRange(stores.Select(s => s.Instruction));
 
-                        current.Instructions.InsertRange(current.Instructions.IndexOf(instruction), moved);
+                        // a constructor call is emitted where its object was allocated (newobj): in front of that
+                        var insertAt = current.Instructions.IndexOf(instruction);
+                        if (instruction is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: ".ctor" }, LocalVariable constructed, ..] })
+                        {
+                            var allocationIndex = current.Instructions.FindLastIndex(insertAt, i => i is { OpCode: OpCode.Newobj, Operands: [LocalVariable allocated, ..] } && ReferenceEquals(allocated, constructed));
+                            if (allocationIndex >= 0)
+                                insertAt = allocationIndex;
+                        }
+
+                        current.Instructions.InsertRange(insertAt, moved);
                         movedAny = true;
                     }
 

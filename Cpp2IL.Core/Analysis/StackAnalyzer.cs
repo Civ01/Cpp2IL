@@ -95,6 +95,31 @@ public class StackAnalyzer
         if (aliases.Count == 0)
             return;
 
+        // Up to its first reassignment in the block that set it up, an alias is certainly the frame: the prologue's
+        // mov rax,rsp / mov [rax+10h],rdx (spilling arguments to their home slots) uses it before rax is reused
+        foreach (var definition in aliasDefinitions)
+        {
+            if (definition.Operands[0] is not Register { Name: var aliasName } || !aliases.TryGetValue(aliasName, out var aliasOffset))
+                continue;
+            var block = graph.EntryBlock.Successors.FirstOrDefault(b => b.Instructions.Contains(definition));
+            if (block == null)
+                continue;
+
+            for (var at = block.Instructions.IndexOf(definition) + 1; at < block.Instructions.Count; at++)
+            {
+                var instruction = block.Instructions[at];
+                if (aliasDefinitions.Contains(instruction) || !_instructionState.TryGetValue(instruction, out var here))
+                    continue;
+
+                for (var i = 0; i < instruction.Operands.Count; i++)
+                    if (instruction.Operands[i] is MemoryOperand { Index: null, Scale: 0, Base: Register { } frameBase } memory && frameBase.Name == aliasName)
+                        instruction.SetOperand(i, new StackOffset((int)(aliasOffset + memory.Addend - here.Size), memory.Size));
+
+                if (instruction.Destination is Register written && written.Name == aliasName)
+                    break;
+            }
+        }
+
         // Following a register that gets reassigned would need flow analysis, so stop trusting it entirely.
         // The exception is the epilogue restoring the caller's value from the stack (pop rbp), after which
         // the register is never used as a frame base again.

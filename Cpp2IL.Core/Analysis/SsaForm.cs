@@ -26,16 +26,31 @@ public class SsaForm
     private readonly Dictionary<int, Register> _repr = new();
 
     public static void Build(MethodAnalysisContext method)
-        => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackStructTypes.Keys);
+        => Build(method.ControlFlowGraph!, method.DominatorInfo!, method.StackStructTypes.Keys, WriteBarrierAddress(method));
+
+    // The GC write barrier is handed the address of what was just written, and never changes it
+    private static ulong WriteBarrierAddress(MethodAnalysisContext method)
+    {
+        try
+        {
+            return method.AppContext.GetOrCreateKeyFunctionAddresses().il2cpp_codegen_write_barrier;
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private ulong _writeBarrier;
 
     // Struct-holding stack slots that are only ever accessed piecewise, through memory operands, and so behave as
     // memory rather than as SSA variables: they're never versioned, and handing out their address doesn't
     // redefine them.
     private HashSet<string> _memorySlots = [];
 
-    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo, IEnumerable<string>? memorySlots = null)
+    public static void Build(ISILControlFlowGraph graph, DominatorInfo dominatorInfo, IEnumerable<string>? memorySlots = null, ulong writeBarrier = 0)
     {
-        var ssa = new SsaForm();
+        var ssa = new SsaForm { _writeBarrier = writeBarrier };
         if (memorySlots != null)
             ssa._memorySlots = [..memorySlots];
 
@@ -62,7 +77,7 @@ public class SsaForm
                 foreach (var operand in instruction.Operands)
                 {
                     if (operand is AddressOf { Target: Register addressed } && !_memorySlots.Contains(addressed.Name) && IsReadAfter(block, i, addressed)
-                        && ReachesCall(block, i))
+                        && ReachesCall(block, i, _writeBarrier))
                         _clobbering.Add(instruction);
                 }
             }
@@ -71,11 +86,13 @@ public class SsaForm
 
     // Whether the address can be written through: it's a call argument, or held in a register a call in this block
     // is passed. An address only stored somewhere (lea rax,[rsp+60h] / mov [rsp+30h],rax for a finally block) isn't.
-    private static bool ReachesCall(Block block, int index)
+    private static bool ReachesCall(Block block, int index, ulong writeBarrier)
     {
+        bool IsBarrier(Instruction call) => writeBarrier != 0 && call.Operands is [Immediate { } target, ..] && (ulong)target.Value == writeBarrier;
+
         var instruction = block.Instructions[index];
         if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.IndirectJump)
-            return true;
+            return !IsBarrier(instruction);
 
         if (instruction is not { OpCode: OpCode.Move, Operands: [Register holder, AddressOf] })
             return true; // something else we don't model: assume the worst
@@ -84,6 +101,7 @@ public class SsaForm
         {
             var next = block.Instructions[i];
             if (next.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.IndirectJump
+                && !IsBarrier(next)
                 && next.Operands.Any(operand => operand is Register used && used.Name == holder.Name))
                 return true;
 
