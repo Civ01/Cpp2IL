@@ -75,6 +75,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// </summary>
     public Dictionary<string, TypeAnalysisContext> StackStructTypes = [];
 
+    /// <summary>
+    /// foreach loops found by <see cref="Analysis.ForeachRecovery"/>, for IL generation to wrap in try/finally.
+    /// </summary>
+    public List<Analysis.ForeachRegion>? ForeachRegions;
+
     public static int MaxMethodSizeBytes = 30000; // 30KB
 
     /// <summary>
@@ -543,6 +548,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         LocalVariables.RemoveUnused(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.RemoveUnused");
+
+        // Last, as it depends on the final block layout
+        ForeachRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "ForeachRecovery.Run");
     }
 
     public void AddWarning(string warning) => AnalysisWarnings.Add(warning);
@@ -551,6 +560,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     {
         ConvertedIsil = null;
         ControlFlowGraph = null;
+        ForeachRegions = null;
         DominatorInfo = null;
     }
 
