@@ -80,6 +80,11 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// </summary>
     public List<Analysis.ForeachRegion>? ForeachRegions;
 
+    /// <summary>
+    /// Switches found by <see cref="Analysis.SwitchChainRecovery"/>, for IL generation to emit as an IL switch.
+    /// </summary>
+    public List<Analysis.SwitchTable>? SwitchTables;
+
     public static int MaxMethodSizeBytes = 30000; // 30KB
 
     /// <summary>
@@ -549,6 +554,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.RemoveUnused(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.RemoveUnused");
 
+        // Switches over a field, read once ahead of the cases so they compare one local
+        SwitchChainRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "SwitchChainRecovery.Run");
+
         // Last, as it depends on the final block layout
         ForeachRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "ForeachRecovery.Run");
@@ -561,6 +570,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ConvertedIsil = null;
         ControlFlowGraph = null;
         ForeachRegions = null;
+        SwitchTables = null;
         DominatorInfo = null;
     }
 

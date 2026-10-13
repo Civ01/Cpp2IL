@@ -55,7 +55,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
     [ThreadStatic] private static List<Instruction>? _recent;
 
     // jmp rcx after mov ecx,[rdx+rax*4+table] / add rcx,rdx: the index register and the case targets, read from the table
-    private static (Register Index, List<ulong> Targets)? FindJumpTable(Instruction jump, MethodAnalysisContext context)
+    private static (Register Index, ulong LoadAddress, List<ulong> Targets)? FindJumpTable(Instruction jump, MethodAnalysisContext context)
     {
         const ulong imageBase = 0x180000000;
         if (_recent is not { Count: > 1 })
@@ -121,7 +121,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             targets.Add(target);
         }
 
-        return (index.GetFullRegister(), targets);
+        return (index.GetFullRegister(), load.IP, targets);
     }
 
     private static bool IsScalarSingle(Mnemonic mnemonic) => mnemonic is Mnemonic.Addss or Mnemonic.Subss or Mnemonic.Mulss or Mnemonic.Divss
@@ -1179,7 +1179,21 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     // a switch: compare the index against each case in turn
                     if (isJumpTable && context != null && FindJumpTable(instruction, context) is { } jumpTable)
                     {
-                        var indexRegister = new ISIL.Register(null, X86Utils.GetRegisterName(jumpTable.Index));
+                        // the case is compared as it was before the table read, which usually overwrites it
+                        // (mov eax,[rcx+rax*4+table] / add rax,rcx / jmp rax): keep a copy from just before that
+                        var indexRegister = new ISIL.Register(null, "JTINDEX");
+                        var loadAt = addresses.IndexOf(jumpTable.LoadAddress);
+                        if (loadAt < 0)
+                        {
+                            AddIndirectJmp(instruction);
+                            break;
+                        }
+
+                        addresses.Insert(loadAt, jumpTable.LoadAddress);
+                        instructions.Insert(loadAt, new ISIL.Instruction(loadAt, ISIL.OpCode.Move, indexRegister, new ISIL.Register(null, X86Utils.GetRegisterName(jumpTable.Index))));
+                        for (var renumber = loadAt + 1; renumber < instructions.Count; renumber++)
+                            instructions[renumber].Index = renumber;
+
                         for (var k = 0; k < jumpTable.Targets.Count - 1; k++)
                         {
                             var caseFlag = new ISIL.Register(null, "TEMP");
