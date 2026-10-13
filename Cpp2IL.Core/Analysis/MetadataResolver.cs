@@ -844,9 +844,13 @@ public static class MetadataResolver
                     && ReferenceEquals(BaseMethodOf(concrete), BaseMethodOf(alreadyResolved))
                     && concrete.Parameters.Count == alreadyResolved.Parameters.Count
                     && concrete.IsStatic == alreadyResolved.IsStatic
-                    && concrete.ToString() != alreadyResolved.ToString())
+                    && !SameInstantiation(concrete, alreadyResolved))
                 {
                     instruction.SetOperand(0, concrete);
+                    // its result was typed from the shared instantiation (object for a T)
+                    if (instruction.Destination is LocalVariable { Type: { FullName: "System.Object" } } result
+                        && concrete.ReturnType is { } concreteReturn && concreteReturn.FullName != "System.Object")
+                        result.Type = concreteReturn;
                     changed = true;
                 }
 
@@ -1036,6 +1040,14 @@ public static class MetadataResolver
         }
 
         return null;
+    }
+
+    private static bool SameInstantiation(MethodAnalysisContext a, MethodAnalysisContext b)
+    {
+        static string Arguments(MethodAnalysisContext m) => m is ConcreteGenericMethodAnalysisContext c
+            ? string.Join(",", c.TypeGenericParameters.Select(t => t.FullName)) + "|" + string.Join(",", c.MethodGenericParameters.Select(t => t.FullName))
+            : "";
+        return Arguments(a) == Arguments(b);
     }
 
     private static MethodAnalysisContext BaseMethodOf(MethodAnalysisContext method) =>
