@@ -285,10 +285,39 @@ public static class LocalVariables
 
         // Anything used as a pointer is better left alone than called an integer
         var pointers = new HashSet<LocalVariable>();
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        var addressing = new HashSet<LocalVariable>();
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
             foreach (var operand in instruction.Operands)
+            {
                 if (operand is MemoryOperand { Base: LocalVariable pointer })
+                {
                     pointers.Add(pointer);
+                    addressing.Add(pointer);
+                }
+
+                if (operand is MemoryOperand { Index: LocalVariable index })
+                    addressing.Add(index);
+            }
+
+            if (instruction.Destination is LocalVariable defined)
+                definitions[defined] = instruction;
+        }
+
+        // a loop counter: counter = phi(small constant, counter +- small constant), nowhere used to address memory
+        bool IsCounter(LocalVariable local) =>
+            !addressing.Contains(local) && definitions.TryGetValue(local, out var phi) && phi.OpCode == OpCode.Phi
+            && phi.Operands.Skip(1).All(input => input switch
+            {
+                Immediate { Value: >= int.MinValue and <= int.MaxValue } => true,
+                LocalVariable step when ReferenceEquals(step, local) => true,
+                LocalVariable step when !addressing.Contains(step) && definitions.TryGetValue(step, out var stepDefinition)
+                                        && stepDefinition is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable stepped, Immediate { Value: >= -0x10000 and <= 0x10000 }] }
+                                        && ReferenceEquals(stepped, local) => true,
+                LocalVariable { Type: { FullName: "System.Int32" } } => true,
+                _ => false,
+            });
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -309,7 +338,8 @@ public static class LocalVariables
                 { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Size: var size }] } => SizedInteger(size, method),
                 { OpCode: OpCode.Move, Operands: [_, StackOffset { Size: var size }] } => SizedInteger(size, method),
                 { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo
-                    or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.Not or OpCode.Negate } => types.SystemInt64Type,
+                    or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.Not or OpCode.Negate }
+                    => ThirtyTwoBitArithmetic(instruction, IsCounter) ? types.SystemInt32Type : types.SystemInt64Type,
                 _ => null
             };
 
@@ -321,6 +351,39 @@ public static class LocalVariables
         }
 
         return changed;
+    }
+
+    // Arithmetic on nothing wider than 32 bits (a bool, an int, small constants) is 32 bit, even though the compiler did it
+    // in 64 bit registers ((b ? 1 : 0) * 2 + 1 as lea eax,[rcx*2+1])
+    private static bool ThirtyTwoBitArithmetic(Instruction instruction, System.Func<LocalVariable, bool> isCounter)
+    {
+        if (instruction is { OpCode: OpCode.ShiftLeft, Operands: [_, _, Immediate { Value: >= 32 }] })
+            return false;
+
+        var sawTyped = false;
+        for (var i = 1; i < instruction.Operands.Count; i++)
+        {
+            switch (instruction.Operands[i])
+            {
+                case Immediate { Value: >= int.MinValue and <= int.MaxValue }:
+                    continue;
+                case LocalVariable { Type: { } type } when Narrow(type):
+                case FieldReference { Field.FieldType: var fieldType } when Narrow(fieldType):
+                    sawTyped = true;
+                    continue;
+                case LocalVariable { Type: null } counter when isCounter(counter):
+                    sawTyped = true;
+                    continue;
+                default:
+                    return false;
+            }
+        }
+
+        return sawTyped;
+
+        static bool Narrow(TypeAnalysisContext type) =>
+            type is { IsEnumType: true } ? type.EnumUnderlyingType?.FullName is "System.Int32" or "System.UInt32" or "System.Int16" or "System.UInt16" or "System.Byte" or "System.SByte"
+                : type.FullName is "System.Boolean" or "System.Int32" or "System.UInt32" or "System.Int16" or "System.UInt16" or "System.Byte" or "System.SByte" or "System.Char";
     }
 
     private static TypeAnalysisContext? SizedInteger(int size, MethodAnalysisContext method) => size switch
@@ -751,6 +814,10 @@ public static class LocalVariables
     {
         if (instruction.Operands[0] is not LocalVariable { Type: null } destination)
             return false;
+
+        // shifted by 32 or more, it's 64 bits whatever went in
+        if (instruction is { OpCode: OpCode.ShiftLeft, Operands: [_, _, Immediate { Value: >= 32 and < 64 }] })
+            return SetTypeIfUnknown(destination, method.AppContext.SystemTypes.SystemInt64Type);
 
         for (var i = 1; i < instruction.Operands.Count; i++)
             if (IntegerResultType(instruction.Operands[i], method) is { } integerType)
