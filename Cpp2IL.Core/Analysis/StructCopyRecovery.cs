@@ -371,8 +371,9 @@ public static class StructCopyRecovery
         var pointee = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element : baseType;
 
         // The whole local (a struct value, or what a struct pointer points at)
+        // (a local holding the struct itself is just that local; through a pointer it's what's pointed at)
         if (offset == 0 && StackStructRecovery.IsStruct(pointee) && TypeSizes.StorageSize(pointee, pointerSize) == size)
-            return (new MemoryOperand(baseLocal, size: (int)size), pointee);
+            return (ReferenceEquals(pointee, baseType) ? baseLocal : new MemoryOperand(baseLocal, size: (int)size), pointee);
 
         var isStatic = pointee is StaticFieldStorageTypeAnalysisContext;
         var owner = (pointee as StaticFieldStorageTypeAnalysisContext)?.OwnerType ?? pointee;
