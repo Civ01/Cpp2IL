@@ -64,7 +64,10 @@ public static class StackStructRecovery
             var passed = PassedMethodInfo(app, resolver, block, callee);
             if (passed != null && candidates.Any(c => c.Name == passed.Name && c.Parameters.Count == passed.Parameters.Count && c.IsStatic == passed.IsStatic))
                 callee = passed;
-            else if (candidates.Count > 1 && !candidates.All(c => SameLayout(c, callee) && ReferenceEquals(c.DeclaringType, callee.DeclaringType)))
+            // folded duplicates are fine as long as they agree on where structs go (the receiver only matters when it is a
+            // struct itself)
+            else if (candidates.Count > 1 && !candidates.All(c => SameLayout(c, callee)
+                                                                  && (ReferenceEquals(c.DeclaringType, callee.DeclaringType) || c.DeclaringType is { IsValueType: false } && callee.DeclaringType is { IsValueType: false })))
                 continue;
 
             // Only trust the operand layout if it's the managed one for this callee (not the raw unmanaged register dump)
@@ -147,8 +150,7 @@ public static class StackStructRecovery
             var types = group.Select(r => r.Type).Distinct().ToList();
             var instances = types.Count == 1
                 ? [new Instance(StackAnalyzer.NameForSlot(new StackOffset(group.Key)), types[0], group.Key, group.Key + (int)TypeSizes.UnboxedSize(types[0], 8), group.ToList())]
-                : group.OrderBy(r => r.Call.Index).Select((r, n) => new Instance($"{StackAnalyzer.NameForSlot(new StackOffset(group.Key))}_{n}", r.Type, group.Key,
-                    group.Key + (int)TypeSizes.UnboxedSize(r.Type, 8), [r])).ToList();
+                : PerUse(group.Key, group.OrderBy(r => r.Call.Index).ToList());
 
             if (instances.Any(i => i.End <= i.Start))
                 continue;
@@ -183,10 +185,10 @@ public static class StackStructRecovery
                         foreach (var slot in accepted.Where(r => access.Offset < r.End && accessEnd > r.Start).ToList())
                         {
                             var isWrite = operandIndex == 0 && instruction.OpCode == OpCode.Move;
-                            var instance = slot.Instances.Count == 1 ? slot.Instances[0] : Choose(slot, instruction, isWrite);
+                            var instance = slot.Instances.Count == 1 ? slot.Instances[0] : Choose(slot, instruction, isWrite, access.Offset, accessEnd);
                             if (instance == null || access.Offset < instance.Start || accessEnd > instance.End)
                             {
-                                Debug?.Invoke($"reject {slot.Start:X} by {instruction}");
+                                Debug?.Invoke($"reject {slot.Start:X} by {instruction} (instance {instance?.Type} {instance?.Start:X}-{instance?.End:X}; roots {string.Join(",", slot.Instances.Select(i => i.Type + "@" + i.Roots[0].Call.Index + (i.Roots[0].CalleeReads ? "r" : "") + (i.Roots[0].CalleeWrites ? "w" : "")))})");
                                 accepted.Remove(slot);
                                 continue;
                             }
@@ -526,6 +528,26 @@ public static class StackStructRecovery
         }
     }
 
+    // A slot reused for several structs: one instance per use, except that consecutive uses as the same type are the same
+    // value (a struct parameter copied into the slot, then passed on)
+    private static List<Instance> PerUse(int offset, List<Root> ordered)
+    {
+        var instances = new List<Instance>();
+        foreach (var root in ordered)
+        {
+            if (instances.Count > 0 && ReferenceEquals(instances[^1].Type, root.Type))
+            {
+                instances[^1].Roots.Add(root);
+                continue;
+            }
+
+            instances.Add(new Instance($"{StackAnalyzer.NameForSlot(new StackOffset(offset))}_{instances.Count}", root.Type, offset,
+                offset + (int)TypeSizes.UnboxedSize(root.Type, 8), [root]));
+        }
+
+        return instances;
+    }
+
     private sealed record Root(int Offset, TypeAnalysisContext Type, Instruction Call, Instruction Definition, bool CalleeReads, bool CalleeWrites);
 
     private sealed record Instance(string Name, TypeAnalysisContext Type, int Start, int End, List<Root> Roots);
@@ -534,16 +556,25 @@ public static class StackStructRecovery
 
     // A slot reused for several structs: our write is building the next call's argument, our read is of what the last
     // call left there (a returned struct), or else of an argument we're building
-    private static Instance? Choose(Slot slot, Instruction access, bool isWrite)
+    private static Instance? Choose(Slot slot, Instruction access, bool isWrite, int accessStart, int accessEnd)
     {
-        var ordered = slot.Instances.OrderBy(i => i.Roots[0].Call.Index).ToList();
-        var next = ordered.FirstOrDefault(i => i.Roots[0].Call.Index > access.Index && i.Roots[0].CalleeReads);
-        var previous = ordered.LastOrDefault(i => i.Roots[0].Call.Index < access.Index);
+        // the access that is itself the root (a copy of a struct parameter into the slot)
+        if (slot.Instances.FirstOrDefault(i => i.Roots.Any(r => ReferenceEquals(r.Call, access) || ReferenceEquals(r.Definition, access))) is { } own)
+            return own;
+
+        // only an instance the access fits in can be the one it's to
+        var fitting = slot.Instances.Where(i => accessStart >= i.Start && accessEnd <= i.End).ToList();
+        if (fitting.Count == 1)
+            return fitting[0];
+
+        var ordered = (fitting.Count > 0 ? fitting : slot.Instances).OrderBy(i => i.Roots[0].Call.Index).ToList();
+        var next = ordered.FirstOrDefault(i => i.Roots.Any(r => r.Call.Index > access.Index && r.CalleeReads));
+        var previous = ordered.LastOrDefault(i => i.Roots.Any(r => r.Call.Index < access.Index));
 
         if (isWrite)
-            return next ?? (previous is { Roots: [{ CalleeWrites: true }] } ? previous : null);
+            return next ?? (previous != null && previous.Roots.Any(r => r.CalleeWrites) ? previous : null);
 
-        if (previous is { Roots: [{ CalleeWrites: true }] })
+        if (previous != null && previous.Roots.Any(r => r.CalleeWrites))
             return previous;
 
         return next ?? previous;

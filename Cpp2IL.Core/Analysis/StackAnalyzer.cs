@@ -86,9 +86,11 @@ public class StackAnalyzer
                 aliases[leaDestination.Name] = atCopy.Size + frameSlot.Offset;
                 aliasDefinitions.Add(instruction);
             }
-            // mov rax,rsp / lea rbp,[rax-87h]: a frame register derived from another alias
-            else if (instruction is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [Register derived, Register derivedFrom, Immediate derivedBy] }
-                     && derived.Name != derivedFrom.Name && derived.Name != "rsp" && aliases.TryGetValue(derivedFrom.Name, out var fromOffset))
+            // mov rax,rsp / lea rbp,[rax-87h]: a frame register derived from another alias (only a register that
+            // survives calls can be one: lea rcx,[rax-38h] / lea r9,[rax-28h] are addresses of slots being passed, and
+            // r9 held the fourth argument before, which treating it as the frame everywhere would replace)
+            else if (instruction is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [Register { Name: not ("rsp" or "rax" or "rcx" or "rdx" or "r8" or "r9" or "r10" or "r11") } derived, Register derivedFrom, Immediate derivedBy] }
+                     && derived.Name != derivedFrom.Name && aliases.TryGetValue(derivedFrom.Name, out var fromOffset))
             {
                 aliases[derived.Name] = (int)(fromOffset + (instruction.OpCode == OpCode.Add ? derivedBy.Value : -derivedBy.Value));
                 aliasDefinitions.Add(instruction);
@@ -113,6 +115,16 @@ public class StackAnalyzer
                 var instruction = block.Instructions[at];
                 if (aliasDefinitions.Contains(instruction) || !_instructionState.TryGetValue(instruction, out var here))
                     continue;
+
+                // lea rcx,[rax-38h] (an add/sub of the alias): the address of a stack slot, e.g. a return buffer
+                if (instruction is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [Register leaTarget, Register { } leaBase, Immediate leaBy] }
+                    && leaBase.Name == aliasName && leaTarget.Name != aliasName && leaTarget.Name != "rsp")
+                {
+                    var leaDelta = instruction.OpCode == OpCode.Add ? leaBy.Value : -leaBy.Value;
+                    instruction.OpCode = OpCode.Move;
+                    instruction.SetOperands(leaTarget, new AddressOf(new StackOffset((int)(aliasOffset + leaDelta - here.Size))));
+                    continue;
+                }
 
                 for (var i = 0; i < instruction.Operands.Count; i++)
                     if (instruction.Operands[i] is MemoryOperand { Index: null, Scale: 0, Base: Register { } frameBase } memory && frameBase.Name == aliasName)

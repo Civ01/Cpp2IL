@@ -517,6 +517,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         EqualityBranchInverter.Run(this);
         DebugPassCallback?.Invoke(this, "EqualityBranchInverter.Run");
 
+        // A struct's slot used as scratch before the struct is built in it
+        DeadFieldStoreEliminator.Run(this);
+
         // Inlined List<T>.Add back to the call
         InlinedListAddRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "InlinedListAddRecovery.Run");
