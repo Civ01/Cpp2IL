@@ -179,12 +179,17 @@ public static class IlGenerator
 
         var regionIl = regions.ToDictionary(r => r, _ => new List<CilInstruction>());
 
+        // a switch is emitted from its first compare; the rest of its compares aren't reached any more
+        var switches = (context.SwitchTables ?? []).ToDictionary(t => t.First);
+        var replacedBySwitch = switches.Values.SelectMany(t => t.Chain.Skip(1)).ToHashSet();
+        var pendingSwitchFixups = new List<(CilInstruction Switch, List<Block> Targets)>();
+
         foreach (var (block, within) in emissionOrder)
         {
             if (block == context.ControlFlowGraph.EntryBlock || block == context.ControlFlowGraph.ExitBlock)
                 continue;
 
-            if (block.Instructions.Count == 0)
+            if (block.Instructions.Count == 0 || replacedBySwitch.Contains(block))
                 continue;
 
             var blockStart = definition.CilMethodBody!.Instructions.Count;
@@ -194,8 +199,44 @@ public static class IlGenerator
                 regionIl[region].AddRange(definition.CilMethodBody!.Instructions.Skip(blockStart));
         }
 
+        void EmitSwitch(Block block, Analysis.SwitchTable table)
+        {
+            var compareAt = block.Instructions.FindLastIndex(i => i.OpCode is OpCode.CheckEqual or OpCode.CheckNotEqual);
+            foreach (var instruction in block.Instructions.Take(compareAt))
+            {
+                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine);
+                instructionMap.Add(instruction, generated);
+            }
+
+            var il = definition.CilMethodBody!.Instructions;
+            var start = il.Count;
+            LoadLocal(table.Value, definition, locals);
+            if (table.Minimum != 0)
+            {
+                il.Add(CilOpCodes.Ldc_I4, unchecked((int)table.Minimum));
+                il.Add(CilOpCodes.Sub);
+            }
+
+            var switchInstruction = new CilInstruction(CilOpCodes.Switch, new List<ICilLabel>());
+            il.Add(switchInstruction);
+            pendingSwitchFixups.Add((switchInstruction, table.Targets));
+
+            var toDefault = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
+            il.Add(toDefault);
+            pendingBlockBranchFixups.Add((toDefault, table.Default));
+
+            if (!blockEntryMap.ContainsKey(block))
+                blockEntryMap[block] = il[instructionMap.Where(kv => block.Instructions.Contains(kv.Key)).SelectMany(kv => kv.Value).Select(i => IndexOf(il, i)).DefaultIfEmpty(start).Min()];
+        }
+
         void EmitBlock(Block block)
         {
+            if (switches.TryGetValue(block, out var table) && locals.ContainsKey(table.Value))
+            {
+                EmitSwitch(block, table);
+                return;
+            }
+
             foreach (var instruction in block.Instructions)
             {
                 var generated = GenerateInstructions(instruction, context, definition, locals, writeLine);
@@ -270,6 +311,24 @@ public static class IlGenerator
             }
 
             branchInstruction.Operand = new CilInstructionLabel(target);
+        }
+
+        foreach (var (switchInstruction, targets) in pendingSwitchFixups)
+        {
+            var labels = (List<ICilLabel>)switchInstruction.Operand!;
+            foreach (var target in targets)
+            {
+                var entry = ResolveBlockEntryInstruction(target, blockEntryMap);
+                if (entry == null)
+                {
+                    context.AddWarning($"Unable to resolve switch target block: {target}");
+                    switchInstruction.OpCode = CilOpCodes.Pop; // still takes the value off the stack, then on to the default
+                    switchInstruction.Operand = null;
+                    break;
+                }
+
+                labels.Add(entry.CreateLabel());
+            }
         }
 
         // innermost first, as what wrapping one adds is part of those around it
