@@ -83,7 +83,8 @@ public static class WideChunkSplitter
             {
                 var load = block.Instructions[index];
                 if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable { Type: var resultType } result, MemoryOperand { Base: LocalVariable { Type: { } baseType }, Index: null, Size: 8 } memory] }
-                    || resultType != types.SystemInt64Type && resultType != types.SystemUInt64Type)
+                    || resultType != types.SystemInt64Type && resultType != types.SystemUInt64Type
+                    && resultType != types.SystemIntPtrType && resultType != types.SystemUIntPtrType) // a 64 bit integer, defaulted to nint if nothing said more
                     continue;
 
                 var owner = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element : baseType;

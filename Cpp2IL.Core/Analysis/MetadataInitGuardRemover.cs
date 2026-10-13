@@ -254,7 +254,8 @@ public static class MetadataInitGuardRemover
         {
             switch (instruction.OpCode)
             {
-                case OpCode.Jump:
+                // control flow within the region (a nested guard), whose targets are checked to stay in it
+                case OpCode.Jump or OpCode.ConditionalJump:
                     break;
 
                 // Behind an initialized_and_no_error test the callee is the class initializer, even if we didn't resolve it.

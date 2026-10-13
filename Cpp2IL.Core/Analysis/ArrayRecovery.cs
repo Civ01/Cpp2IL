@@ -24,7 +24,9 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        RecoverElementCopies(method);
         RecoverAccesses(method);
+        RecoverStructElementFields(method);
         RecoverStructElementAddresses(method);
         GroupInitialisers(method.ControlFlowGraph!);
     }
@@ -57,6 +59,160 @@ public static class ArrayRecovery
                          && memory.Addend - ElementsOffset(pointerSize) is >= 0 and var structOffset && structOffset % structSize == 0)
                     instruction.SetOperand(i, new ArrayAccess(array, new Immediate(structOffset / structSize)));
             }
+        }
+    }
+
+    // A field of a struct element whose size isn't an addressing scale: [arr + (i*3)*4 + 0x20 + 8] is arr[i].z of a Vector3[].
+    // The element's address goes in a temporary, and the field is read or written through it.
+    private static void RecoverStructElementFields(MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var definitions = SingleDefinitions(method.ControlFlowGraph!);
+
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        {
+            for (var at = 0; at < block.Instructions.Count; at++)
+            {
+                var instruction = block.Instructions[at];
+                for (var i = 0; i < instruction.Operands.Count; i++)
+                {
+                    if (instruction.Operands[i] is not MemoryOperand { Base: LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { IsValueType: true } elementType } } array, Size: > 0 } memory
+                        || MetadataResolver.IsPrimitiveOrEnum(elementType))
+                        continue;
+                    var elementSize = MetadataElementSize(elementType, pointerSize);
+                    if (elementSize <= 0)
+                        continue;
+
+                    var indexAffine = memory.Index is LocalVariable indexLocal
+                        ? ScaleBy(Evaluate(indexLocal, definitions, 0), Math.Max(memory.Scale, 1))
+                        : new Affine(null, 0, 0);
+                    if (Sum(indexAffine, new Affine(null, 0, memory.Addend)) is not { } address || ReferenceEquals(address.Root, array))
+                        continue;
+
+                    var offset = address.Offset - ElementsOffset(pointerSize);
+                    IOperand index;
+                    long fieldOffset;
+                    if (address.Root != null)
+                    {
+                        if (address.Multiplier != elementSize || offset < 0 || offset >= elementSize)
+                            continue;
+                        index = address.Root;
+                        fieldOffset = offset;
+                    }
+                    else
+                    {
+                        // a store at a constant index is an initialiser, made of chunked copies of a struct built elsewhere,
+                        // which don't line up with the element's fields
+                        if (offset < 0 || i == 0 && instruction.OpCode == OpCode.Move)
+                            continue;
+                        index = new Immediate(offset / elementSize);
+                        fieldOffset = offset % elementSize;
+                    }
+
+                    var chain = elementType is GenericInstanceTypeAnalysisContext generic
+                        ? GenericInstanceFieldLayout.FindFieldChain(generic, fieldOffset, memory.Size, pointerSize)
+                        : MetadataResolver.FindFieldChain(elementType, false, fieldOffset, memory.Size, pointerSize);
+                    if (chain == null)
+                        continue;
+
+                    var element = new LocalVariable($"element{method.Locals.Count}", new Register(null, $"ELEMENT_{method.Locals.Count}", 0), elementType.MakeByReferenceType());
+                    method.Locals.Add(element);
+                    block.Instructions.Insert(at, new Instruction(instruction.Index, OpCode.Move, element, new AddressOf(new ArrayAccess(array, index))));
+                    at++;
+                    instruction.SetOperand(i, new FieldReference(chain[^1], element, (int)fieldOffset) { Path = chain.GetRange(0, chain.Count - 1) });
+                }
+            }
+        }
+    }
+
+    // keys[0] = keyframe for a 28 byte Keyframe is copied in chunks (16 + 8 + 4 bytes) from the local into the element.
+    // Chunks from one struct local that together cover exactly one element become that one element store.
+    private static void RecoverElementCopies(MethodAnalysisContext method)
+    {
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+        var elementsOffset = ElementsOffset(pointerSize);
+
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        {
+            for (var start = 0; start < block.Instructions.Count; start++)
+            {
+                if (ElementChunk(block.Instructions[start], pointerSize, elementsOffset) is not var (array, element, source, elementSize, _, _))
+                    continue;
+
+                var covered = new SortedDictionary<long, long>();
+                var chunks = new List<Instruction>();
+                for (var at = start; at < block.Instructions.Count && at < start + 12; at++)
+                {
+                    var instruction = block.Instructions[at];
+                    if (ElementChunk(instruction, pointerSize, elementsOffset) is var (chunkArray, chunkElement, chunkSource, _, offset, size)
+                        && ReferenceEquals(chunkArray, array) && chunkElement == element && ReferenceEquals(chunkSource, source))
+                    {
+                        if (covered.ContainsKey(offset))
+                            break;
+                        covered[offset] = size;
+                        chunks.Add(instruction);
+                        continue;
+                    }
+
+                    // anything else touching the struct or the array ends the run
+                    if (instruction.Operands.Any(o => ReferencesLocal(o, source) || ReferencesLocal(o, array)) || instruction.IsCall)
+                        break;
+                }
+
+                // the chunks tile the element exactly
+                long position = 0;
+                foreach (var (offset, size) in covered)
+                {
+                    if (offset != position)
+                        break;
+                    position += size;
+                }
+                if (position != elementSize || covered.Values.Sum() != elementSize)
+                    continue;
+
+                chunks[0].SetOperands(new ArrayAccess(array, new Immediate(element)), source);
+                foreach (var chunk in chunks.Skip(1))
+                {
+                    chunk.OpCode = OpCode.Nop;
+                    chunk.SetOperands();
+                }
+            }
+        }
+    }
+
+    private static bool ReferencesLocal(IOperand operand, LocalVariable local) => operand switch
+    {
+        LocalVariable l => ReferenceEquals(l, local),
+        MemoryOperand m => ReferenceEquals(m.Base, local) || ReferenceEquals(m.Index, local),
+        FieldReference f => ReferenceEquals(f.Local, local),
+        AddressOf { Target: var target } => ReferencesLocal(target, local),
+        _ => false,
+    };
+
+    // Move [arr + 0x20 + k*size + offset]:n, (a piece of) struct local: (arr, k, local, element size, offset, n)
+    private static (LocalVariable Array, long Element, LocalVariable Source, long ElementSize, long Offset, long Size)? ElementChunk(Instruction instruction, int pointerSize, long elementsOffset)
+    {
+        if (instruction is not { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { IsValueType: true } elementType } } array, Index: null, Size: > 0 } destination, var value] }
+            || MetadataResolver.IsPrimitiveOrEnum(elementType))
+            return null;
+
+        var elementSize = MetadataElementSize(elementType, pointerSize);
+        if (elementSize <= 0 || destination.Addend < elementsOffset)
+            return null;
+
+        var element = (destination.Addend - elementsOffset) / elementSize;
+        var offset = (destination.Addend - elementsOffset) % elementSize;
+
+        switch (value)
+        {
+            case MemoryOperand { Base: LocalVariable { Type: { } sourceType } source, Index: null } piece
+                when sourceType == elementType && piece.Addend == offset && piece.Size == destination.Size:
+                return (array, element, source, elementSize, offset, destination.Size);
+            case FieldReference { Local: { Type: { } fieldOwner } source, Path.Count: 0 } field
+                when fieldOwner == elementType && field.Offset == offset && TypeSizes.StorageSize(field.Field.FieldType, pointerSize) == destination.Size:
+                return (array, element, source, elementSize, offset, destination.Size);
+            default:
+                return null;
         }
     }
 
@@ -115,7 +271,16 @@ public static class ArrayRecovery
                         var moved = new List<Instruction> { allocation };
                         moved.AddRange(stores.Select(s => s.Instruction));
 
-                        current.Instructions.InsertRange(current.Instructions.IndexOf(instruction), moved);
+                        // a constructor call is emitted where its object was allocated (newobj): in front of that
+                        var insertAt = current.Instructions.IndexOf(instruction);
+                        if (instruction is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: ".ctor" }, LocalVariable constructed, ..] })
+                        {
+                            var allocationIndex = current.Instructions.FindLastIndex(insertAt, i => i is { OpCode: OpCode.Newobj, Operands: [LocalVariable allocated, ..] } && ReferenceEquals(allocated, constructed));
+                            if (allocationIndex >= 0)
+                                insertAt = allocationIndex;
+                        }
+
+                        current.Instructions.InsertRange(insertAt, moved);
                         movedAny = true;
                     }
 
@@ -289,7 +454,7 @@ public static class ArrayRecovery
     }
 
     // value = Multiplier * Root + Offset (a null Root means it's just a constant)
-    private readonly record struct Affine(LocalVariable? Root, long Multiplier, long Offset);
+    private readonly record struct Affine(IOperand? Root, long Multiplier, long Offset);
 
     private static Affine? Evaluate(IOperand operand, Dictionary<LocalVariable, Instruction?> definitions, int depth)
     {
@@ -301,6 +466,10 @@ public static class ArrayRecovery
             case Immediate { Value: var value }:
                 return new Affine(null, 0, value);
 
+            // a field read forwarded into the arithmetic: a value of its own
+            case FieldReference field:
+                return new Affine(field, 1, 0);
+
             case LocalVariable local:
             {
                 if (!definitions.TryGetValue(local, out var definition) || definition == null)
@@ -309,7 +478,8 @@ public static class ArrayRecovery
                 return definition switch
                 {
                     { OpCode: OpCode.Move, Operands: [_, MemoryOperand lea] } => EvaluateLea(lea, definitions, depth + 1),
-                    { OpCode: OpCode.Move, Operands: [_, var source] } => Evaluate(source, definitions, depth + 1),
+                    { OpCode: OpCode.Move, Operands: [_, LocalVariable or Immediate] } => Evaluate(definition.Operands[1], definitions, depth + 1),
+                    { OpCode: OpCode.Move } => new Affine(local, 1, 0), // loaded from somewhere: a value of its own
                     { OpCode: OpCode.Add, Operands: [_, var left, var right] } => Sum(Evaluate(left, definitions, depth + 1), Evaluate(right, definitions, depth + 1)),
                     { OpCode: OpCode.ShiftLeft, Operands: [_, var left, Immediate { Value: >= 0 and < 32 } shift] } => ScaleBy(Evaluate(left, definitions, depth + 1), 1L << (int)shift.Value),
                     { OpCode: OpCode.Multiply, Operands: [_, var left, Immediate factor] } => ScaleBy(Evaluate(left, definitions, depth + 1), factor.Value),
@@ -340,11 +510,17 @@ public static class ArrayRecovery
         if (left is not { } l || right is not { } r)
             return null;
 
-        if (l.Root != null && r.Root != null && !ReferenceEquals(l.Root, r.Root))
+        if (l.Root != null && r.Root != null && !SameRoot(l.Root, r.Root))
             return null;
 
         return new Affine(l.Root ?? r.Root, l.Multiplier + r.Multiplier, l.Offset + r.Offset);
     }
+
+    private static bool SameRoot(IOperand a, IOperand b) => (a, b) switch
+    {
+        (FieldReference x, FieldReference y) => x.Field == y.Field && ReferenceEquals(x.Local, y.Local) && x.Path.SequenceEqual(y.Path),
+        _ => ReferenceEquals(a, b),
+    };
 
     private static Affine? ScaleBy(Affine? value, long factor)
         => value is { } affine ? new Affine(affine.Root, affine.Multiplier * factor, affine.Offset * factor) : null;

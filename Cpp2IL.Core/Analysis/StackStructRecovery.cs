@@ -75,6 +75,13 @@ public static class StackStructRecovery
 
             var last = block.Instructions.Count - 1;
 
+            // a small struct comes back in rax; spilled straight to the stack, that slot is the struct
+            if (!resolver.ReturnsViaHiddenBuffer(callee) && IsStruct(callee.ReturnType) && TypeSizes.UnboxedSize(callee.ReturnType, 8) is 1 or 2 or 4 or 8
+                && block.Successors is [var after] && after.Predecessors.Count == 1
+                && after.Instructions.TakeWhile(i => !(i.Destination is Register { Name: "rax" })).FirstOrDefault(i => i is { OpCode: OpCode.Move, Operands: [StackOffset, Register { Name: "rax" }] }) is { } spill
+                && ((StackOffset)spill.Operands[0]).Offset < 0) // not the home of an incoming parameter, which MSVC reuses as scratch
+                AddRoot(after, call, (((StackOffset)spill.Operands[0]).Offset, spill), callee.ReturnType, false, true);
+
             if (resolver.ReturnsViaHiddenBuffer(callee) && AddressedSlot(block, last, "rcx") is { } buffer)
             {
                 AddRoot(block, call, buffer, callee.ReturnType, false, true);

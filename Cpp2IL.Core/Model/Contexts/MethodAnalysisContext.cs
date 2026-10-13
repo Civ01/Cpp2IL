@@ -439,6 +439,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         LocalVariables.ResolveTypesAndFields(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.ResolveTypesAndFields");
 
+        // two packed floats returned/passed in a general register: the struct they are
+        SmallStructRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "SmallStructRecovery.Run");
+
         // again, for dispatch through classes and methods only the rgctx (resolved with the types) names
         InterfaceDispatchRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "InterfaceDispatchRecovery.Run (rgctx)");

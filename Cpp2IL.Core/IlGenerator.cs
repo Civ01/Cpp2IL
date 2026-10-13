@@ -353,6 +353,14 @@ public static class IlGenerator
                 {
                     // Operands run [ctor, newObject, arguments..., methodInfo], so take only as many as
                     // the constructor declares (i.e. drop methodInfo)
+                    // the constructor may be the shared one (Foo<object>..ctor) while the allocation knows the instantiation
+                    if (instruction.Operands is [_, GenericInstanceTypeAnalysisContext allocatedGeneric]
+                        && (constructor as ConcreteGenericMethodAnalysisContext)?.BaseMethodContext is { DeclaringType: { } constructorOwner } sharedBase
+                        && ReferenceEquals(constructorOwner, allocatedGeneric.GenericType)
+                        && constructor.DeclaringType is GenericInstanceTypeAnalysisContext constructorGeneric
+                        && !constructorGeneric.GenericArguments.Select(a => a.FullName).SequenceEqual(allocatedGeneric.GenericArguments.Select(a => a.FullName)))
+                        constructor = new ConcreteGenericMethodAnalysisContext(sharedBase, allocatedGeneric.GenericArguments, []);
+
                     var constructorArgs = constructorCall.Operands.Skip(ConstructorReceiverIndex(constructorCall) + 1).Take(constructor.Parameters.Count).ToList();
                     for (var i = 0; i < constructorArgs.Count; i++)
                         LoadOperand(constructorArgs[i], method, locals, writeLine, constructor.Parameters[i].ParameterType);
@@ -745,9 +753,24 @@ public static class IlGenerator
 
         // A null reference reaches us as an integer zero, which would otherwise be emitted as a literal 0
         // and read back as a cast from a number.
+        // (a type parameter could be a struct: that zero is default(T))
+        if (expectedType is GenericParameterTypeAnalysisContext && IsZeroConstant(operand))
+        {
+            LoadOperand(new DefaultValue(expectedType), method, locals, writeLine);
+            return;
+        }
+
         if (expectedType is { IsValueType: false } && IsZeroConstant(operand))
         {
             instructions.Add(CilOpCodes.Ldnull);
+            return;
+        }
+
+        // Likewise a zeroed struct (a null float? passed in a register, a cleared Color) is default(T), not a number
+        if (expectedType is { IsValueType: true, IsEnumType: false } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext or GenericParameterTypeAnalysisContext)
+            && !MetadataResolver.IsPrimitiveOrEnum(expectedType) && IsZeroConstant(operand))
+        {
+            LoadOperand(new DefaultValue(expectedType), method, locals, writeLine);
             return;
         }
 
@@ -840,7 +863,7 @@ public static class IlGenerator
 
                     // A load through a managed pointer (byref) dereferences it to yield the referent.
                     if (local2.Type is ByRefTypeAnalysisContext { ElementType: { } referent })
-                        instructions.Add(referent.IsValueType
+                        instructions.Add(referent.IsValueType || referent is GenericParameterTypeAnalysisContext
                             ? new CilInstruction(CilOpCodes.Ldobj, referent.ToTypeSignature().ToTypeDefOrRef())
                             : new CilInstruction(CilOpCodes.Ldind_Ref));
                     break;
@@ -1210,7 +1233,7 @@ public static class IlGenerator
                         instructions.Add(CilOpCodes.Stloc, storedValue);
                         LoadLocal(local2, method, locals);
                         instructions.Add(CilOpCodes.Ldloc, storedValue);
-                        instructions.Add(storedReferent.IsValueType
+                        instructions.Add(storedReferent.IsValueType || storedReferent is GenericParameterTypeAnalysisContext
                             ? new CilInstruction(CilOpCodes.Stobj, storedReferent.ToTypeSignature().ToTypeDefOrRef())
                             : new CilInstruction(CilOpCodes.Stind_Ref));
                         break;

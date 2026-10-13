@@ -337,6 +337,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveVirtualCalls(method);
             changed |= PropagateFromCallParameters(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
+            changed |= MetadataResolver.ResolveFieldAddresses(method);
             changed |= ArrayPointerLoopRecovery.Run(method);
             changed |= RgctxResolver.Run(method);
             changed |= KeyFunctionRecovery.RewriteUnboxes(method);

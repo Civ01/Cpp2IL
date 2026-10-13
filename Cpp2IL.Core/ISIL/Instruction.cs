@@ -44,6 +44,15 @@ public class Instruction : IOperand
     /// <summary>A conditional jump that came from an unsigned condition (ja/jae/jb/jbe), lowered with the signed flag logic.</summary>
     public bool Unsigned;
 
+    /// <summary>Kept by dead code elimination even if nothing reads it yet (a later pass may, then clears this).</summary>
+    public bool KeepAlive;
+
+    /// <summary>A move out of a general register into a vector lane that reads its low / high 4 bytes (movq xmm,rax).</summary>
+    public bool ReadsLowHalf, ReadsHighHalf;
+
+    /// <summary>movd r32,xmm: only the low 4 bytes of the vector register are read.</summary>
+    public bool ReadsLowDword;
+
     public bool ScalarSingle;
 
     public bool IsCall => OpCode is OpCode.Call or OpCode.CallVoid;

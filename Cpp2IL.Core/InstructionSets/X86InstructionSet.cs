@@ -347,6 +347,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.Cvttsd2si: // same, but double to integer
             case Mnemonic.Movdqu: // DEST[127:0] := SRC[127:0]
                 Add(instruction.IP, ISIL.OpCode.Move, ConvertOperand(instruction, 0), ConvertOperand(instruction, 1));
+                if (instruction is { Mnemonic: Mnemonic.Movd, Op0Kind: OpKind.Register, Op1Kind: OpKind.Register } && instruction.Op0Register.IsGPR32() && instruction.Op1Register.IsXMM())
+                    instructions[^1].ReadsLowDword = true;
                 break;
             case Mnemonic.Movss when instruction.Op0Kind == OpKind.Register && instruction.Op1Kind == OpKind.Register:
                 AddShuffle(4, 1, 2, 3); // merges the low lane only
@@ -622,6 +624,50 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                     goto default;
 
                 break;
+
+            // Packed single arithmetic (inlined Vector4 / struct-of-4-floats maths): lane by lane, as scalar ops on lanes
+            // pulled down with shuffles and put back together, which VectorLaneRecovery resolves like any other shuffle
+            case Mnemonic.Addps or Mnemonic.Subps or Mnemonic.Mulps or Mnemonic.Divps
+                when instruction.OpCount == 2 && instruction.Op0Kind == OpKind.Register:
+            {
+                var op = instruction.Mnemonic switch
+                {
+                    Mnemonic.Addps => ISIL.OpCode.Add,
+                    Mnemonic.Subps => ISIL.OpCode.Subtract,
+                    Mnemonic.Mulps => ISIL.OpCode.Multiply,
+                    _ => ISIL.OpCode.Divide,
+                };
+                var a = ConvertOperand(instruction, 0);
+                ISIL.IOperand b = ConvertOperand(instruction, 1);
+                var tag = instruction.IP.ToString("X");
+                if (instruction.Op1Kind != OpKind.Register)
+                {
+                    var loaded = new ISIL.Register(null, $"xmm_p{tag}_src");
+                    Add(instruction.IP, ISIL.OpCode.Move, loaded, b);
+                    b = loaded;
+                }
+
+                const int zero = 8;
+                var result = new ISIL.Register(null, $"xmm_p{tag}_r");
+                Add(instruction.IP, op, result, a, b);
+                instructions[^1].ScalarSingle = true;
+                for (var lane = 1; lane < 4; lane++)
+                {
+                    var laneA = new ISIL.Register(null, $"xmm_p{tag}_a{lane}");
+                    var laneB = new ISIL.Register(null, $"xmm_p{tag}_b{lane}");
+                    var laneSelector = Imm((ulong)(lane | zero << 4 | zero << 8 | zero << 12));
+                    Add(instruction.IP, ISIL.OpCode.VectorShuffle, laneA, a, a, laneSelector);
+                    Add(instruction.IP, ISIL.OpCode.VectorShuffle, laneB, b, b, laneSelector);
+                    Add(instruction.IP, op, laneA, laneA, laneB);
+                    instructions[^1].ScalarSingle = true;
+                    // put it in place: the lanes so far, this one, zeroes above
+                    var keep = Enumerable.Range(0, 4).Select(k => k < lane ? k : k == lane ? 4 : zero).ToArray();
+                    Add(instruction.IP, ISIL.OpCode.VectorShuffle, result, result, laneA, Imm((ulong)(keep[0] | keep[1] << 4 | keep[2] << 8 | keep[3] << 12)));
+                }
+
+                Add(instruction.IP, ISIL.OpCode.Move, a, result);
+                break;
+            }
 
             case Mnemonic.Divss: // Divide Scalar Single Precision Floating-Point Values. DEST[31:0] = DEST[31:0] / SRC[31:0]
                 Add(instruction.IP, ISIL.OpCode.Divide, ConvertOperand(instruction, 0), ConvertOperand(instruction, 0), ConvertScalarFloatOperand(instruction, 1, true, context));
@@ -1108,10 +1154,12 @@ public class X86InstructionSet : Cpp2IlInstructionSet
                 {
                     var jumpTarget = instruction.NearBranchTarget;
 
-                    var methodEnd = instruction.IP + (ulong)context.RawBytes.Length;
                     var methodStart = context.UnderlyingPointer;
+                    var methodEnd = methodStart + (ulong)context.RawBytes.Length;
 
-                    if (jumpTarget < methodStart || jumpTarget > methodEnd)
+                    // outside this method, or the start of another one (a tail call to the next function in the binary)
+                    if (jumpTarget < methodStart || jumpTarget >= methodEnd
+                        || jumpTarget != methodStart && context.AppContext.MethodsByAddress.ContainsKey(jumpTarget))
                     {
                         callNoReturn = true;
                         goto case Mnemonic.Call;
