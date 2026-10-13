@@ -39,6 +39,24 @@ public static class VectorConstantRecovery
                 constants[literalDestination] = literalKind;
         }
 
+        // the same mask loaded on each path into a join (the compiler hoisting it differently per branch)
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var instruction in graph.Instructions)
+            {
+                if (instruction is not { OpCode: OpCode.Phi, Operands: [LocalVariable merged, _, ..] } || constants.ContainsKey(merged))
+                    continue;
+
+                var sources = instruction.Operands.Skip(1).Select(o => o is LocalVariable source && constants.TryGetValue(source, out var known) ? known : ((ConstantKind Kind, float FirstLane)?)null).ToList();
+                if (sources.Any(s => s == null) || sources.Select(s => s!.Value.Kind).Distinct().Count() != 1 || sources[0]!.Value.Kind == ConstantKind.Floats)
+                    continue;
+
+                constants[merged] = sources[0]!.Value;
+                changed = true;
+            }
+        }
+
         (ConstantKind Kind, float FirstLane)? ConstantOf(IOperand operand) => operand switch
         {
             LocalVariable local when constants.TryGetValue(local, out var known) => known,

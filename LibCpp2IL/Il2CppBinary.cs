@@ -515,6 +515,12 @@ public abstract class Il2CppBinary(Stream input) : ClassReadingBinaryReader(inpu
             .ToArray();
 
     public abstract ReadOnlySpan<byte> GetRawBinaryContent();
+
+    /// <summary>
+    /// Whether the given virtual address lies in a section which is mapped readable but neither writable nor
+    /// executable (.rdata), i.e. holds data which never changes at runtime. False when the format can't tell.
+    /// </summary>
+    public virtual bool IsReadOnlyDataAddress(ulong virtualAddress) => false;
     public abstract ulong GetVirtualAddressOfExportedFunctionByName(string toFind);
     public virtual bool IsExportedFunction(ulong addr) => false;
 

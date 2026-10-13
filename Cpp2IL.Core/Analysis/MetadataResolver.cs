@@ -185,7 +185,13 @@ public static class MetadataResolver
     /// typed (a field load types its result, which is the base of the next load), more offsets
     /// resolve, so this is re-run until it stops finding new fields.
     /// </summary>
-    public static bool ResolveFieldOffsets(MethodAnalysisContext method)
+    public static bool ResolveFieldOffsets(MethodAnalysisContext method) => ResolveFieldOffsets(method, false);
+
+    /// <param name="method">The method.</param>
+    /// <param name="allowTrailingPadding">Also take an access wider than a field, when what it covers past the field is only padding (a
+    /// trailing bool copied as 8 bytes). Only once chunked copies of whole structs have been recognised, as the last chunk
+    /// of one looks just like that.</param>
+    public static bool ResolveFieldOffsets(MethodAnalysisContext method, bool allowTrailingPadding)
     {
         var changed = false;
 
@@ -253,7 +259,7 @@ public static class MetadataResolver
                 }
                 else
                 {
-                    if (FindFieldChain(genericOwner?.GenericType ?? owner, staticOwner != null, memory.Addend, memory.Size, pointerSize) is not { } chain)
+                    if (FindFieldChain(genericOwner?.GenericType ?? owner, staticOwner != null, memory.Addend, memory.Size, pointerSize, allowTrailingPadding) is not { } chain)
                         continue;
 
                     field = chain[^1];
@@ -263,8 +269,10 @@ public static class MetadataResolver
                 if (field == null) // TODO: Support nested fields (Field1.Field2.Field3)
                     continue;
 
-                // A wider access than the field is a copy of several fields at once, which a later pass deals with
-                if (path.Count == 0 && memory.Size > 0 && TypeSizes.StorageSize(field.FieldType, pointerSize) is > 0 and var fieldSize && memory.Size > fieldSize)
+                // A wider access than the field is a copy of several fields at once, which a later pass deals with - unless
+                // what's past the field is only padding (a trailing bool, copied as 8 bytes)
+                if (path.Count == 0 && memory.Size > 0 && TypeSizes.StorageSize(field.FieldType, pointerSize) is > 0 and var fieldSize && memory.Size > fieldSize
+                    && (!allowTrailingPadding || memory.Size > RoomAfter(owner, staticOwner != null, null, memory.Addend, pointerSize)))
                     continue;
 
                 // make sure we have a full GIT for field access. open type is bad.
@@ -335,7 +343,7 @@ public static class MetadataResolver
     /// into an instance of <paramref name="owner"/> (or its static storage), outermost field first. Null if the access
     /// doesn't correspond to a single field. A size of 0 means unknown, and matches any field starting there.
     /// </summary>
-    public static List<FieldAnalysisContext>? FindFieldChain(TypeAnalysisContext owner, bool isStatic, long offset, int size, int pointerSize)
+    public static List<FieldAnalysisContext>? FindFieldChain(TypeAnalysisContext owner, bool isStatic, long offset, int size, int pointerSize, bool allowTrailingPadding = false)
     {
         // a generic base class has no offsets in the metadata: its fields come first, laid out like any generic instance
         TypeAnalysisContext? genericBase = null;
@@ -380,11 +388,27 @@ public static class MetadataResolver
         }
 
         var path = new List<FieldAnalysisContext>();
-        if (!DescendIntoStructField(ref field, path, offset - fieldOffset, size, pointerSize))
+        if (!DescendIntoStructField(ref field, path, offset - fieldOffset, size, pointerSize, allowTrailingPadding ? RoomAfter(owner, isStatic, genericBase, fieldOffset, pointerSize) : -1))
             return null;
 
         path.Add(field);
         return path;
+    }
+
+    // How many bytes there are from a field at fieldOffset to the next field of the owner (or the end of a struct): the
+    // field's own and whatever padding follows it. Only the field's size when that's unknown (the end of a class).
+    private static long RoomAfter(TypeAnalysisContext owner, bool isStatic, TypeAnalysisContext? genericBase, long fieldOffset, int pointerSize)
+    {
+        long? next = null;
+        for (var candidateOwner = owner; candidateOwner != null && candidateOwner != genericBase; candidateOwner = candidateOwner.BaseType)
+            foreach (var f in candidateOwner.Fields)
+                if (f.IsStatic == isStatic && (f.Attributes & FieldAttributes.Literal) == 0 && f.BackingData?.FieldOffset is { } start && start > fieldOffset && (next == null || start < next))
+                    next = start;
+
+        if (next != null)
+            return next.Value - fieldOffset;
+
+        return owner.IsValueType && !isStatic && TypeSizes.UnboxedSize(owner, pointerSize) is > 0 and var size ? size - fieldOffset : 0;
     }
 
     /// <summary>
@@ -392,7 +416,7 @@ public static class MetadataResolver
     /// innermost field actually accessed, recording the enclosing struct fields in <paramref name="path"/>.
     /// Returns false if the access doesn't map onto a field (e.g. it spans several fields - a chunked copy).
     /// </summary>
-    private static bool DescendIntoStructField(ref FieldAnalysisContext field, List<FieldAnalysisContext> path, long offset, int accessSize, int pointerSize)
+    private static bool DescendIntoStructField(ref FieldAnalysisContext field, List<FieldAnalysisContext> path, long offset, int accessSize, int pointerSize, long room)
     {
         for (var depth = 0; depth < 16; depth++)
         {
@@ -402,8 +426,9 @@ public static class MetadataResolver
             if (offset == 0 && (accessSize <= 0 || fieldSize <= 0 || accessSize == fieldSize))
                 return true;
 
+            // the last field of a struct copied along with the padding after it (an 8 byte chunk for a trailing bool)
             if (offset == 0 && accessSize > fieldSize)
-                return false; // spans several fields
+                return accessSize <= room; // else spans several fields
 
             if (!StackStructRecovery.IsStruct(field.FieldType))
                 return offset == 0; // part of a primitive, e.g. the low byte of an int, is still that field
@@ -432,8 +457,14 @@ public static class MetadataResolver
             if (nested == null)
                 return false;
 
+            var nestedStart = nested.BackingData!.FieldOffset;
+            if (room >= 0)
+                room = (structType.Fields.Where(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0 && f.BackingData?.FieldOffset > nestedStart)
+                       .Select(f => (long?)f.BackingData!.FieldOffset).Min()
+                       ?? TypeSizes.UnboxedSize(structType, pointerSize)) - nestedStart;
+
             path.Add(field);
-            offset -= nested.BackingData!.FieldOffset;
+            offset -= nestedStart;
             field = nested;
         }
 

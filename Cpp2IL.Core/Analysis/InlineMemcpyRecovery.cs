@@ -162,6 +162,8 @@ public static class InlineMemcpyRecovery
         // Exactly one way in (the preheader) and one way out (straight into the tail)
         var preheaders = loop.Predecessors.Where(p => p != loop).Distinct().ToList();
         var exits = loop.Successors.Where(s => s != loop).Distinct().ToList();
+        if (exits is [{ } sharedExit] && UnshareReturningTail(graph, loop, sharedExit) is { } ownTail)
+            exits = [ownTail];
         if (preheaders is not [{ } preheader] || exits is not [{ } tail] || tail.Predecessors.Distinct().Count() != 1)
             { Debug?.Invoke($"memcpy loop B{loop.ID} rejected at check 5"); return false; }
 
@@ -195,14 +197,20 @@ public static class InlineMemcpyRecovery
                 break;
 
             // Something else touching the destination pointer, or writing memory, ends the tail - except a stack store
-            // well clear of a stack destination (spilling callee-saved registers, which MSVC likes to interleave)
-            if (Touches(instruction, destination) || instruction.Operands.Count > 0 && instruction.Operands[0] is MemoryOperand
+            // well clear of a stack destination (spilling callee-saved registers, which MSVC likes to interleave), or
+            // a write through a pointer loaded from memory (list._version++ for the Add the copy is for), which can't
+            // point into this frame
+            var stackDestination = SizedOperand(preheader, destination, 0) is StackOffset;
+            if (Touches(instruction, destination)
+                || instruction.Operands.Count > 0 && instruction.Operands[0] is MemoryOperand writtenMemory
+                   && !(stackDestination && writtenMemory.Base is Register { Name: var writtenBase } && writtenMemory.Index == null
+                        && writtenBase != source && IsLoadedPointer(writtenBase, tail, tailEnd, loop, preheader))
                 || instruction.Operands.Count > 0 && instruction.Operands[0] is StackOffset spill
-                   && !(SizedOperand(preheader, destination, 0) is StackOffset copyStart && (spill.Offset >= 0 || spill.Offset >= copyStart.Offset + iterations * stride + 0x80 || spill.Offset + 16 <= copyStart.Offset)))
+                   && !(SizedOperand(preheader, destination, 0) is StackOffset copyStart && (spill.Offset >= 0 || spill.Offset >= copyStart.Offset + iterations * stride + 0x80 || spill.Offset + (spill.Size > 0 ? spill.Size : 16) <= copyStart.Offset)))
                 break;
 
-            // Reading the source pointer other than to copy from it ends it too
-            if (instruction.Sources.Any(o => o is Register r && r.Name == source || o is MemoryOperand { Base: Register { } b } && b.Name == source))
+            // Reading the source pointer other than to copy from it ends it too (once overwritten, it's something else)
+            if (sourceAlive && instruction.Sources.Any(o => o is Register r && r.Name == source || o is MemoryOperand { Base: Register { } b } && b.Name == source))
                 break;
 
             // Clobbering a chunk that's been loaded but not yet stored would lose it
@@ -254,6 +262,57 @@ public static class InlineMemcpyRecovery
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// When the same struct is copied out on several paths that all return straight after, MSVC merges the copies'
+    /// remainders (and the return) into one block the loops all jump to. Gives this loop its own copy of that block,
+    /// in place of <paramref name="exit"/> (when that is just the jump to it) or as a new block after the loop, so the
+    /// remainder can be read as the end of this copy. Null if the tail isn't shared like that.
+    /// </summary>
+    private static Block? UnshareReturningTail(ISILControlFlowGraph graph, Block loop, Block exit)
+    {
+        var jumpOnly = exit.Instructions.Count > 0 && exit.Instructions[^1].OpCode == OpCode.Jump
+                       && exit.Instructions.Take(exit.Instructions.Count - 1).All(i => i.OpCode == OpCode.Nop)
+                       && exit.Successors.Count == 1 && exit.Predecessors.Distinct().Count() == 1;
+
+        var shared = jumpOnly ? exit.Successors[0] : exit;
+        var from = jumpOnly ? exit : loop;
+
+        if (shared == loop || shared.Predecessors.Distinct().Count() < 2 || shared.Instructions.Count is 0 or > 64
+            || shared.Instructions[^1].OpCode != OpCode.Return || shared.Instructions.Any(i => i.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.IndirectJump)
+            || shared.Successors.Any(s => s != graph.ExitBlock))
+            return null;
+
+        var copy = shared.Instructions.Select(i => new Instruction(i.Index, i.OpCode, i.Operands.ToList())
+        {
+            ImplicitDefinition = i.ImplicitDefinition, Unsigned = i.Unsigned, KeepAlive = i.KeepAlive, ReadsLowHalf = i.ReadsLowHalf,
+            ReadsHighHalf = i.ReadsHighHalf, ReadsLowDword = i.ReadsLowDword, ScalarSingle = i.ScalarSingle,
+        }).ToList();
+
+        Block own;
+        if (jumpOnly)
+        {
+            own = exit;
+            own.Instructions.Clear();
+            own.Successors.Clear();
+        }
+        else
+        {
+            own = new Block { ID = graph.Blocks.Max(b => b.ID) + 1 };
+            own.Predecessors.Add(loop);
+            loop.Successors[loop.Successors.IndexOf(shared)] = own;
+            graph.Blocks.Insert(graph.Blocks.IndexOf(loop) + 1, own);
+        }
+
+        own.Instructions.AddRange(copy);
+        own.BlockType = BlockType.Return;
+        own.Successors.Add(graph.ExitBlock);
+        graph.ExitBlock.Predecessors.Add(own);
+        shared.Predecessors.Remove(from);
+
+        Debug?.Invoke($"memcpy loop B{loop.ID}: unshared returning tail B{shared.ID} as B{own.ID}");
+        return own;
     }
 
     private static bool IsFlagInput(IOperand operand, string? counter) => operand switch
@@ -440,6 +499,36 @@ public static class InlineMemcpyRecovery
         }
 
         return new MemoryOperand(new Register(null, register), size: size);
+    }
+
+    // Whether the register holds a pointer read out of memory (an object or one of its fields) at that point in the
+    // tail, going back through the loop, its preheader and the straight line of blocks before it: never the address of
+    // a stack slot
+    private static bool IsLoadedPointer(string register, Block tail, int before, Block loop, Block preheader)
+    {
+        if (register is "rsp" or "rbp")
+            return false;
+
+        var blocks = new List<(Block Block, int End)> { (tail, before), (loop, loop.Instructions.Count) };
+        for (var block = preheader; block != null && blocks.Count < 8; block = block.Predecessors.Distinct().Count() == 1 ? block.Predecessors[0] : null)
+            blocks.Add((block, block.Instructions.Count));
+
+        foreach (var (block, end) in blocks)
+        {
+            for (var i = end - 1; i >= 0; i--)
+            {
+                var instruction = block.Instructions[i];
+                if (instruction.IsCall)
+                    return false;
+
+                if (instruction.Destination is not Register written || written.Name != register)
+                    continue;
+
+                return instruction is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: Register { Name: not ("rsp" or "rbp") } }] };
+            }
+        }
+
+        return false;
     }
 
     private static bool Touches(Instruction instruction, string register)
