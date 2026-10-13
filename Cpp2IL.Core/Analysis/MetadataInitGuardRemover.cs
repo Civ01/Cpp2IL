@@ -142,7 +142,67 @@ public static class MetadataInitGuardRemover
         var guardFlag = guard.Instructions.Select(GuardFlagAddress).FirstOrDefault(a => a != null);
 
         return TryExcise(cfg, guard, first, second, initialisedFlagTest, guardFlag)
-            || TryExcise(cfg, guard, second, first, initialisedFlagTest, guardFlag);
+            || TryExcise(cfg, guard, second, first, initialisedFlagTest, guardFlag)
+            || guardFlag != null && (TryCommitToInitPath(cfg, guard, first, second, guardFlag.Value) || TryCommitToInitPath(cfg, guard, second, first, guardFlag.Value));
+    }
+
+    /// <summary>
+    /// When what follows the guard is short, MSVC duplicates it into both paths rather than rejoining them: the init
+    /// path runs the metadata init, the code after it and sets the flag, the other runs just the code. Both are the same
+    /// code, so keep the init path, without the init and the flag store, and drop the test.
+    /// </summary>
+    private static bool TryCommitToInitPath(ISILControlFlowGraph cfg, Block guard, Block initPath, Block otherPath, long guardFlag)
+    {
+        if (initPath == otherPath || initPath == guard || initPath.Predecessors.Distinct().Count() != 1 || otherPath == cfg.ExitBlock
+            || otherPath.Predecessors.Distinct().Count() == 1 && otherPath.Successors.Any(s => s != cfg.ExitBlock))
+            return false;
+
+        var initCalls = initPath.Instructions.Where(i => i.IsCall && i.Operands is [StringLiteral { Value: InitializeRuntimeMetadata or InitializeMethod }, ..]).ToList();
+        var flagStores = initPath.Instructions.Where(i => i is { OpCode: OpCode.Move, Operands: [MemoryOperand { IsConstant: true } stored, var value] }
+                                                          && stored.Addend == guardFlag && IsOne(value)).ToList();
+        if (initCalls.Count == 0 || flagStores.Count != 1)
+            return false;
+
+        // the init has to come before anything else with an effect (it's the guarded prologue of the duplicated code)
+        var firstEffect = initPath.Instructions.FindIndex(i => i.IsCall && !initCalls.Contains(i) || i.OpCode is OpCode.IndirectCall);
+        if (firstEffect >= 0 && initCalls.Any(c => initPath.Instructions.IndexOf(c) > firstEffect))
+            return false;
+
+        foreach (var removed in initCalls.Concat(flagStores))
+        {
+            removed.OpCode = OpCode.Nop;
+            removed.SetOperands();
+        }
+
+        // the other path loses this way in
+        for (var i = otherPath.Predecessors.Count - 1; i >= 0; i--)
+        {
+            if (otherPath.Predecessors[i] != guard)
+                continue;
+
+            foreach (var phi in otherPath.Instructions)
+                if (phi.OpCode == OpCode.Phi && 1 + i < phi.Operands.Count)
+                    phi.RemoveOperandAt(1 + i);
+
+            otherPath.Predecessors.RemoveAt(i);
+        }
+
+        guard.Successors.Remove(otherPath);
+        var terminator = guard.Instructions[^1];
+        terminator.OpCode = OpCode.Jump;
+        terminator.SetOperands(initPath);
+        guard.CalculateBlockType();
+
+        // left with no way in, it's a returning copy of the init path: gone
+        if (otherPath.Predecessors.Count == 0)
+        {
+            foreach (var successor in otherPath.Successors)
+                successor.Predecessors.Remove(otherPath);
+            otherPath.Successors.Clear();
+            cfg.Blocks.Remove(otherPath);
+        }
+
+        return true;
     }
 
     private static long? GuardFlagAddress(Instruction instruction) =>

@@ -66,16 +66,17 @@ public static class ThrowHelperRecovery
         return callTargets.Any(target => ReachesCall(appContext, target, wanted, depth + 1, visited));
     }
 
-    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth)
+    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth) => ResolveName(appContext, address, depth, []);
+
+    private static string? ResolveName(ApplicationAnalysisContext appContext, ulong address, int depth, HashSet<ulong> visiting)
     {
         if (appContext.ThrowHelperNamesByAddress.TryGetValue(address, out var cached))
             return cached;
 
-        if (address == 0 || depth >= MaxDepth)
+        // Cycles are cut with this walk's own set: a placeholder in the shared cache would be read as "not a throw
+        // helper" by other threads decompiling at the same time
+        if (address == 0 || depth >= MaxDepth || !visiting.Add(address))
             return null;
-
-        // Insert before recursing so a cycle terminates
-        appContext.ThrowHelperNamesByAddress[address] = null;
 
         var (dataReferences, callTargets) = appContext.InstructionSet.InspectPotentialThrowHelper(appContext, address);
 
@@ -85,14 +86,17 @@ public static class ThrowHelperRecovery
         {
             foreach (var target in callTargets)
             {
-                name = ResolveName(appContext, target, depth + 1);
+                name = ResolveName(appContext, target, depth + 1, visiting);
 
                 if (name != null)
                     break;
             }
         }
 
-        appContext.ThrowHelperNamesByAddress[address] = name;
+        // only a complete answer is shared (one cut short by the depth limit or a cycle depends on where the walk began)
+        if (name != null || depth == 0)
+            appContext.ThrowHelperNamesByAddress[address] = name;
+
         return name;
     }
 
