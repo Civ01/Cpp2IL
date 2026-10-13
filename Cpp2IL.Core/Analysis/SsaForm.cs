@@ -54,6 +54,7 @@ public class SsaForm
         if (memorySlots != null)
             ssa._memorySlots = [..memorySlots];
 
+        DelayAddressTakes(graph);
         ssa.FindClobberingAddressTakes(graph);
 
         graph.BuildUseDefLists(ssa._clobbering);
@@ -61,6 +62,47 @@ public class SsaForm
         ssa.CollectRegisters(graph);
         ssa.InsertPhiFunctions(graph, dominatorInfo);
         ssa.Rename(graph.EntryBlock, dominatorInfo);
+    }
+
+    // lea rdx,[rsp+20h] / movaps [rsp+20h],xmm0 / call f: the slot's address is taken before it's filled, so as SSA
+    // versions go the call would be handed the slot as it was before the store, and the store would be dead. Moving the
+    // address-take after the stores (nothing in between reads its register) gives the same program in an order SSA reads right.
+    private static void DelayAddressTakes(ISILControlFlowGraph graph)
+    {
+        foreach (var block in graph.Blocks)
+        {
+            var instructions = block.Instructions;
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if (instructions[i] is not { OpCode: OpCode.Move, Operands: [Register holder, AddressOf { Target: Register slot }] } take)
+                    continue;
+
+                var lastStore = -1;
+                for (var j = i + 1; j < instructions.Count; j++)
+                {
+                    var next = instructions[j];
+                    if (next.IsCall || next.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return or OpCode.IndirectCall or OpCode.IndirectJump)
+                        break;
+                    if (next.Operands.Any(o => o is Register r && r.Name == holder.Name
+                                               || o is MemoryOperand m && (m.Base is Register b && b.Name == holder.Name || m.Index is Register x && x.Name == holder.Name)))
+                        break; // the address is used (or the register reassigned)
+                    if (next.Destination is Register written && written.Name == slot.Name)
+                    {
+                        lastStore = j;
+                        continue;
+                    }
+                    if (next.Operands.Any(o => o is Register r && r.Name == slot.Name || o is AddressOf { Target: Register a } && a.Name == slot.Name))
+                        break; // the slot is read in between: leave the order alone
+                }
+
+                if (lastStore < 0)
+                    continue;
+
+                instructions.RemoveAt(i);
+                instructions.Insert(lastStore, take);
+                i--;
+            }
+        }
     }
 
     // The address-takes whose slot is read again afterwards, and so have to be treated as definitions.

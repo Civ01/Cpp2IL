@@ -78,7 +78,9 @@ public class StackAnalyzer
                 aliasDefinitions.Add(instruction);
             }
             // lea reg, [rsp+x] - MSVC sets up rbp as a frame pointer this way (lea rbp,[rsp-98h]) in larger methods
-            else if (instruction is { OpCode: OpCode.Move, Operands: [Register { Name: not "rsp" } leaDestination, AddressOf { Target: StackOffset frameSlot }] })
+            // (not into an argument register: lea rdx,[rsp+20h] is the address of a struct being passed, and that register
+            // held something else before it, which treating it as the frame everywhere would replace)
+            else if (instruction is { OpCode: OpCode.Move, Operands: [Register { Name: not ("rsp" or "rax" or "rcx" or "rdx" or "r8" or "r9") } leaDestination, AddressOf { Target: StackOffset frameSlot }] })
             {
                 aliases[leaDestination.Name] = atCopy.Size + frameSlot.Offset;
                 aliasDefinitions.Add(instruction);

@@ -133,6 +133,7 @@ public static class StackStructRecovery
             }
         }
 
+        CollapseVectorCopies(graph);
         AddParameterCopyRoots(method, graph, roots);
 
         if (roots.Count == 0)
@@ -306,6 +307,90 @@ public static class StackStructRecovery
 
     // A struct parameter passed by pointer that the method copies into its frame (MSVC copies a by-value struct
     // argument it modifies or keeps): the copy is that struct
+    // movups xmm0,[r9] / movups xmm1,[r9+10h] / lea r9,[rsp+50h] / movaps [rsp+50h],xmm0 / movaps [rsp+60h],xmm1: a 32 byte
+    // copy whose source register is reused before the stores. It becomes one copy where the loads are, as long as
+    // nothing else touches the destination in between.
+    private static void CollapseVectorCopies(ISILControlFlowGraph graph)
+    {
+        foreach (var block in graph.Blocks)
+        {
+            var instructions = block.Instructions;
+            for (var first = 0; first < instructions.Count; first++)
+            {
+                if (instructions[first] is not { OpCode: OpCode.Move, Operands: [Register { Name: var firstVector }, MemoryOperand { Base: Register sourceBase, Index: null, Size: 16 } firstLoad] }
+                    || !firstVector.StartsWith("xmm", System.StringComparison.Ordinal))
+                    continue;
+
+                // the loads from that base (before it's reassigned), then each one's store to the stack
+                var loads = new Dictionary<string, (int Index, long Offset)>();
+                var stores = new List<(int Index, int Slot, long Offset)>();
+                var baseIntact = true;
+                for (var at = first; at < instructions.Count && at < first + 16; at++)
+                {
+                    var instruction = instructions[at];
+                    if (baseIntact && instruction is { OpCode: OpCode.Move, Operands: [Register { Name: var vector }, MemoryOperand { Base: Register b, Index: null, Size: 16 } load] }
+                        && vector.StartsWith("xmm", System.StringComparison.Ordinal) && b.Name == sourceBase.Name && !loads.ContainsKey(vector))
+                    {
+                        loads[vector] = (at, load.Addend);
+                        continue;
+                    }
+
+                    if (instruction is { OpCode: OpCode.Move, Operands: [StackOffset { Size: 16 } slot, Register { Name: var stored }] } && loads.TryGetValue(stored, out var loaded))
+                    {
+                        stores.Add((at, slot.Offset, loaded.Offset));
+                        loads.Remove(stored);
+                        continue;
+                    }
+
+                    if (instruction.Destination is Register { Name: var written })
+                    {
+                        if (written == sourceBase.Name)
+                            baseIntact = false;
+                        if (loads.ContainsKey(written))
+                            break; // a loaded value replaced before it was stored
+                    }
+
+                    if (instruction.IsCall || instruction.OpCode is OpCode.Jump or OpCode.ConditionalJump or OpCode.Return)
+                        break;
+                }
+
+                if (stores.Count < 2 || loads.Count != 0)
+                    continue;
+
+                // one contiguous source range onto one contiguous destination range
+                var ordered = stores.OrderBy(st => st.Offset).ToList();
+                var sourceStart = ordered[0].Offset;
+                var destinationStart = ordered[0].Slot;
+                if (ordered.Select((st, n) => st.Offset == sourceStart + 16 * n && st.Slot == destinationStart + 16 * n).Any(ok => !ok))
+                    continue;
+
+                var size = 16 * ordered.Count;
+                var lastStore = stores.Max(st => st.Index);
+                var storeIndices = stores.Select(st => st.Index).ToHashSet();
+                var touched = false;
+                for (var at = first; at <= lastStore && !touched; at++)
+                {
+                    if (storeIndices.Contains(at))
+                        continue;
+                    // (taking its address in between is fine: that's how it gets passed)
+                    touched = instructions[at].Operands.Any(o => o is StackOffset other && other.Offset < destinationStart + size && other.Offset + Math.Max(other.Size, 1) > destinationStart);
+                }
+                if (touched)
+                    continue;
+
+                foreach (var index in storeIndices)
+                {
+                    instructions[index].OpCode = OpCode.Nop;
+                    instructions[index].SetOperands();
+                }
+
+                instructions.Insert(first, new Instruction(instructions[first].Index, OpCode.Move, new StackOffset(destinationStart, size),
+                    new MemoryOperand(sourceBase, null, sourceStart, 0, size)));
+                first += stores.Count;
+            }
+        }
+    }
+
     private static void AddParameterCopyRoots(MethodAnalysisContext method, ISILControlFlowGraph graph, List<Root> roots)
     {
         var parameterRegisters = new Dictionary<string, TypeAnalysisContext>();
