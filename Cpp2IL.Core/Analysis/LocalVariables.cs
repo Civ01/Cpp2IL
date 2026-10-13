@@ -959,10 +959,12 @@ public static class LocalVariables
             && StackStructRecovery.IsStruct(wholeType) && TypeSizes.StorageSize(wholeType, pointerSize) == wholeSize)
             return SetTypeIfUnknown(wholeDest, wholeType);
 
-        // An element of T[] is a T, whether we loaded it (reference arrays) or only computed its address
+        // An element of T[] is a T, whether we loaded it (reference arrays) or only computed its address - unless less of it
+        // was read than a whole struct element is (a field of it, which array recovery names)
         if (destination is LocalVariable { Type: null } elementDest
             && source is MemoryOperand { Base: LocalVariable { Type: SzArrayTypeAnalysisContext { ElementType: { } elementType } } } elementAccess
-            && (elementAccess.Index != null || elementAccess.Addend >= 4L * pointerSize))
+            && (elementAccess.Index != null || elementAccess.Addend >= 4L * pointerSize)
+            && !(StackStructRecovery.IsStruct(elementType) && elementAccess.Size > 0 && elementAccess.Size < TypeSizes.StorageSize(elementType, pointerSize)))
             return SetTypeIfUnknown(elementDest, elementType);
 
         // the whole value behind a pointer to a primitive or enum (ref/out parameters, unboxed values) is of that type
