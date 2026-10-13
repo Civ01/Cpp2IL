@@ -170,9 +170,21 @@ public static class StackStructRecovery
                 accepted.Add(slots[i]);
         }
 
+        // A slot only ever filled for us (a returned struct, a struct parameter copied in) and only read by us holds the
+        // struct from where it's filled until anything else is written there: MSVC reuses it for other spills before that
+        // and once it's dead (in a loop, too), which aren't the struct's
+        var holding = new Dictionary<Slot, HashSet<Instruction>>();
+        foreach (var slot in accepted.Where(s => s.Instances.All(i => i.Roots.All(r => r is { CalleeReads: false, CalleeWrites: true }))))
+            holding[slot] = HoldingAt(graph, slot);
+
+        bool NotTheStruct(Slot slot, Instruction instruction, bool isWrite)
+            => holding.TryGetValue(slot, out var held)
+               && !slot.Instances.Any(i => i.Roots.Any(r => ReferenceEquals(r.Call, instruction) || ReferenceEquals(r.Definition, instruction)))
+               && (isWrite || !held.Contains(instruction));
         // Which instance each access belongs to. An access straddling a slot boundary means our idea of the layout is
         // wrong, as does taking the address of the middle of one (we can't represent that yet)
         var assignments = new List<(Instruction Instruction, int Operand, Instance Instance, int Start)>();
+        var partlyOther = new HashSet<Slot>();
         foreach (var instruction in graph.Instructions)
         {
             for (var operandIndex = 0; operandIndex < instruction.Operands.Count; operandIndex++)
@@ -185,6 +197,12 @@ public static class StackStructRecovery
                         foreach (var slot in accepted.Where(r => access.Offset < r.End && accessEnd > r.Start).ToList())
                         {
                             var isWrite = operandIndex == 0 && instruction.OpCode == OpCode.Move;
+                            if (NotTheStruct(slot, instruction, isWrite))
+                            {
+                                partlyOther.Add(slot);
+                                continue;
+                            }
+
                             var instance = slot.Instances.Count == 1 ? slot.Instances[0] : Choose(slot, instruction, isWrite, access.Offset, accessEnd);
                             if (instance == null || access.Offset < instance.Start || accessEnd > instance.End)
                             {
@@ -209,7 +227,10 @@ public static class StackStructRecovery
                             }
 
                             if (slot.Instances.Count == 1)
-                                continue; // becomes the address of the slot register as usual
+                            {
+                                assignments.Add((instruction, operandIndex, slot.Instances[0], slot.Start));
+                                continue;
+                            }
 
                             var owner = slot.Instances.FirstOrDefault(i => i.Roots.Any(r => r.Definition == instruction));
                             if (owner == null)
@@ -230,6 +251,16 @@ public static class StackStructRecovery
 
         if (accepted.Count == 0)
             return;
+
+        // the slot's own name stays with those other uses of it
+        var renamed = new Dictionary<Instance, Instance>();
+        foreach (var slot in accepted.Where(partlyOther.Contains))
+            for (var i = 0; i < slot.Instances.Count; i++)
+                if (slot.Instances[i].Name == StackAnalyzer.NameForSlot(new StackOffset(slot.Start)))
+                    slot.Instances[i] = renamed[slot.Instances[i]] = slot.Instances[i] with { Name = slot.Instances[i].Name + "_0" };
+
+        if (renamed.Count > 0)
+            assignments = assignments.Select(a => renamed.TryGetValue(a.Instance, out var to) ? a with { Instance = to } : a).ToList();
 
         foreach (var (instruction, operandIndex, instance, slotStart) in assignments)
         {
@@ -526,6 +557,55 @@ public static class StackStructRecovery
             Debug?.Invoke($"return copy root {start:X} {method.ReturnType}");
             roots.Add(new Root(start, method.ReturnType, copies[0].Store, copies[0].Store, true, false));
         }
+    }
+
+    // The instructions before which the slot holds what its roots filled it with: on every path there, one of them filled
+    // it and nothing wrote to it since
+    private static HashSet<Instruction> HoldingAt(ISILControlFlowGraph graph, Slot slot)
+    {
+        var fills = slot.Instances.SelectMany(i => i.Roots).SelectMany(r => new[] { r.Call, r.Definition }).ToHashSet();
+
+        bool Overwrites(Instruction instruction)
+            => instruction.Destination is StackOffset written && written.Offset < slot.End && written.Offset + Math.Max(written.Size, 1) > slot.Start;
+
+        bool Transfer(Block block, bool holds, HashSet<Instruction>? record)
+        {
+            foreach (var instruction in block.Instructions)
+            {
+                if (holds)
+                    record?.Add(instruction);
+
+                if (fills.Contains(instruction))
+                    holds = true;
+                else if (Overwrites(instruction))
+                    holds = false;
+            }
+
+            return holds;
+        }
+
+        // must-hold, so start from everything holding and only ever drop
+        var holdsOut = graph.Blocks.ToDictionary(b => b, _ => true);
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var block in graph.Blocks)
+            {
+                var holdsIn = block.Predecessors.Count > 0 && block.Predecessors.All(p => holdsOut[p]);
+                var after = Transfer(block, holdsIn, null);
+                if (after != holdsOut[block])
+                {
+                    holdsOut[block] = after;
+                    changed = true;
+                }
+            }
+        }
+
+        var holding = new HashSet<Instruction>();
+        foreach (var block in graph.Blocks)
+            Transfer(block, block.Predecessors.Count > 0 && block.Predecessors.All(p => holdsOut[p]), holding);
+
+        return holding;
     }
 
     // A slot reused for several structs: one instance per use, except that consecutive uses as the same type are the same
