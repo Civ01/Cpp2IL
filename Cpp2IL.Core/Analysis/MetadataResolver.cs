@@ -281,6 +281,51 @@ public static class MetadataResolver
         return changed;
     }
 
+    /// <summary>
+    /// <c>lea rcx,[obj+38h]</c> is the address of the field at that offset (passed as a ref or out argument, typically):
+    /// <c>Add x, obj, 0x38</c> becomes <c>Move x, &amp;obj.field</c>.
+    /// </summary>
+    public static bool ResolveFieldAddresses(MethodAnalysisContext method)
+    {
+        var changed = false;
+        var pointerSize = method.AppContext.Binary.PointerSizeBytes;
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Add, Operands: [LocalVariable destination, LocalVariable { Type: { } baseType } owner, Immediate { Value: > 0 and < 0x10000 } offset] })
+                continue;
+
+            // a reference type's own fields, or those of the struct a managed pointer points at
+            var ownerType = baseType is ByRefTypeAnalysisContext { ElementType: { IsValueType: true } referent } ? referent : baseType;
+            if (ownerType is SzArrayTypeAnalysisContext or PointerTypeAnalysisContext or ByRefTypeAnalysisContext or GenericParameterTypeAnalysisContext
+                    or RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext or RuntimeMethodInfoAnalysisContext or RuntimeFieldInfoAnalysisContext
+                || IsPrimitiveOrEnum(ownerType) || ownerType.FullName is "System.String" or "System.Object"
+                || !ownerType.IsValueType && offset.Value < 2 * pointerSize
+                || ownerType.IsValueType && baseType is not ByRefTypeAnalysisContext)
+                continue;
+
+            var chain = ownerType is GenericInstanceTypeAnalysisContext generic
+                ? GenericInstanceFieldLayout.FindFieldChain(generic, offset.Value, 0, pointerSize)
+                : ownerType.GenericParameters.Count > 0
+                    ? GenericInstanceFieldLayout.FindFieldChainOpen(ownerType, offset.Value, 0, pointerSize)
+                    : FindFieldChain(ownerType, false, offset.Value, 0, pointerSize);
+            if (chain == null)
+                continue;
+
+            // the start of the (innermost) field, not somewhere inside it
+            var field = chain[^1];
+            if (ownerType is GenericInstanceTypeAnalysisContext genericOwner && field is not ConcreteGenericFieldAnalysisContext && chain.Count == 1)
+                field = new ConcreteGenericFieldAnalysisContext(field, genericOwner);
+
+            instruction.OpCode = OpCode.Move;
+            instruction.SetOperands(destination, new AddressOf(new FieldReference(field, owner, (int)offset.Value) { Path = chain.GetRange(0, chain.Count - 1) }));
+            destination.Type = field.FieldType.MakeByReferenceType();
+            changed = true;
+        }
+
+        return changed;
+    }
+
     internal static bool IsPrimitiveOrEnum(TypeAnalysisContext type) =>
         type.IsEnumType || type.Namespace == "System" && type.Name is "Boolean" or "Byte" or "SByte" or "Int16" or "UInt16" or "Char"
             or "Int32" or "UInt32" or "Int64" or "UInt64" or "Single" or "Double" or "IntPtr" or "UIntPtr";
