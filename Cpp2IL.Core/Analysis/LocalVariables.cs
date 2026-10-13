@@ -305,19 +305,32 @@ public static class LocalVariables
                 definitions[defined] = instruction;
         }
 
-        // a loop counter: counter = phi(small constant, counter +- small constant), nowhere used to address memory
+        // a loop counter: counter = phi(small constant, counter +- small constant), never a pointer itself (an index into
+        // an array is what a counter is for)
         bool IsCounter(LocalVariable local) =>
-            !addressing.Contains(local) && definitions.TryGetValue(local, out var phi) && phi.OpCode == OpCode.Phi
+            !pointers.Contains(local) && definitions.TryGetValue(local, out var phi) && phi.OpCode == OpCode.Phi
             && phi.Operands.Skip(1).All(input => input switch
             {
                 Immediate { Value: >= int.MinValue and <= int.MaxValue } => true,
                 LocalVariable step when ReferenceEquals(step, local) => true,
-                LocalVariable step when !addressing.Contains(step) && definitions.TryGetValue(step, out var stepDefinition)
+                LocalVariable step when !pointers.Contains(step) && definitions.TryGetValue(step, out var stepDefinition)
                                         && stepDefinition is { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable stepped, Immediate { Value: >= -0x10000 and <= 0x10000 }] }
                                         && ReferenceEquals(stepped, local) => true,
                 LocalVariable { Type: { FullName: "System.Int32" } } => true,
+                // the start value, set from a constant, maybe through copies (not typed yet, as this is what types it)
+                LocalVariable { Type: null } start => StartsSmall(start, 0),
                 _ => false,
             });
+
+        bool StartsSmall(LocalVariable local, int depth) =>
+            depth < 4 && definitions.TryGetValue(local, out var definition) && definition is { OpCode: OpCode.Move, Operands: [_, var from] }
+            && from switch
+            {
+                Immediate { Value: >= int.MinValue and <= int.MaxValue } => true,
+                LocalVariable { Type: { FullName: "System.Int32" } } => true,
+                LocalVariable { Type: null } copied => StartsSmall(copied, depth + 1),
+                _ => false
+            };
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
