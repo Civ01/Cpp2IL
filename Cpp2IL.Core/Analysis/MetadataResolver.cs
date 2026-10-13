@@ -970,6 +970,19 @@ public static class MetadataResolver
             if (instruction.OpCode != OpCode.IndirectCall)
                 continue;
 
+            // MethodInfo::methodPointer / virtualMethodPointer of a known method (full generic sharing calls what the
+            // rgctx names that way): a call to that method, which also gets its MethodInfo as the hidden last argument
+            if (SlotLoad(instruction.Operands[0]) is { Index: null, Addend: var pointerOffset } methodPointer && (pointerOffset == 0 || pointerOffset == pointerSize)
+                && methodPointer.Base is LocalVariable { Type: RuntimeMethodInfoAnalysisContext { RepresentedMethod: { } called } }
+                && !ReferenceEquals(called, method))
+            {
+                instruction.OpCode = OpCode.Call;
+                instruction.SetOperand(0, called);
+                called.AppContext.InstructionSet.CallingConventionResolver?.RemapRawArguments(instruction, called);
+                changed = true;
+                continue;
+            }
+
             if (SlotLoad(instruction.Operands[0]) is not { } target
                 || target.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } receiverType } } klassLocal)
                 continue;

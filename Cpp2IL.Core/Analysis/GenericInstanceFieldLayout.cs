@@ -205,9 +205,16 @@ public static class GenericInstanceFieldLayout
 
     private static bool HasInstanceFields(TypeAnalysisContext type)
     {
+        // an instance of a generic class has neither fields nor a base of its own: its definition does
         for (var current = type; current != null; current = current.BaseType)
+        {
+            if (current is GenericInstanceTypeAnalysisContext instance)
+                current = instance.GenericType;
+
             if (current.Fields.Any(f => !f.IsStatic))
                 return true;
+        }
+
         return false;
     }
 

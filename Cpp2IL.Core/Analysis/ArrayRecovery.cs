@@ -35,6 +35,20 @@ public static class ArrayRecovery
     {
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
 
+        // a local typed only as System.Array (by the Array.Copy it's passed to) that holds an element of an array of
+        // arrays is that element's array type, which is what has a length and elements to recover
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { FullName: "System.Array" } } plain, var source] }
+                && source switch
+                {
+                    ArrayAccess { Array.Type: SzArrayTypeAnalysisContext { ElementType: SzArrayTypeAnalysisContext element } } => element,
+                    LocalVariable { Type: SzArrayTypeAnalysisContext copied } => copied,
+                    _ => null,
+                } is { } precise)
+                plain.Type = precise;
+        }
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             RecoverAllocation(instruction);
@@ -329,6 +343,10 @@ public static class ArrayRecovery
         if (!instruction.IsCall || instruction.Operands is not [StringLiteral { Value: var name }, LocalVariable result, TypeAnalysisContext type, { } length, ..]
             || !ArrayNewFunctions.Contains(name))
             return;
+
+        // the array class from the rgctx (shared generic code) is Il2CppClass<T[]>, the array is a T[]
+        if (type is RuntimeClassTypeAnalysisContext { RepresentedType: SzArrayTypeAnalysisContext arrayClass })
+            type = arrayClass;
 
         instruction.OpCode = OpCode.NewArr;
         instruction.SetOperands(result, type, length);

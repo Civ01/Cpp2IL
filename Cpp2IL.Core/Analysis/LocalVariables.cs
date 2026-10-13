@@ -253,6 +253,10 @@ public static class LocalVariables
         if (MetadataResolver.GuessAmbiguousCalls(method))
             RunTypeAndFieldFixpoint(method);
 
+        // a struct read through one of several pointers (a static field's, a returned value's) reads each of them
+        if (PointerPhiLoads.Run(method))
+            RunTypeAndFieldFixpoint(method);
+
         // chunks which together copy a whole struct are that struct's copy, before they're taken apart by field
         StructCopyRecovery.Run(method);
 

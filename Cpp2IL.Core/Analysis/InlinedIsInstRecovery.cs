@@ -113,49 +113,78 @@ public static class InlinedIsInstRecovery
         }
     }
 
-    // The last write to a register before the given point, in this block or back through single predecessors
+    // The last write to a register before the given point, in this block or back through its predecessors - when they
+    // meet at a join, the same write must reach along every path (a class loaded once and tested against several types)
     private static Instruction? Trace(ISILControlFlowGraph graph, Block block, int before, string register)
+        => Trace(block, before, register, 0, new Dictionary<Block, Instruction?>());
+
+    // reaching: per block, the write reaching its end (null while that's being worked out, i.e. around a loop)
+    private static Instruction? Trace(Block block, int before, string register, int depth, Dictionary<Block, Instruction?> reaching)
     {
-        for (var depth = 0; depth < 4; depth++)
+        for (var i = before - 1; i >= 0; i--)
+            if (block.Instructions[i].Destination is Register written && written.Name == register)
+                return block.Instructions[i];
+
+        var predecessors = block.Predecessors.Distinct().Where(p => p != block).ToList();
+        if (depth >= 8 || predecessors.Count == 0)
+            return null;
+
+        Instruction? found = null;
+        foreach (var predecessor in predecessors)
         {
-            for (var i = before - 1; i >= 0; i--)
-                if (block.Instructions[i].Destination is Register written && written.Name == register)
-                    return block.Instructions[i];
-
-            var predecessors = block.Predecessors.Distinct().ToList();
-            if (predecessors is not [{ } only] || only == block)
-                return null;
-
-            block = only;
-            before = block.Instructions.Count;
-        }
-
-        return null;
-    }
-
-    // Whether the register is written anywhere on the (single-predecessor) path from 'from' up to the point
-    private static bool RedefinedBetween(ISILControlFlowGraph graph, Instruction from, Block block, int before, string register)
-    {
-        for (var depth = 0; depth < 4; depth++)
-        {
-            for (var i = before - 1; i >= 0; i--)
+            Instruction? fromPredecessor;
+            if (reaching.TryGetValue(predecessor, out var known))
             {
-                var instruction = block.Instructions[i];
-                if (ReferenceEquals(instruction, from))
-                    return false;
+                if (known == null)
+                    continue; // back round a loop to where we started: the other paths decide
+                fromPredecessor = known;
+            }
+            else
+            {
+                reaching[predecessor] = null;
+                fromPredecessor = Trace(predecessor, predecessor.Instructions.Count, register, depth + 1, reaching);
+                if (fromPredecessor == null)
+                {
+                    reaching.Remove(predecessor);
+                    return null;
+                }
 
-                if (instruction.Destination is Register written && written.Name == register)
-                    return true;
+                reaching[predecessor] = fromPredecessor;
             }
 
-            var predecessors = block.Predecessors.Distinct().ToList();
-            if (predecessors is not [{ } only] || only == block)
-                return true;
+            if (found != null && !ReferenceEquals(found, fromPredecessor))
+                return null;
 
-            block = only;
-            before = block.Instructions.Count;
+            found = fromPredecessor;
         }
 
-        return true;
+        return found;
+    }
+
+    // Whether the register is written anywhere on a path from 'from' up to the point
+    private static bool RedefinedBetween(ISILControlFlowGraph graph, Instruction from, Block block, int before, string register)
+        => RedefinedBetween(from, block, before, register, 0, []);
+
+    private static bool RedefinedBetween(Instruction from, Block block, int before, string register, int depth, HashSet<Block> visited)
+    {
+        for (var i = before - 1; i >= 0; i--)
+        {
+            var instruction = block.Instructions[i];
+            if (ReferenceEquals(instruction, from))
+                return false;
+
+            if (instruction.Destination is Register written && written.Name == register)
+                return true;
+        }
+
+        var predecessors = block.Predecessors.Distinct().ToList();
+        if (depth >= 6 || predecessors.Count == 0)
+            return true;
+
+        // a block already walked (a loop, or two paths meeting) adds nothing new
+        if (!visited.Add(block))
+            return false;
+
+        return predecessors.Any(p => p == block || RedefinedBetween(from, p, p.Instructions.Count, register, depth + 1, visited));
     }
 }
