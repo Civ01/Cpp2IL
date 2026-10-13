@@ -418,6 +418,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
         DebugPassCallback?.Invoke(this, "DeadCodeEliminator.Run");
 
+        // a value just tested for 0 is 0 the way the test was true (x == null ? 0 : x.Count returns x there)
+        ZeroOnTestedPath.Run(this);
+        DebugPassCallback?.Invoke(this, "ZeroOnTestedPath.Run");
+
         // Resolve call targets, strings and getters, then run the combined type-propagation and
         // field-resolution fixpoint - all while still in SSA form, so every local is
         // single-assignment and a type, once known, is stable for that value.
