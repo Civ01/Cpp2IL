@@ -133,6 +133,9 @@ public static class IlGenerator
         body.Instructions.Add(CilOpCodes.Ldstr, "-------------------------------------------------------------------------");
         body.Instructions.Add(CilOpCodes.Call, _importer!.ImportMethod(_writeLine!)); */
 
+        _constructorCalls = null;
+        PairConstructorCalls(context);
+
         // Generate IL
         Dictionary<Instruction, List<CilInstruction>> instructionMap = [];
         Dictionary<Block, CilInstruction> blockEntryMap = [];
@@ -339,6 +342,8 @@ public static class IlGenerator
                 regionIl[outer].AddRange(added);
         }
 
+        _constructorCalls = null;
+
         // Add analysis warnings
         var instructions = body.Instructions;
         foreach (var warning in context.AnalysisWarnings)
@@ -515,6 +520,17 @@ public static class IlGenerator
                 break;
 
             case OpCode.Move:
+                // a class or its static storage, as runtime pointers: IL reaches statics and types by name, so there's
+                // nothing to keep (what reads them handles the type themselves)
+                if (instruction.Operands[0] is LocalVariable { Type: RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext }
+                    && instruction.Operands[1] is TypeAnalysisContext
+                        or LocalVariable { Type: RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext }
+                        or MemoryOperand { Base: LocalVariable { Type: RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext or MethodRgctxTableTypeAnalysisContext } })
+                {
+                    instructions.Add(CilOpCodes.Nop);
+                    break;
+                }
+
                 if (instruction.Operands[0] is FieldReference field) // stfld takes instance before value so LoadOperand StoreToOperand doesn't work
                 {
                     var isStaticStore = LoadFieldContainer(field, method, locals);
@@ -921,8 +937,29 @@ public static class IlGenerator
     private static int ConstructorReceiverIndex(Instruction constructorCall) => constructorCall.OpCode == OpCode.CallVoid ? 1 : 2;
 
     // Try find the follow up CallVoid for a constructor, after a Newobj.
+    // Each allocation's constructor call, taken out of the code before any IL is emitted (it may well be in a block that
+    // is emitted before the allocation's own)
+    [System.ThreadStatic] private static Dictionary<Instruction, Instruction>? _constructorCalls;
+
+    private static void PairConstructorCalls(MethodAnalysisContext context)
+    {
+        _constructorCalls = [];
+        foreach (var newobj in context.ControlFlowGraph!.Instructions.Where(i => i.OpCode == OpCode.Newobj).ToList())
+        {
+            if (FindConstructorCall(context, newobj) is not { } call)
+                continue;
+
+            _constructorCalls[newobj] = new Instruction(call.Index, call.OpCode, call.Operands.ToList());
+            call.OpCode = OpCode.Nop;
+            call.SetOperands();
+        }
+    }
+
     private static Instruction? FindConstructorCall(MethodAnalysisContext context, Instruction newobj)
     {
+        if (_constructorCalls != null && _constructorCalls.TryGetValue(newobj, out var paired))
+            return paired;
+
         var newObject = newobj.Operands[0];
 
         // The allocation and the constructor call routinely end up in different blocks
@@ -1131,6 +1168,10 @@ public static class IlGenerator
             case StringLiteral s:
                 instructions.Add(CilOpCodes.Ldstr, s.Value);
                 break;
+            // a class held in a local, where a type handle or a Type is wanted: typeof(T)
+            case LocalVariable { Type: RuntimeClassTypeAnalysisContext classLocal } when expectedType?.FullName is "System.RuntimeTypeHandle" or "System.Type":
+                LoadOperand(classLocal, method, locals, writeLine, expectedType);
+                break;
             case LocalVariable local:
                 LoadLocal(local, method, locals);
                 break;
@@ -1246,6 +1287,16 @@ public static class IlGenerator
 
                 instructions.Add(CilOpCodes.Ldc_I4_0);
                 instructions.Add(CilOpCodes.Conv_I);
+                break;
+            // a class where a type handle (Type.GetTypeFromHandle's argument) or a Type is wanted is typeof(T)
+            case RuntimeClassTypeAnalysisContext { RepresentedType: { } handled } when expectedType?.FullName is "System.RuntimeTypeHandle" or "System.Type":
+                instructions.Add(CilOpCodes.Ldtoken, handled.ToTypeSignature().ToTypeDefOrRef());
+                if (expectedType.FullName == "System.Type")
+                {
+                    var scope = module.CorLibTypeFactory.CorLibScope;
+                    instructions.Add(CilOpCodes.Call, scope.CreateTypeReference("System", "Type").CreateMemberReference("GetTypeFromHandle", MethodSignature.CreateStatic(
+                        scope.CreateTypeReference("System", "Type").ToTypeSignature(false), [scope.CreateTypeReference("System", "RuntimeTypeHandle").ToTypeSignature(true)])));
+                }
                 break;
             case RuntimeClassTypeAnalysisContext or RgctxTableTypeAnalysisContext
                 or MethodRgctxTableTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext:

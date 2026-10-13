@@ -128,6 +128,42 @@ public static class GenericInstanceFieldLayout
         return null;
     }
 
+    /// <summary>
+    /// The static field of a generic type (or of an instance of one) at <paramref name="targetOffset"/> into its static
+    /// storage, laid out sequentially as the metadata has no offsets for it; whole fields only. Type parameters are sized
+    /// as references, as in shared code.
+    /// </summary>
+    public static FieldAnalysisContext? FindStaticField(TypeAnalysisContext owner, long targetOffset, int size, int pointerSize)
+    {
+        var instance = owner as GenericInstanceTypeAnalysisContext;
+        var definition = instance?.GenericType ?? owner;
+        var arguments = instance != null ? SizingArguments(instance, true) : null;
+
+        long offset = 0;
+        foreach (var field in definition.Fields)
+        {
+            if (!field.IsStatic || (field.Attributes & System.Reflection.FieldAttributes.Literal) != 0
+                || field.CustomAttributes?.Any(a => a.Constructor.DeclaringType?.Name == "ThreadStaticAttribute") == true)
+                continue;
+
+            var sizing = field.FieldType is GenericParameterTypeAnalysisContext && arguments == null
+                ? ((long)pointerSize, (long)pointerSize)
+                : TypeSizes.SizeAndAlignment(field.FieldType, pointerSize, arguments, 0);
+            if (sizing is not var (fieldSize, alignment))
+                return null;
+
+            offset = (offset + alignment - 1) & ~(alignment - 1);
+            if (offset == targetOffset)
+                return size == 0 || size <= fieldSize ? (instance != null ? new ConcreteGenericFieldAnalysisContext(field, instance) : field) : null;
+            if (offset > targetOffset)
+                return null;
+
+            offset += fieldSize;
+        }
+
+        return null;
+    }
+
     // The base type of a generic definition is written in terms of the definition's own parameters
     private static GenericInstanceTypeAnalysisContext? BaseAsSeenBy(TypeAnalysisContext baseType, List<TypeAnalysisContext>? arguments)
     {

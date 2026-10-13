@@ -396,6 +396,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         StackAnalyzer.Analyze(this);
         DebugPassCallback?.Invoke(this, "StackAnalyzer.Analyze");
 
+        // calls MSVC merged across branches that each picked a different target
+        CallTailDuplication.Run(this);
+        DebugPassCallback?.Invoke(this, "CallTailDuplication.Run");
+
         // Dominator info must be computed after stack analysis, which removes unreachable/empty
         // blocks and would otherwise leave the dominator tree out of sync with the graph SSA sees.
         DominatorInfo = new DominatorInfo(ControlFlowGraph);
@@ -543,6 +547,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // Inlined trivial getters of the class libraries (list._size, enumerator._current) back to the property
         InlinedPropertyRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "InlinedPropertyRecovery.Run");
+
+        // full generic sharing's expansion of boxing a T, and branches left doing nothing
+        SharedGenericCleanup.Run(this);
+        DebugPassCallback?.Invoke(this, "SharedGenericCleanup.Run");
 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
