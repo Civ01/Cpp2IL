@@ -544,6 +544,7 @@ public static class LocalVariables
     public static bool TypeAddressedLocals(MethodAnalysisContext method)
     {
         var changed = false;
+        Dictionary<LocalVariable, List<Instruction>>? definitions = null;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -573,12 +574,68 @@ public static class LocalVariables
                 // a struct passed by value travels as a pointer to a copy (win64), which is a local of that struct type
                 else if (instruction.Operands[i] is AddressOf { Target: LocalVariable copy }
                          && calledMethod.Parameters[parameterIndex].ParameterType is { } valueType && StackStructRecovery.IsStruct(valueType))
-                    changed |= SetTypeIfUnknown(copy, valueType);
+                {
+                    if (copy.Type != null && copy.Type != valueType)
+                        changed |= RetypeWholeCopy(method, copy, valueType, ref definitions);
+                    else
+                        changed |= SetTypeIfUnknown(copy, valueType);
+                }
             }
         }
 
         return changed;
     }
+
+    // movups xmm0,[rbp] / movups [rsp+20h],xmm0 / lea r8,[rsp+20h]: the copy of a whole struct, made to pass it by value,
+    // which reads as its first field (the low half of the vector load) once fields resolve. What's passed says it is
+    // the struct, so a copy defined only by the first field of a struct of that type is a copy of that struct.
+    private static bool RetypeWholeCopy(MethodAnalysisContext method, LocalVariable copy, TypeAnalysisContext structType, ref Dictionary<LocalVariable, List<Instruction>>? definitions)
+    {
+        if (definitions == null)
+        {
+            definitions = new Dictionary<LocalVariable, List<Instruction>>();
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+                if (instruction.Destination is LocalVariable defined)
+                {
+                    if (!definitions.TryGetValue(defined, out var list))
+                        definitions[defined] = list = [];
+                    list.Add(instruction);
+                }
+        }
+
+        if (!definitions.TryGetValue(copy, out var copyDefinitions) || copyDefinitions is not [{ OpCode: OpCode.Move, Operands: [_, FieldReference { Local: { } owner } first] } definition])
+            return false;
+
+        var chain = first.Chain.ToList();
+        IOperand? whole = null;
+        for (var start = 0; start < chain.Count && whole == null; start++)
+        {
+            // everything from here inwards has to be the first field of its struct
+            if (!chain.Skip(start).All(IsFirstInstanceField))
+                continue;
+
+            if (start == 0)
+            {
+                if (owner.Type == structType)
+                    whole = owner;
+                else if (owner.Type is ByRefTypeAnalysisContext { ElementType: var pointee } && pointee == structType)
+                    whole = new MemoryOperand(owner, size: (int)TypeSizes.StorageSize(structType, method.AppContext.Binary.PointerSizeBytes));
+            }
+            else if (chain[start - 1].FieldType == structType)
+                whole = new FieldReference(chain[start - 1], owner, first.Offset) { Path = chain.GetRange(0, start - 1) };
+        }
+
+        if (whole == null)
+            return false;
+
+        definition.SetOperand(1, whole);
+        copy.Type = structType;
+        return true;
+    }
+
+    private static bool IsFirstInstanceField(FieldAnalysisContext field)
+        => field.DeclaringType.Fields.Where(f => !f.IsStatic && (f.Attributes & System.Reflection.FieldAttributes.Literal) == 0)
+            .OrderBy(f => f.Offset).FirstOrDefault() == field;
 
     // Fills in a local's type only when it is currently unknown, keeping propagation monotonic (a
     // type, once set, is never changed) so the fixpoint terminates. Returns whether it set anything.

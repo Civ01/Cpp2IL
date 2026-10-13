@@ -1,3 +1,4 @@
+using System.Linq;
 using System;
 using System.Collections.Generic;
 using Cpp2IL.Core.ISIL;
@@ -36,8 +37,18 @@ public class X64CallingConventionResolver : BaseCallingConventionResolver
             return false;
 
         var size = TypeSizes.UnboxedSize(returnType, ptrSize);
+
+        // a generic struct over type parameters (List<T>.Enumerator, as the shared code sees it): sized with the parameters
+        // as references, which is what any instantiation with at least two fields comes to at least
+        if (size == 0 && returnType is GenericInstanceTypeAnalysisContext { GenericType: var genericDefinition } openInstance
+            && openInstance.GenericArguments.Any(a => a is GenericParameterTypeAnalysisContext))
+        {
+            var asReferences = openInstance.GenericArguments.Select(a => a is GenericParameterTypeAnalysisContext ? ctx.AppContext.SystemTypes.SystemObjectType : a).ToList();
+            size = TypeSizes.SizeAndAlignment(new GenericInstanceTypeAnalysisContext(genericDefinition, asReferences), ptrSize, null, 0)?.Size ?? 0;
+        }
+
         if (size == 0)
-            return false; // unknown size (e.g. generic): assume a register return
+            return false; // unknown size: assume a register return
 
         return ctx.AppContext.Binary is PE ? size is not (1 or 2 or 4 or 8) : size > 16;
     }
