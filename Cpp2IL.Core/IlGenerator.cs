@@ -743,6 +743,120 @@ public static class IlGenerator
         };
     }
 
+    /// <summary>
+    /// Loads a constant the compiler placed in read-only data and reads at an absolute address: a float or integer, or
+    /// a small struct of them (a Color or Vector4 literal, read as one 16 byte vector), built with the struct's
+    /// constructor when it has one taking every field in order, else field by field. The value is only knowable from
+    /// what it's used as, so needs <paramref name="expectedType"/>.
+    /// </summary>
+    private static bool TryLoadReadOnlyConstant(MemoryOperand memory, TypeAnalysisContext? expectedType, MethodDefinition method,
+        Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine)
+    {
+        if (memory is not { Base: null, Index: null } || expectedType == null || expectedType is ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+            return false;
+
+        var binary = expectedType.AppContext.Binary;
+        var address = (ulong)memory.Addend;
+
+        if (!binary.IsReadOnlyDataAddress(address))
+            return false;
+
+        byte[] Read(long offset, int count)
+        {
+            var raw = binary.MapVirtualAddressToRaw(address + (ulong)offset, false);
+            var content = binary.GetRawBinaryContent();
+            return raw <= 0 || raw + count > content.Length ? [] : content.Slice((int)raw, count).ToArray();
+        }
+
+        if (ReadOnlyScalar(expectedType, 0, Read) is { } scalar)
+        {
+            // the read must cover the value (a 16 byte vector read used as a float is its first lane)
+            if (memory.Size > 0 && memory.Size < Utils.TypeSizes.StorageSize(expectedType, binary.PointerSizeBytes))
+                return false;
+
+            LoadOperand(scalar, method, locals, writeLine, expectedType);
+            return true;
+        }
+
+        if (!StackStructRecovery.IsStruct(expectedType) || expectedType is GenericInstanceTypeAnalysisContext)
+            return false;
+
+        var pointerSize = binary.PointerSizeBytes;
+        var size = Utils.TypeSizes.StorageSize(expectedType, pointerSize);
+        if (size <= 0 || size > 16 || memory.Size > 0 && memory.Size < size)
+            return false;
+
+        var fields = expectedType.Fields.Where(f => !f.IsStatic && (f.Attributes & FieldAttributes.Literal) == 0).ToList();
+        var values = new List<IOperand>();
+        foreach (var field in fields)
+        {
+            if (field.BackingData?.FieldOffset is not { } offset || ReadOnlyScalar(field.FieldType, offset, Read) is not { } value)
+                return false;
+            values.Add(value);
+        }
+
+        if (values.Count == 0)
+            return false;
+
+        var instructions = method.CilMethodBody!.Instructions;
+        var constructor = expectedType.Methods.FirstOrDefault(m => m is { IsStatic: false, Name: ".ctor" } && m.Parameters.Count == fields.Count
+            && m.Parameters.Select(p => p.ParameterType.FullName).SequenceEqual(fields.Select(f => f.FieldType.FullName)));
+
+        if (constructor != null)
+        {
+            for (var i = 0; i < values.Count; i++)
+                LoadOperand(values[i], method, locals, writeLine, fields[i].FieldType);
+            instructions.Add(CilOpCodes.Newobj, constructor.ToMethodDescriptor());
+            return true;
+        }
+
+        var structType = expectedType.ToTypeSignature().ToTypeDefOrRef();
+        var temporary = new CilLocalVariable(expectedType.ToTypeSignature());
+        method.CilMethodBody.LocalVariables.Add(temporary);
+        instructions.Add(CilOpCodes.Ldloca, temporary);
+        instructions.Add(CilOpCodes.Initobj, structType);
+        for (var i = 0; i < values.Count; i++)
+        {
+            instructions.Add(CilOpCodes.Ldloca, temporary);
+            LoadOperand(values[i], method, locals, writeLine, fields[i].FieldType);
+            instructions.Add(CilOpCodes.Stfld, fields[i].ToFieldDescriptor());
+        }
+        instructions.Add(CilOpCodes.Ldloc, temporary);
+        return true;
+    }
+
+    private static IOperand? ReadOnlyScalar(TypeAnalysisContext type, long offset, System.Func<long, int, byte[]> read)
+    {
+        var underlying = type.IsEnumType ? type.EnumUnderlyingType : type;
+        if (underlying is not { Namespace: "System" })
+            return null;
+
+        var size = underlying.Name switch
+        {
+            "Single" or "Int32" or "UInt32" => 4,
+            "Double" or "Int64" or "UInt64" => 8,
+            "Int16" or "UInt16" or "Char" => 2,
+            "Byte" or "SByte" or "Boolean" => 1,
+            _ => 0,
+        };
+
+        if (size == 0 || read(offset, size) is not { Length: > 0 } bytes)
+            return null;
+
+        return underlying.Name switch
+        {
+            "Single" => new FloatLiteral(System.BitConverter.ToSingle(bytes, 0)),
+            "Double" => new DoubleLiteral(System.BitConverter.ToDouble(bytes, 0)),
+            "Int32" => new Immediate(System.BitConverter.ToInt32(bytes, 0)),
+            "UInt32" => new Immediate(System.BitConverter.ToUInt32(bytes, 0)),
+            "Int64" or "UInt64" => new Immediate(System.BitConverter.ToInt64(bytes, 0)),
+            "Int16" => new Immediate(System.BitConverter.ToInt16(bytes, 0)),
+            "UInt16" or "Char" => new Immediate(System.BitConverter.ToUInt16(bytes, 0)),
+            "SByte" => new Immediate((sbyte)bytes[0]),
+            _ => new Immediate(bytes[0]),
+        };
+    }
+
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
         TypeAnalysisContext? expectedType = null)
@@ -876,6 +990,9 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Sizeof, sized.ToTypeSignature().ToTypeDefOrRef());
                     break;
                 }
+                // a read of read-only data (.rdata) is a constant the compiler pooled: a float, or a whole struct literal
+                if (TryLoadReadOnlyConstant(memory, expectedType, method, locals, writeLine))
+                    break;
                 instructions.Add(CilOpCodes.Ldstr, Diagnostic("Unmanaged memory load: " + operand));
                 instructions.Add(CilOpCodes.Call, writeLine);
                 instructions.Add(CilOpCodes.Ldc_I4_0);

@@ -1101,7 +1101,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             case Mnemonic.Minss: // dest > src ? src : dest
                 {
                     var dest = ConvertOperand(instruction, 0);
-                    var src = ConvertOperand(instruction, 1);
+                    var src = ConvertScalarFloatOperand(instruction, 1, true, context); // a pooled constant bound is a float literal
                     AddCompareInstruction(instruction.IP, dest, src); // compare dest & src
                     if (instruction.Mnemonic == Mnemonic.Maxss)
                     {

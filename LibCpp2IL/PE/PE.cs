@@ -246,6 +246,19 @@ public sealed class PE : Il2CppBinary
         return pointer - peImageBase;
     }
 
+    public override bool IsReadOnlyDataAddress(ulong virtualAddress)
+    {
+        const uint executable = 0x20000000, readable = 0x40000000, writable = 0x80000000;
+
+        if (virtualAddress < peImageBase)
+            return false;
+
+        var rva = virtualAddress - peImageBase;
+        var section = peSectionHeaders.FirstOrDefault(x => rva >= x.VirtualAddress && rva < x.VirtualAddress + Math.Min(x.VirtualSize, x.SizeOfRawData));
+
+        return section != null && (section.Characteristics & (executable | readable | writable)) == readable;
+    }
+
     public override ReadOnlySpan<byte> GetEntirePrimaryExecutableSection()
     {
         var primarySection = peSectionHeaders.FirstOrDefault(s => s.Name == ".text");

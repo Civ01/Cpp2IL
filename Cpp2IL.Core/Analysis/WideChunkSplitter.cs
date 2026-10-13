@@ -63,6 +63,110 @@ public static class WideChunkSplitter
             changed = true;
         }
 
+        changed |= SplitConstantStores(method, pointerSize, leafCache);
+        changed |= SplitMemoryCopies(method, pointerSize, leafCache);
+
+        return changed;
+    }
+
+    /// <summary>
+    /// MSVC initialises neighbouring fields with one wide store of a constant: <c>mov qword ptr [rbx+70h], 3F99999Ah</c>
+    /// sets a float to 1.2 and the next one to 0, <c>mov word ptr [rcx+18h], 101h</c> two bools to true. Each field gets
+    /// its own store of its share of the bits.
+    /// </summary>
+    private static bool SplitConstantStores(MethodAnalysisContext method, int pointerSize,
+        Dictionary<(TypeAnalysisContext, bool), List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>> leafCache)
+    {
+        var changed = false;
+
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var store = block.Instructions[i];
+                // (zeroing 8 bytes or more is left whole, for StructCopyRecovery to make default(T) of or expand)
+                if (store is not { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable, Index: null, Size: 2 or 4 or 8 } destination, Immediate immediate] }
+                    || immediate.Value == 0 && destination.Size == 8)
+                    continue;
+
+                var bitsStored = unchecked((ulong)immediate.Value);
+
+                if (Pieces(destination, pointerSize, leafCache) is not { Count: > 1 } pieces)
+                    continue;
+
+                List<Instruction>? replacements = [];
+                foreach (var piece in pieces)
+                {
+                    var bits = bitsStored >> (int)(8 * piece.Offset);
+                    if (piece.Size < 8)
+                        bits &= (1UL << (8 * piece.Size)) - 1;
+
+                    IOperand? pieceValue = piece.Type.FullName switch
+                    {
+                        "System.Single" => new FloatLiteral(System.BitConverter.Int32BitsToSingle(unchecked((int)bits))),
+                        "System.Double" => new DoubleLiteral(System.BitConverter.Int64BitsToDouble(unchecked((long)bits))),
+                        "System.Int32" => new Immediate(unchecked((int)bits)),
+                        "System.Int16" => new Immediate(unchecked((short)bits)),
+                        "System.SByte" => new Immediate(unchecked((sbyte)bits)),
+                        "System.Boolean" when bits > 1 => null,
+                        _ when piece.Type.IsEnumType && piece.Type.EnumUnderlyingType?.FullName is "System.Int32" => new Immediate(unchecked((int)bits)),
+                        _ => new Immediate(unchecked((long)bits)),
+                    };
+
+                    if (pieceValue == null)
+                    {
+                        replacements = null;
+                        break;
+                    }
+
+                    replacements.Add(new Instruction(store.Index, OpCode.Move, new MemoryOperand(destination.Base, null, destination.Addend + piece.Offset, 0, piece.Size), pieceValue));
+                }
+
+                if (replacements == null)
+                    continue;
+
+                block.Instructions.RemoveAt(i);
+                block.Instructions.InsertRange(i, replacements);
+                i += replacements.Count - 1;
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>
+    /// A run of 16 byte chunks copied straight from one struct to another (merged into one memory to memory move when
+    /// the struct was built for a call) that is only part of the struct: one move per field it covers.
+    /// </summary>
+    private static bool SplitMemoryCopies(MethodAnalysisContext method, int pointerSize,
+        Dictionary<(TypeAnalysisContext, bool), List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>> leafCache)
+    {
+        var changed = false;
+
+        foreach (var block in method.ControlFlowGraph!.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var copy = block.Instructions[i];
+                if (copy is not { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: LocalVariable, Index: null, Size: >= 8 } destination, MemoryOperand { Base: LocalVariable, Index: null } source] }
+                    || source.Size != destination.Size
+                    || Pieces(destination, pointerSize, leafCache) is not { Count: > 1 } pieces
+                    || Pieces(source, pointerSize, leafCache) is not { } sourcePieces
+                    || !pieces.Select(p => (p.Offset, p.Size)).SequenceEqual(sourcePieces.Select(p => (p.Offset, p.Size))))
+                    continue;
+
+                var replacements = pieces.Select(piece => new Instruction(copy.Index, OpCode.Move,
+                    new MemoryOperand(destination.Base, null, destination.Addend + piece.Offset, 0, piece.Size),
+                    new MemoryOperand(source.Base, null, source.Addend + piece.Offset, 0, piece.Size))).ToList();
+
+                block.Instructions.RemoveAt(i);
+                block.Instructions.InsertRange(i, replacements);
+                i += replacements.Count - 1;
+                changed = true;
+            }
+        }
+
         return changed;
     }
 

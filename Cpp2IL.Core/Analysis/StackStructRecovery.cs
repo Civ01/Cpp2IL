@@ -135,6 +135,7 @@ public static class StackStructRecovery
 
         CollapseVectorCopies(graph);
         AddParameterCopyRoots(method, graph, roots);
+        AddReturnCopyRoots(method, resolver, graph, roots);
 
         if (roots.Count == 0)
             return;
@@ -436,6 +437,92 @@ public static class StackStructRecovery
             }
 
             block = block.Successors.Distinct().ToList() is [{ } next] && next.Predecessors.Distinct().Count() == 1 ? next : null;
+        }
+    }
+
+    /// <summary>
+    /// A struct returned through the hidden buffer is usually built on the stack first, then copied into the buffer in
+    /// chunks (<c>movups xmm0,[rsp+40h]; movups [rbx],xmm0; mov eax,[rsp+50h]; mov [rbx+10h],eax</c>), with the buffer
+    /// pointer kept in a callee-saved register across the calls building it. The stack region so copied is the struct.
+    /// </summary>
+    private static void AddReturnCopyRoots(MethodAnalysisContext method, BaseCallingConventionResolver resolver, ISILControlFlowGraph graph, List<Root> roots)
+    {
+        if (resolver.HiddenReturnBufferRegister(method) is not { } bufferRegister || !IsStruct(method.ReturnType))
+            return;
+
+        var size = (int)TypeSizes.UnboxedSize(method.ReturnType, 8);
+        if (size <= 0)
+            return;
+
+        // registers holding the buffer: any the incoming one is copied into before the first call, and never otherwise
+        // assigned (but for restoring the caller's value from the stack on the way out)
+        var holders = new HashSet<string>();
+        var first = graph.EntryBlock.Successors.Distinct().ToList() is [{ } entry] ? entry : null;
+        if (first == null)
+            return;
+
+        foreach (var instruction in first.Instructions)
+        {
+            if (instruction.IsCall || instruction.OpCode is OpCode.IndirectCall)
+                break;
+            if (instruction is { OpCode: OpCode.Move, Operands: [Register copy, Register { } original] } && original.Name == bufferRegister.Name)
+                holders.Add(copy.Name);
+            else if (instruction.Destination is Register { } clobbered && clobbered.Name == bufferRegister.Name)
+                break;
+        }
+
+        holders.RemoveWhere(h => graph.Instructions.Count(i => i.Destination is Register { } written && written.Name == h
+                                                             && i is not { OpCode: OpCode.Move, Operands: [_, StackOffset] }) != 1);
+        if (holders.Count == 0)
+            return;
+
+        foreach (var block in graph.Blocks)
+        {
+            // chunk loads from the stack and their stores into the buffer, in this block
+            var loaded = new Dictionary<string, StackOffset>();
+            var copies = new List<(int SourceOffset, long DestinationOffset, int Size, Instruction Store)>();
+
+            foreach (var instruction in block.Instructions)
+            {
+                if (instruction is { OpCode: OpCode.Move, Operands: [Register target, StackOffset { Size: > 0 } source] })
+                {
+                    loaded[target.Name] = source;
+                    continue;
+                }
+
+                if (instruction is { OpCode: OpCode.Move, Operands: [MemoryOperand { Base: Register { } bufferBase, Index: null, Size: > 0 } destination, Register value] }
+                    && holders.Contains(bufferBase.Name) && loaded.TryGetValue(value.Name, out var chunk) && chunk.Size == destination.Size)
+                {
+                    copies.Add((chunk.Offset, destination.Addend, destination.Size, instruction));
+                    continue;
+                }
+
+                if (instruction.Destination is Register overwritten)
+                    loaded.Remove(overwritten.Name);
+            }
+
+            if (copies.Count == 0)
+                continue;
+
+            // the chunks must tile the whole struct, all from one stack region
+            var start = copies[0].SourceOffset - (int)copies[0].DestinationOffset;
+            var covered = 0L;
+            foreach (var copy in copies.OrderBy(c => c.DestinationOffset))
+            {
+                if (copy.SourceOffset - copy.DestinationOffset != start || copy.DestinationOffset != covered)
+                {
+                    covered = -1;
+                    break;
+                }
+
+                covered += copy.Size;
+            }
+
+            if (covered < size || start >= 0)
+                continue;
+
+            Debug?.Invoke($"return copy root {start:X} {method.ReturnType}");
+            roots.Add(new Root(start, method.ReturnType, copies[0].Store, copies[0].Store, true, false));
         }
     }
 

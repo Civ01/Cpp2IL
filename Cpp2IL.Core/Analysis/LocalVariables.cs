@@ -253,6 +253,13 @@ public static class LocalVariables
         if (MetadataResolver.GuessAmbiguousCalls(method))
             RunTypeAndFieldFixpoint(method);
 
+        // chunks which together copy a whole struct are that struct's copy, before they're taken apart by field
+        StructCopyRecovery.Run(method);
+
+        // what's left that reaches past a field into the padding after it is that field
+        if (MetadataResolver.ResolveFieldOffsets(method, true))
+            RunTypeAndFieldFixpoint(method);
+
         // 8/16 byte struct chunks become one value per field
         if (WideChunkSplitter.Run(method))
             RunTypeAndFieldFixpoint(method);
@@ -495,6 +502,11 @@ public static class LocalVariables
                 if (instruction.Operands[i] is AddressOf { Target: LocalVariable referenced }
                     && calledMethod.Parameters[parameterIndex].ParameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
                     changed |= SetTypeIfUnknown(referenced, referencedType);
+
+                // a struct passed by value travels as a pointer to a copy (win64), which is a local of that struct type
+                else if (instruction.Operands[i] is AddressOf { Target: LocalVariable copy }
+                         && calledMethod.Parameters[parameterIndex].ParameterType is { } valueType && StackStructRecovery.IsStruct(valueType))
+                    changed |= SetTypeIfUnknown(copy, valueType);
             }
         }
 
