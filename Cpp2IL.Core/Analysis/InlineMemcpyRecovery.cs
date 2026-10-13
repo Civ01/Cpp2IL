@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Cpp2IL.Core.Graphs;
@@ -103,6 +104,78 @@ public static class InlineMemcpyRecovery
         } while (collapsed && ++rounds < 8);
 
         ResolvePointersToStack(graph);
+    }
+
+    /// <summary>
+    /// A struct copy too short for a loop is still unrolled with pointers that advance part way (<c>lea rcx,[rcx+80h]</c>,
+    /// <c>sub rax,-80h</c>), which hides that every chunk goes to the matching offset. Where the advanced pointer is only
+    /// used as a base for the rest of its life, the advance is folded into those offsets instead. Runs on registers
+    /// before frame aliases are resolved.
+    /// </summary>
+    public static void FoldPointerBumps(ISILControlFlowGraph graph)
+    {
+        foreach (var block in graph.Blocks)
+        {
+            for (var i = 0; i < block.Instructions.Count; i++)
+            {
+                var bump = block.Instructions[i];
+                long delta;
+                if (bump is { OpCode: OpCode.Add, Operands: [Register target, Register source, Immediate added] } && target.Name == source.Name)
+                    delta = added.Value;
+                else if (bump is { OpCode: OpCode.Subtract, Operands: [Register subTarget, Register subSource, Immediate subtracted] } && subTarget.Name == subSource.Name)
+                    delta = -subtracted.Value;
+                else
+                    continue;
+
+                var register = ((Register)bump.Operands[0]).Name;
+                if (register is "rsp" or "rbp" || FlagRegisters.Contains(register) || delta == 0 || Math.Abs(delta) > 0x1000)
+                    continue;
+
+                // every later use, up to where it's next written, is as a memory base
+                var uses = new List<(Instruction Instruction, int Operand)>();
+                var end = block.Instructions.Count;
+                var valid = true;
+                for (var j = i + 1; j < block.Instructions.Count && valid; j++)
+                {
+                    var instruction = block.Instructions[j];
+                    for (var k = 0; k < instruction.Operands.Count; k++)
+                    {
+                        switch (instruction.Operands[k])
+                        {
+                            case MemoryOperand { Base: Register { Name: var memoryBase }, Index: var index } when memoryBase == register:
+                                if (index is Register { Name: var indexName } && indexName == register)
+                                    valid = false;
+                                uses.Add((instruction, k));
+                                break;
+                            case MemoryOperand { Index: Register { Name: var onlyIndex } } when onlyIndex == register:
+                                valid = false;
+                                break;
+                            case Register { Name: var used } when used == register && !(k == 0 && instruction.Destination is Register):
+                                valid = false;
+                                break;
+                        }
+                    }
+
+                    if (instruction.Destination is Register written && written.Name == register)
+                    {
+                        end = j;
+                        break;
+                    }
+                }
+
+                if (!valid || uses.Count == 0 || end == block.Instructions.Count && !DeadAfter(block, block.Instructions.Count, register))
+                    continue;
+
+                foreach (var (instruction, operand) in uses)
+                {
+                    var memory = (MemoryOperand)instruction.Operands[operand];
+                    instruction.SetOperand(operand, new MemoryOperand(memory.Base, memory.Index, memory.Addend + delta, memory.Scale, memory.Size));
+                }
+
+                bump.OpCode = OpCode.Nop;
+                bump.SetOperands();
+            }
+        }
     }
 
     private static bool TryCollapseLoop(ISILControlFlowGraph graph, Block loop)
@@ -554,6 +627,8 @@ public static class InlineMemcpyRecovery
             for (var i = from; i < current.Instructions.Count && !pathEnded; i++)
             {
                 var instruction = current.Instructions[i];
+                if (instruction.OpCode is OpCode.Nop or OpCode.ShiftStack)
+                    continue;
 
                 // A call to something unmanaged lists every argument register, used or not. Nothing sane hands a
                 // copy loop's leftover pointer to one, so take it as clobbering rather than reading them.

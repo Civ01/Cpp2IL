@@ -129,7 +129,9 @@ public static class InlinedPropertyRecovery
                     if (instruction is { OpCode: OpCode.Move, Operands: [FieldReference into, FieldReference from] }
                         && ReferenceEquals(into.Local, destination) && ReferenceEquals(from.Local, source) && SameChain(into, from))
                     {
-                        copied.Add(ChainKey(into));
+                        // a struct field copied whole covers everything inside it
+                        var key = ChainKey(into);
+                        copied.UnionWith(expected.Where(leaf => leaf == key || leaf.StartsWith(key + ".", System.StringComparison.Ordinal)));
                         copies.Add(instruction);
                         continue;
                     }
