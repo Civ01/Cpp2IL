@@ -231,6 +231,78 @@ public static class WideChunkSplitter
         return changed;
     }
 
+    /// <summary>
+    /// Usually only one half of a pair read as one 64 bit value was wanted: <c>pair &gt;&gt; 32</c> is the high field and
+    /// <c>pair &amp; 0xFFFFFFFF</c> (or the pair narrowed to 32 bits) the low one. Runs in SSA once copies are propagated.
+    /// </summary>
+    public static void SimplifyPairHalves(MethodAnalysisContext method)
+    {
+        var graph = method.ControlFlowGraph!;
+        var definitions = new Dictionary<LocalVariable, Instruction>();
+        foreach (var instruction in graph.Instructions)
+            if (instruction.Destination is LocalVariable defined)
+                definitions[defined] = instruction;
+
+        IOperand Through(IOperand operand)
+        {
+            for (var depth = 0; depth < 4 && operand is LocalVariable local && definitions.TryGetValue(local, out var definition)
+                                && definition is { OpCode: OpCode.Move, Operands: [_, LocalVariable or FieldReference] }; depth++)
+                operand = definition.Operands[1];
+            return operand;
+        }
+
+        // pair = (high << 32) | (low & 0xFFFFFFFF), either way round: the two halves
+        (IOperand Low, IOperand High)? Halves(IOperand operand)
+        {
+            if (Through(operand) is not LocalVariable pair || !definitions.TryGetValue(pair, out var or)
+                || or is not { OpCode: OpCode.Or, Operands: [_, var first, var second] })
+                return null;
+
+            IOperand? low = null, high = null;
+            foreach (var part in new[] { first, second })
+            {
+                if (part is not LocalVariable partLocal || !definitions.TryGetValue(partLocal, out var partDefinition))
+                    return null;
+
+                if (partDefinition is { OpCode: OpCode.ShiftLeft, Operands: [_, var shifted, Immediate { Value: 32 }] })
+                    high = Through(shifted);
+                else if (partDefinition is { OpCode: OpCode.And, Operands: [_, var masked, Immediate { Value: 0xFFFFFFFF }] })
+                    low = Through(masked);
+                else
+                    return null;
+            }
+
+            return low != null && high != null ? (low, high) : null;
+        }
+
+        foreach (var use in graph.Instructions)
+        {
+            switch (use)
+            {
+                case { OpCode: OpCode.ShiftRight, Operands: [LocalVariable shifted, var shiftedPair, Immediate { Value: 32 }] } when Halves(shiftedPair) is { } halves:
+                    use.OpCode = OpCode.Move;
+                    use.SetOperands(shifted, halves.High);
+                    shifted.Type = HalfType(halves.High) ?? shifted.Type;
+                    break;
+                case { OpCode: OpCode.And, Operands: [LocalVariable masked, var maskedPair, Immediate { Value: 0xFFFFFFFF }] } when Halves(maskedPair) is { } lowHalves:
+                    use.OpCode = OpCode.Move;
+                    use.SetOperands(masked, lowHalves.Low);
+                    masked.Type = HalfType(lowHalves.Low) ?? masked.Type;
+                    break;
+                case { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { } narrowType }, var narrowedPair] } when IsFourByteInteger(narrowType) && Halves(narrowedPair) is { } narrowHalves:
+                    use.SetOperand(1, narrowHalves.Low);
+                    break;
+            }
+        }
+    }
+
+    private static TypeAnalysisContext? HalfType(IOperand half) => half switch
+    {
+        LocalVariable { Type: { } localType } => localType,
+        FieldReference field => field.Field.FieldType,
+        _ => null,
+    };
+
     private static bool IsFourByteInteger(TypeAnalysisContext type) =>
         type.IsEnumType ? type.Fields.FirstOrDefault(f => !f.IsStatic) is { FieldType: var underlying } && IsFourByteInteger(underlying)
             : type.Namespace == "System" && type.Name is "Int32" or "UInt32";

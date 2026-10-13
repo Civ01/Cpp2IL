@@ -478,6 +478,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         for (var i = 0; i < 8 && ConstantFolder.Run(this); i++)
             SsaSimplifier.Run(this);
 
+        // ((long)b << 32 | (uint)a) >> 32 is just b
+        WideChunkSplitter.SimplifyPairHalves(this);
+
         InternalCallGuardRemover.Run(this);
         DebugPassCallback?.Invoke(this, "InternalCallGuardRemover.Run");
         KeyFunctionRecovery.Run(this);

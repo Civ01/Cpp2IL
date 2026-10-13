@@ -620,17 +620,28 @@ public static class IlGenerator
                 // operands are coerced to the (float) result type. A no-op when they already match.
                 var floatConversion = FloatArithmeticConversion(instruction);
 
-                LoadOperand(instruction.Operands[1], method, locals, writeLine);
-                if (floatConversion is { } conv1)
-                    instructions.Add(conv1);
-                // a 32 bit value shifted into a 64 bit result has to be widened first, or the shift wraps
-                else if (instruction.OpCode == OpCode.ShiftLeft
-                         && DestinationType(instruction.Operands[0]) is { Namespace: "System", Name: "Int64" or "UInt64" }
-                         && SourceType(instruction.Operands[1], context) is { Namespace: "System", Name: "Int32" or "UInt32" or "Int16" or "UInt16" or "Byte" or "SByte" } narrow)
-                    instructions.Add(narrow.Name.StartsWith("U") || narrow.Name == "Byte" ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8);
-                LoadOperand(instruction.Operands[2], method, locals, writeLine);
-                if (floatConversion is { } conv2)
-                    instructions.Add(conv2);
+                // a 32 bit mask or constant against a 32 bit value (x & 0xFFFFFFFC, the lifter reads it unsigned) is a 32 bit
+                // constant; and a 32 bit operand of an operation with a 64 bit result is widened first (or a shift wraps)
+                var wideResult = instruction.OpCode is not (>= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual)
+                                 && DestinationType(instruction.Operands[0]) is { Namespace: "System", Name: "Int64" or "UInt64" };
+                for (var operandIndex = 1; operandIndex <= 2; operandIndex++)
+                {
+                    var operand = instruction.Operands[operandIndex];
+                    var other = instruction.Operands[3 - operandIndex];
+                    var otherNarrow = Narrow32(SourceType(other, context));
+
+                    if (operand is Immediate { Value: > int.MaxValue and <= uint.MaxValue } wrapped && otherNarrow && !wideResult)
+                        instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)(uint)wrapped.Value));
+                    else
+                        LoadOperand(operand, method, locals, writeLine);
+
+                    if (floatConversion is { } operandConversion)
+                        instructions.Add(operandConversion);
+                    else if (wideResult && instruction.OpCode is OpCode.ShiftLeft or OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.And or OpCode.Or or OpCode.Xor
+                             && (operandIndex == 1 || instruction.OpCode != OpCode.ShiftLeft)
+                             && SourceType(operand, context) is { Namespace: "System", Name: "Int32" or "UInt32" or "Int16" or "UInt16" or "Byte" or "SByte" } narrow)
+                        instructions.Add(narrow.Name.StartsWith("U") || narrow.Name == "Byte" ? CilOpCodes.Conv_U8 : CilOpCodes.Conv_I8);
+                }
 
                 switch (instruction.OpCode)
                 {
@@ -857,6 +868,10 @@ public static class IlGenerator
         };
     }
 
+    private static bool Narrow32(TypeAnalysisContext? type) =>
+        type is { IsEnumType: true } ? type.EnumUnderlyingType?.FullName is "System.Int32" or "System.UInt32"
+            : type?.FullName is "System.Int32" or "System.UInt32";
+
     private static void LoadOperand(IOperand operand, MethodDefinition method,
         Dictionary<LocalVariable, CilLocalVariable> locals, IMethodDescriptor writeLine,
         TypeAnalysisContext? expectedType = null)
@@ -891,7 +906,7 @@ public static class IlGenerator
         switch (operand)
         {
             // a 32 bit store of 0xFFFFFFFF into an int is -1 (the lifter reads the immediate unsigned)
-            case Immediate { Value: > int.MaxValue and <= uint.MaxValue } wrapped when expectedType is { FullName: "System.Int32" } or { IsEnumType: true, EnumUnderlyingType.FullName: "System.Int32" }:
+            case Immediate { Value: > int.MaxValue and <= uint.MaxValue } wrapped when expectedType is { FullName: "System.Int32" or "System.UInt32" } or { IsEnumType: true, EnumUnderlyingType.FullName: "System.Int32" or "System.UInt32" }:
                 instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)(uint)wrapped.Value));
                 break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
