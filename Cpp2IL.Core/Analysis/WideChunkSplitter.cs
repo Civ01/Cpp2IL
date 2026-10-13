@@ -251,9 +251,13 @@ public static class WideChunkSplitter
             return operand;
         }
 
-        // pair = (high << 32) | (low & 0xFFFFFFFF), either way round: the two halves
+        // pair = (high << 32) | (low & 0xFFFFFFFF), either way round: the two halves; or a struct of two ints (Vector2Int)
+        // handled as one 8 byte value
         (IOperand Low, IOperand High)? Halves(IOperand operand)
         {
+            if (StructHalves(Through(operand)) is { } fields)
+                return fields;
+
             if (Through(operand) is not LocalVariable pair || !definitions.TryGetValue(pair, out var or)
                 || or is not { OpCode: OpCode.Or, Operands: [_, var first, var second] })
                 return null;
@@ -279,6 +283,12 @@ public static class WideChunkSplitter
         {
             switch (use)
             {
+                // a 4 byte field read 8 bytes at a time: its upper half is the field after it
+                case { OpCode: OpCode.ShiftRight, Operands: [LocalVariable nextRead, var wideRead, Immediate { Value: 32 }] } when FieldAfter(Through(wideRead)) is { } after:
+                    use.OpCode = OpCode.Move;
+                    use.SetOperands(nextRead, after);
+                    nextRead.Type = after.Field.FieldType;
+                    break;
                 case { OpCode: OpCode.ShiftRight, Operands: [LocalVariable shifted, var shiftedPair, Immediate { Value: 32 }] } when Halves(shiftedPair) is { } halves:
                     use.OpCode = OpCode.Move;
                     use.SetOperands(shifted, halves.High);
@@ -292,8 +302,55 @@ public static class WideChunkSplitter
                 case { OpCode: OpCode.Move, Operands: [LocalVariable { Type: { } narrowType }, var narrowedPair] } when IsFourByteInteger(narrowType) && Halves(narrowedPair) is { } narrowHalves:
                     use.SetOperand(1, narrowHalves.Low);
                     break;
+                // 32 bit arithmetic or a compare on the struct is on its low half
+                case { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.And or OpCode.Or or OpCode.Xor or OpCode.ShiftLeft or OpCode.ShiftRight
+                    or OpCode.CheckEqual or OpCode.CheckNotEqual or OpCode.CheckLess or OpCode.CheckGreater or OpCode.CheckLessOrEqual or OpCode.CheckGreaterOrEqual,
+                    Operands: [LocalVariable { Type: { } resultType }, ..] } arithmetic
+                    when (IsFourByteInteger(resultType) || resultType.FullName == "System.Boolean"):
+                    for (var i = 1; i < arithmetic.Operands.Count; i++)
+                        if (StructHalves(Through(arithmetic.Operands[i])) is { } operandHalves)
+                            arithmetic.SetOperand(i, operandHalves.Low);
+                    break;
             }
         }
+    }
+
+    // The field 4 bytes on from a 4 byte field, in the same object or struct
+    private static FieldReference? FieldAfter(IOperand operand)
+    {
+        if (operand is not FieldReference { Field: { IsStatic: false } field } read || TypeSizes.StorageSize(field.FieldType, 8) != 4)
+            return null;
+
+        var next = field.DeclaringType.Fields.FirstOrDefault(f => !f.IsStatic && (f.Attributes & System.Reflection.FieldAttributes.Literal) == 0 && f.Offset == field.Offset + 4);
+        if (next == null || TypeSizes.StorageSize(next.FieldType, 8) is 0 or > 4)
+            return null;
+
+        return new FieldReference(next, read.Local, read.Offset + 4) { Path = read.Path };
+    }
+
+    // A local (or field) of a struct that is just two 4 byte integers, as its two fields
+    private static (IOperand Low, IOperand High)? StructHalves(IOperand operand)
+    {
+        var type = operand switch
+        {
+            LocalVariable { Type: { } localType } => localType,
+            FieldReference field => field.Field.FieldType,
+            _ => null
+        };
+        if (type is not { IsValueType: true, IsEnumType: false } || type is GenericInstanceTypeAnalysisContext || type.Namespace == "System" && type.Name is "Int64" or "UInt64" or "Double" or "IntPtr" or "UIntPtr")
+            return null;
+
+        var fields = type.Fields.Where(f => !f.IsStatic && (f.Attributes & System.Reflection.FieldAttributes.Literal) == 0).OrderBy(f => f.Offset).ToList();
+        if (fields is not [var low, var high] || high.Offset - low.Offset != 4 || !IsFourByteInteger(low.FieldType) || !IsFourByteInteger(high.FieldType))
+            return null;
+
+        return operand switch
+        {
+            LocalVariable local => (new FieldReference(low, local, 0), new FieldReference(high, local, 4)),
+            FieldReference outer => (new FieldReference(low, outer.Local, outer.Offset) { Path = [..outer.Path, outer.Field] },
+                new FieldReference(high, outer.Local, outer.Offset + 4) { Path = [..outer.Path, outer.Field] }),
+            _ => null
+        };
     }
 
     private static TypeAnalysisContext? HalfType(IOperand half) => half switch
