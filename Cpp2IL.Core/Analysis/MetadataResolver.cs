@@ -257,6 +257,16 @@ public static class MetadataResolver
                     field = openChain[^1];
                     path = openChain.GetRange(0, openChain.Count - 1);
                 }
+                else if (staticOwner != null && (genericOwner != null || owner.GenericParameters.Count > 0))
+                {
+                    // a generic type's statics: no offsets in the metadata either (<>c<T>.<>9__3_0, a cached lambda)
+                    if (GenericInstanceFieldLayout.FindStaticField(owner, memory.Addend, memory.Size, pointerSize) is not { } staticField)
+                        continue;
+
+                    instruction.SetOperand(i, new FieldReference(staticField, local, (int)memory.Addend));
+                    changed = true;
+                    continue;
+                }
                 else
                 {
                     if (FindFieldChain(genericOwner?.GenericType ?? owner, staticOwner != null, memory.Addend, memory.Size, pointerSize, allowTrailingPadding) is not { } chain)
@@ -1011,6 +1021,27 @@ public static class MetadataResolver
                     instruction.SetOperand(i, new RuntimeMethodInfoAnalysisContext(resolved, assembly));
             }
 
+            changed = true;
+        }
+
+        // a slot's MethodInfo read as a value is ldvirtftn: the method a delegate is made from (new Action(this.OnDone)
+        // with OnDone virtual)
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable methodLocal, MemoryOperand { Index: null, Scale: 0 } read] }
+                || read.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } owner } }
+                || owner.IsValueType || owner is GenericParameterTypeAnalysisContext)
+                continue;
+
+            var methodOffset = read.Addend - vtableOffset - pointerSize;
+            if (methodOffset < 0 || methodOffset % invokeDataSize != 0
+                || ResolveVTableSlot(method.AppContext, owner, (int)(methodOffset / invokeDataSize)) is not { } slotMethod
+                || (slotMethod.DeclaringType?.DeclaringAssembly ?? method.DeclaringType?.DeclaringAssembly) is not { } slotAssembly)
+                continue;
+
+            var methodInfo = new RuntimeMethodInfoAnalysisContext(slotMethod, slotAssembly);
+            instruction.SetOperand(1, methodInfo);
+            methodLocal.Type = methodInfo;
             changed = true;
         }
 
