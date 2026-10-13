@@ -450,6 +450,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ConstantSplitter.Run(this);
         DebugPassCallback?.Invoke(this, "ConstantSplitter.Run");
 
+        // a field picked by a branch, read where the branches meet
+        SelectedFieldLoads.Run(this);
+        DebugPassCallback?.Invoke(this, "SelectedFieldLoads.Run");
+
         LocalVariables.ResolveTypesAndFields(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.ResolveTypesAndFields");
 
