@@ -59,6 +59,13 @@ public static class StructCopyRecovery
                     continue;
                 }
 
+                // a run of chunks already merged into one memory to memory move
+                if (value is MemoryOperand or FieldReference && Locate(value, pointerSize) is { } direct && direct.Size == destination.Size)
+                {
+                    chunks.Add(new Chunk { Store = instruction, Destination = destination, Load = instruction, Source = direct });
+                    continue;
+                }
+
                 if (value is not LocalVariable temporary
                     || !definitions.TryGetValue(temporary, out var load)
                     || load.OpCode != OpCode.Move

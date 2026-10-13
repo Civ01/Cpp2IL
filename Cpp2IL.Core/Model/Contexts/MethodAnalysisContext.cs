@@ -517,6 +517,17 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         EqualityBranchInverter.Run(this);
         DebugPassCallback?.Invoke(this, "EqualityBranchInverter.Run");
 
+        // Inlined List<T>.Add back to the call
+        InlinedListAddRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "InlinedListAddRecovery.Run");
+
+        // (what's left of the fields it read is dead, and must go before those reads become getter calls)
+        DeadCodeEliminator.Run(this);
+
+        // Inlined trivial getters of the class libraries (list._size, enumerator._current) back to the property
+        InlinedPropertyRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "InlinedPropertyRecovery.Run");
+
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);

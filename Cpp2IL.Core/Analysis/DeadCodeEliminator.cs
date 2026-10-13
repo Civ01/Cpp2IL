@@ -128,8 +128,23 @@ public static class DeadCodeEliminator
     {
         yield return access.Array;
 
-        if (access.Index is LocalVariable index)
-            yield return index;
+        switch (access.Index)
+        {
+            case LocalVariable index:
+                yield return index;
+                break;
+            // a[b[i]], a[b.Length], a[o.f]
+            case ArrayAccess nested:
+                foreach (var used in ArrayAccessLocals(nested))
+                    yield return used;
+                break;
+            case ArrayLength { Array: { } lengthArray }:
+                yield return lengthArray;
+                break;
+            case FieldReference { RootField.IsStatic: false, Local: { } indexOwner }:
+                yield return indexOwner;
+                break;
+        }
     }
 
     /// <summary>

@@ -228,18 +228,27 @@ public static class Simplifier
             visited.Add(startBlock);
             remaining.Push((startBlock, startIndex));
 
+            // A value read from memory is only that value until the memory is written: it isn't carried past a store
+            // or a call (int size = list._size; list._size = 0; if (size > 0) ...)
+            var readsMemory = replacement is FieldReference or ArrayAccess || replacement is MemoryOperand { IsConstant: false };
+            var addressTaken = readsMemory ? AddressTakenLocals() : [];
+
             while (remaining.Count > 0)
             {
                 var (currentBlock, index) = remaining.Pop();
+                var stopped = false;
 
                 // Process instructions starting at the given index
-                for (var i = index; i < currentBlock.Instructions.Count; i++)
+                for (var i = index; i < currentBlock.Instructions.Count && !stopped; i++)
                 {
                     var instruction = currentBlock.Instructions[i];
 
                     // Stop on this branch when reassigned
                     if (instruction.Destination is LocalVariable destLocal && destLocal == local)
                         return;
+
+                    // (the instruction itself still reads the value before it writes)
+                    stopped = readsMemory && MayOverwrite(instruction, replacement, addressTaken);
 
                     // Replace operands
                     for (var j = 0; j < instruction.Operands.Count; j++)
@@ -276,6 +285,9 @@ public static class Simplifier
                     }
                 }
 
+                if (stopped)
+                    continue;
+
                 // Process successors
                 foreach (var successor in currentBlock.Successors)
                 {
@@ -288,6 +300,63 @@ public static class Simplifier
                         remaining.Push((successor, 0));
                 }
             }
+        }
+
+        private HashSet<LocalVariable> AddressTakenLocals()
+        {
+            var taken = new HashSet<LocalVariable>();
+            foreach (var instruction in _graph.Blocks.SelectMany(b => b.Instructions))
+                foreach (var operand in instruction.Operands)
+                    if (operand is AddressOf { Target: LocalVariable addressedLocal })
+                        taken.Add(addressedLocal);
+                    else if (operand is AddressOf { Target: FieldReference { Local: var addressedOwner } })
+                        taken.Add(addressedOwner);
+            return taken;
+        }
+
+        // The local a read goes through, if it holds the struct itself (not a reference or pointer to it): only writes
+        // through that local (or its address) can change what's read
+        private static LocalVariable? OwnStruct(IOperand read) => read switch
+        {
+            FieldReference { Local: { Type: { IsValueType: true } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext) } own, RootField.IsStatic: false } => own,
+            MemoryOperand { Base: LocalVariable { Type: { IsValueType: true } and not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext) } own } => own,
+            _ => null,
+        };
+
+        // Whether the instruction may change what the memory read reads: a store that can alias it, or a call
+        private static bool MayOverwrite(Instruction instruction, IOperand read, HashSet<LocalVariable> addressTaken)
+        {
+            var own = OwnStruct(read);
+
+            if (instruction.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall or OpCode.Newobj)
+                return own == null || addressTaken.Contains(own);
+
+            if (instruction.OpCode is OpCode.Nop or OpCode.Return or OpCode.ConditionalJump or OpCode.Jump or OpCode.Throw || instruction.Operands.Count == 0)
+                return false;
+
+            var written = instruction.Operands[0];
+            if (written is not (FieldReference or ArrayAccess or MemoryOperand { IsConstant: false } or StackOffset))
+                return false;
+
+            // a struct held in a local is only written through it
+            if (own != null)
+                return written switch
+                {
+                    FieldReference field => ReferenceEquals(field.Local, own),
+                    MemoryOperand memory => ReferenceEquals(memory.Base, own) || memory.Base is not LocalVariable,
+                    _ => false,
+                };
+
+            return (read, written) switch
+            {
+                // two different fields never overlap (whatever objects they're on)
+                (FieldReference readField, FieldReference writtenField) => readField.RootField.Name == writtenField.RootField.Name
+                                                                           && readField.RootField.DeclaringType.FullName == writtenField.RootField.DeclaringType.FullName,
+                // array elements aren't fields
+                (FieldReference, ArrayAccess) or (ArrayAccess, FieldReference) => false,
+                (_, FieldReference) when OwnStruct(written) is { } => false,
+                _ => true,
+            };
         }
 
         private bool IsLocalUsedAfterInstruction(Block startBlock, int startIndex, LocalVariable local, out bool usedByMemory)

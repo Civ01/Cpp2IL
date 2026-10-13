@@ -44,6 +44,7 @@ public class StackAnalyzer
             method.AddWarning($"Method ends with non empty stack ({outText}), the output could be wrong!");
         }
 
+        InlineMemcpyRecovery.FoldPointerBumps(graph);
         analyzer.ResolveFrameAliases(graph);
         analyzer.CorrectOffsets(graph);
         NativeHelperRecovery.RunEarly(method, graph);
