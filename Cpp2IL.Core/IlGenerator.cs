@@ -890,6 +890,10 @@ public static class IlGenerator
 
         switch (operand)
         {
+            // a 32 bit store of 0xFFFFFFFF into an int is -1 (the lifter reads the immediate unsigned)
+            case Immediate { Value: > int.MaxValue and <= uint.MaxValue } wrapped when expectedType is { FullName: "System.Int32" } or { IsEnumType: true, EnumUnderlyingType.FullName: "System.Int32" }:
+                instructions.Add(CilOpCodes.Ldc_I4, unchecked((int)(uint)wrapped.Value));
+                break;
             case Immediate { Value: >= int.MinValue and <= int.MaxValue } immediate:
                 instructions.Add(CilOpCodes.Ldc_I4, (int)immediate.Value);
                 break;
