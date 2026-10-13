@@ -150,7 +150,36 @@ public static class IlGenerator
             pendingBlockBranchFixups.Add((startBridge, realStart));
         }
 
-        foreach (var block in context.ControlFlowGraph!.Blocks)
+        // a foreach's try region has to be contiguous, and is best straight after the GetEnumerator() before it; one
+        // inside another goes inside its region the same way
+        var regions = context.ForeachRegions ?? [];
+        var regionSets = regions.ToDictionary(r => r, r => r.Blocks.ToHashSet());
+        bool Encloses(Analysis.ForeachRegion outer, Analysis.ForeachRegion inner) => outer != inner && inner.Blocks.All(regionSets[outer].Contains);
+        List<Analysis.ForeachRegion> ChildrenOf(Analysis.ForeachRegion? scope) => regions
+            .Where(c => c != scope && (scope == null || Encloses(scope, c)) && !regions.Any(m => m != scope && Encloses(m, c) && (scope == null || Encloses(scope, m))))
+            .ToList();
+
+        var emissionOrder = new List<(Block Block, List<Analysis.ForeachRegion> Within)>();
+        void Order(IEnumerable<Block> blocks, Analysis.ForeachRegion? scope, List<Analysis.ForeachRegion> within)
+        {
+            var children = ChildrenOf(scope);
+            var inChildren = children.SelectMany(c => c.Blocks).ToHashSet();
+            foreach (var block in blocks)
+            {
+                if (inChildren.Contains(block))
+                    continue;
+
+                emissionOrder.Add((block, within));
+                foreach (var child in children.Where(c => c.Before == block))
+                    Order(child.Blocks, child, [..within, child]);
+            }
+        }
+
+        Order(context.ControlFlowGraph!.Blocks, null, []);
+
+        var regionIl = regions.ToDictionary(r => r, _ => new List<CilInstruction>());
+
+        foreach (var (block, within) in emissionOrder)
         {
             if (block == context.ControlFlowGraph.EntryBlock || block == context.ControlFlowGraph.ExitBlock)
                 continue;
@@ -158,6 +187,15 @@ public static class IlGenerator
             if (block.Instructions.Count == 0)
                 continue;
 
+            var blockStart = definition.CilMethodBody!.Instructions.Count;
+            EmitBlock(block);
+
+            foreach (var region in within)
+                regionIl[region].AddRange(definition.CilMethodBody!.Instructions.Skip(blockStart));
+        }
+
+        void EmitBlock(Block block)
+        {
             foreach (var instruction in block.Instructions)
             {
                 var generated = GenerateInstructions(instruction, context, definition, locals, writeLine);
@@ -173,7 +211,7 @@ public static class IlGenerator
             {
                 var trueTarget = TryResolveJumpTargetBlock(lastInstruction, context.ControlFlowGraph);
                 var falseSuccessor = block.Successors.FirstOrDefault(s => s != trueTarget && s != context.ControlFlowGraph.ExitBlock);
-                if (falseSuccessor == null) continue;
+                if (falseSuccessor == null) return;
                 var bridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
                 definition.CilMethodBody!.Instructions.Add(bridge);
                 pendingBlockBranchFixups.Add((bridge, falseSuccessor));
@@ -182,7 +220,7 @@ public static class IlGenerator
             else if (lastInstruction.OpCode != OpCode.Jump && lastInstruction.OpCode != OpCode.Return && lastInstruction.OpCode != OpCode.IndirectJump)
             {
                 var successor = block.Successors.FirstOrDefault(s => s != context.ControlFlowGraph.ExitBlock);
-                if (successor == null) continue;
+                if (successor == null) return;
                 var bridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
                 definition.CilMethodBody!.Instructions.Add(bridge);
                 pendingBlockBranchFixups.Add((bridge, successor));
@@ -234,6 +272,14 @@ public static class IlGenerator
             branchInstruction.Operand = new CilInstructionLabel(target);
         }
 
+        // innermost first, as what wrapping one adds is part of those around it
+        foreach (var region in regions.OrderBy(r => r.Blocks.Count))
+        {
+            var added = WrapForeach(context, definition, locals, region, regionIl[region]);
+            foreach (var outer in regions.Where(o => Encloses(o, region)))
+                regionIl[outer].AddRange(added);
+        }
+
         // Add analysis warnings
         var instructions = body.Instructions;
         foreach (var warning in context.AnalysisWarnings)
@@ -241,6 +287,108 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+    }
+
+    // Puts a foreach loop's code into try { ... } finally { enumerator.Dispose(); }: jumps out of it become leaves (a
+    // conditional one through a leave right after the loop), and returns from inside it leave to a return after it
+    private static List<CilInstruction> WrapForeach(MethodAnalysisContext context, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+        Analysis.ForeachRegion region, List<CilInstruction> il)
+    {
+        var body = method.CilMethodBody!;
+        if (il.Count == 0 || !locals.TryGetValue(region.Enumerator, out var enumerator)
+            || context.AppContext.GetAssemblyByName("mscorlib")?.GetTypeByFullName("System.IDisposable")?.Methods.FirstOrDefault(m => m.Name == "Dispose") is not { } dispose)
+            return [];
+
+        var inside = il.ToHashSet(ReferenceEqualityComparer.Instance);
+        var exits = new List<CilInstruction>();
+        var returnPath = new List<CilInstruction>();
+        CilLocalVariable? returned = null;
+
+        foreach (var instruction in il)
+        {
+            if (instruction.OpCode == CilOpCodes.Ret)
+            {
+                if (returnPath.Count == 0)
+                {
+                    if (!context.IsVoid)
+                    {
+                        returned = new CilLocalVariable(context.ReturnType.ToTypeSignature());
+                        body.LocalVariables.Add(returned);
+                        returnPath.Add(new CilInstruction(CilOpCodes.Ldloc, returned));
+                    }
+
+                    returnPath.Add(new CilInstruction(CilOpCodes.Ret));
+                }
+
+                if (returned != null)
+                {
+                    // the value is on the stack: store it, and leave right after
+                    var leave = new CilInstruction(CilOpCodes.Leave, returnPath[0].CreateLabel());
+                    exits.Add(leave);
+                    instruction.OpCode = CilOpCodes.Stloc;
+                    instruction.Operand = returned;
+                    body.Instructions.Insert(IndexOf(body.Instructions, instruction) + 1, leave);
+                }
+                else
+                {
+                    instruction.OpCode = CilOpCodes.Leave;
+                    instruction.Operand = returnPath[0].CreateLabel();
+                }
+
+                continue;
+            }
+
+            if (instruction.Operand is not CilInstructionLabel { Instruction: { } target } || inside.Contains(target))
+                continue;
+
+            if (instruction.OpCode == CilOpCodes.Br)
+                instruction.OpCode = CilOpCodes.Leave;
+            else if (instruction.OpCode.FlowControl == CilFlowControl.ConditionalBranch)
+            {
+                var stub = new CilInstruction(CilOpCodes.Leave, target.CreateLabel());
+                exits.Add(stub);
+                instruction.Operand = stub.CreateLabel();
+            }
+        }
+
+        // after everything of the region, including the leaves just put in
+        var end = il.Concat(exits).Select(i => IndexOf(body.Instructions, i)).Max() + 1;
+
+        var stubs = exits.Where(e => IndexOf(body.Instructions, e) < 0).ToList();
+        var handler = new List<CilInstruction>
+        {
+            new(CilOpCodes.Ldloca, enumerator),
+            new(CilOpCodes.Constrained, region.Enumerator.Type!.ToTypeSignature().ToTypeDefOrRef()),
+            new(CilOpCodes.Callvirt, dispose.ToMethodDescriptor()),
+            new(CilOpCodes.Endfinally),
+        };
+
+        body.Instructions.InsertRange(end, stubs.Concat(handler).Concat(returnPath));
+
+        var afterHandler = end + stubs.Count + handler.Count;
+        if (afterHandler >= body.Instructions.Count)
+            body.Instructions.Add(CilOpCodes.Nop); // never reached, but the handler has to end before something
+
+        body.ExceptionHandlers.Add(new CilExceptionHandler
+        {
+            HandlerType = CilExceptionHandlerType.Finally,
+            TryStart = il[0].CreateLabel(),
+            TryEnd = handler[0].CreateLabel(),
+            HandlerStart = handler[0].CreateLabel(),
+            HandlerEnd = body.Instructions[afterHandler].CreateLabel(),
+        });
+
+        return [..exits, ..handler, ..returnPath];
+    }
+
+    // CilInstruction compares by value, which two "br IL_0010" are as well
+    private static int IndexOf(CilInstructionCollection instructions, CilInstruction instruction)
+    {
+        for (var i = 0; i < instructions.Count; i++)
+            if (ReferenceEquals(instructions[i], instruction))
+                return i;
+
+        return -1;
     }
 
     // Limit so we don't run into the 16mb limit (see AsmResolver issue #775)
