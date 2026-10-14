@@ -333,6 +333,9 @@ public class SsaForm
         block.Instructions.Insert(0, new Instruction(-1, OpCode.Phi, operands));
     }
 
+    // versions assigned the constant 0
+    private readonly Dictionary<Register, bool> _zeroed = new();
+
     private void Rename(Block initialBlock, DominatorInfo dominance)
     {
         var remaining = new Stack<(Stack<Block>, List<int>)>();
@@ -355,6 +358,7 @@ public class SsaForm
 
             // Register numbers newly defined in this block, so we can pop their versions on the way out.
             var definedHere = new List<int>();
+            var copies = new List<(Instruction Before, Instruction Copy)>();
 
             foreach (var instruction in block.Instructions)
             {
@@ -364,7 +368,12 @@ public class SsaForm
                     RewriteUses(instruction);
 
                 if (instruction.Destination is Register definition)
+                {
                     instruction.Destination = NewName(definition, definedHere);
+                    _zeroed[(Register)instruction.Destination!] = instruction is { OpCode: OpCode.Move, Operands: [_, Immediate { Value: 0 }] }
+                                                                   || instruction is { OpCode: OpCode.Move, Operands: [_, Register source] } && _zeroed.GetValueOrDefault(source)
+                                                                   || instruction is { OpCode: OpCode.Xor, Operands: [_, Register x, Register y] } && x.Equals(y);
+                }
 
                 // Nothing to write the new version back into, but taking it off the stack is the point: reads
                 // after this one can't reach back past the call
@@ -375,12 +384,32 @@ public class SsaForm
                 {
                     // Taking a slot's address lets the callee assign it, so the slot stops holding anything that reached this point, UNLESS
                     // nothing reads it afterwards, in which case any write is unobservable and the callee is only reading the value it has now
-                    if (instruction.Operands[i] is AddressOf { Target: Register addressed })
-                        instruction.SetOperand(i, new AddressOf(_clobbering.Contains(instruction)
-                            ? NewName(addressed, definedHere)
-                            : CurrentVersion(addressed.Number)));
+                    if (instruction.Operands[i] is not AddressOf { Target: Register addressed })
+                        continue;
+
+                    if (!_clobbering.Contains(instruction))
+                    {
+                        instruction.SetOperand(i, new AddressOf(CurrentVersion(addressed.Number)));
+                        continue;
+                    }
+
+                    // the callee may change it, but starts from what it holds (num.ToString() in a loop counting num up): the new
+                    // version is a copy of the old one, handed out
+                    // (unless nothing was put there yet: an out argument's fresh slot)
+                    var assigned = _stacks.TryGetValue(addressed.Number, out var versions) && versions.Count > 0;
+                    var held = CurrentVersion(addressed.Number);
+                    var handed = NewName(addressed, definedHere);
+                    instruction.SetOperand(i, new AddressOf(handed));
+                    // (what it holds being 0 or null is what an unassigned one reads as too, so an out argument's slot
+                    // zeroed first needn't hold on to that)
+                    if (assigned && !_zeroed.GetValueOrDefault(held))
+                        copies.Add((instruction, new Instruction(instruction.Index, OpCode.Move, handed, held)));
                 }
             }
+
+            foreach (var (before, copy) in copies)
+                block.Instructions.Insert(block.Instructions.IndexOf(before), copy);
+            copies.Clear();
 
             // Resolve the phi operands of successors that correspond to this block's outgoing edge.
             foreach (var successor in block.Successors)
