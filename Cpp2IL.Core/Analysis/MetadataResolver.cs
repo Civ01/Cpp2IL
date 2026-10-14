@@ -731,6 +731,12 @@ public static class MetadataResolver
             if (plausible.Count > 0)
                 pool = plausible;
 
+            // the arguments' types tell apart folded methods of unrelated types (Type == Type and TimeSpan == TimeSpan
+            // compile to the same compare)
+            var scored = pool.Select(c => (Candidate: c, Score: ArgumentFit(instruction, c))).ToList();
+            var best = scored.Max(x => x.Score);
+            pool = scored.Where(x => x.Score == best).Select(x => x.Candidate).ToList();
+
             var choice = pool.FirstOrDefault(c => c.Name == method.Name) ?? pool.First();
 
             instruction.SetOperand(0, choice);
@@ -739,6 +745,37 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    // How well the typed register arguments of a raw call fit a candidate's receiver and parameters (win64: the first
+    // four in rcx, rdx, r8, r9, or xmm0-3 for floats): +1 for each that fits, -1 for each that can't be it
+    private static int ArgumentFit(Instruction call, MethodAnalysisContext candidate)
+    {
+        string[] integerSlots = ["rcx", "rdx", "r8", "r9"];
+        var slots = new List<TypeAnalysisContext?>();
+        if (!candidate.IsStatic)
+            slots.Add(candidate.DeclaringType);
+        slots.AddRange(candidate.Parameters.Select(p => (TypeAnalysisContext?)p.ParameterType));
+
+        var score = 0;
+        for (var i = 0; i < slots.Count && i < 4; i++)
+        {
+            if (slots[i] is not { } expected)
+                continue;
+
+            var floating = expected is { Namespace: "System", Name: "Single" or "Double" };
+            var register = floating ? $"xmm{i}" : integerSlots[i];
+            if (call.Operands.Skip(1).FirstOrDefault(o => o is LocalVariable local && local.Register.Name == register) is not LocalVariable { Type: { } actual })
+                continue;
+
+            if (IsSameType(actual, expected) || !actual.IsValueType && !expected.IsValueType && (IsInHierarchy(actual, expected) || IsInHierarchy(expected, actual)))
+                score++;
+            else if (actual.IsValueType != expected.IsValueType && actual is not PointerTypeAnalysisContext && expected is not (ByRefTypeAnalysisContext or PointerTypeAnalysisContext)
+                     && !(actual is { Namespace: "System", Name: "Int64" or "IntPtr" or "Int32" } && !expected.IsValueType))
+                score--;
+        }
+
+        return score;
     }
 
     internal static bool IsInHierarchy(TypeAnalysisContext type, TypeAnalysisContext? candidateOwner)
