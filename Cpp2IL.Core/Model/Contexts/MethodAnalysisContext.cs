@@ -491,6 +491,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
         DebugPassCallback?.Invoke(this, "DeadCodeEliminator.Run");
 
+        // coord - offset on a Vector2Int, as one psubd
+        PackedOperatorRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "PackedOperatorRecovery.Run");
+
         // x as T, then throw InvalidCastException if that's null: (T)x
         CheckedCastRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "CheckedCastRecovery.Run");

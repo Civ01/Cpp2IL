@@ -47,6 +47,10 @@ public class Instruction : IOperand
     /// <summary>An <see cref="OpCode.IsInst"/> that throws InvalidCastException rather than giving null: IL's castclass.</summary>
     public bool Checked;
 
+    /// <summary>A read of a first field that was an 8 byte chunk spilled to the stack (x and y of a Vector3), kept as that
+    /// field's read unless the chunk can be split into its fields after all.</summary>
+    public int SpilledChunkSize;
+
     /// <summary>Kept by dead code elimination even if nothing reads it yet (a later pass may, then clears this).</summary>
     public bool KeepAlive;
 

@@ -17,6 +17,11 @@ public static class WideChunkSplitter
 {
     private sealed record Piece(long Offset, int Size, TypeAnalysisContext Type);
 
+    public static System.Action<string>? Debug;
+
+    // locals whose address is handed out: their bytes are memory, not values to split
+    [System.ThreadStatic] private static HashSet<LocalVariable>? _addressTaken;
+
     public static bool Run(MethodAnalysisContext method)
     {
         var graph = method.ControlFlowGraph!;
@@ -39,12 +44,68 @@ public static class WideChunkSplitter
             }
         }
 
+        _addressTaken = graph.Instructions.SelectMany(i => i.Operands).OfType<AddressOf>().Select(a => a.Target).OfType<LocalVariable>().ToHashSet();
+
         var leafCache = new Dictionary<(TypeAnalysisContext, bool), List<(List<FieldAnalysisContext> Chain, long Offset, long Size)>>();
         var done = new HashSet<LocalVariable>();
         var changed = false;
 
         foreach (var load in graph.Instructions.ToList())
         {
+            // a spilled chunk read as its first field: the whole chunk, if it splits (along with the other spilled chunks
+            // it meets, which are all made whole again for the attempt)
+            if (load is { SpilledChunkSize: > 0, OpCode: OpCode.Move, Operands: [LocalVariable spill, _] } && !done.Contains(spill)
+                && Whole(load) is { } whole)
+            {
+                var originals = new Dictionary<Instruction, IOperand>();
+                foreach (var other in graph.Instructions)
+                    if (other is { SpilledChunkSize: > 0, OpCode: OpCode.Move } && Whole(other) is { } otherWhole)
+                    {
+                        originals[other] = other.Operands[1];
+                        other.SetOperand(1, otherWhole);
+                    }
+
+                var spillMembers = new List<LocalVariable>();
+                var spillStores = new List<Instruction>();
+                var split = Pieces(whole, pointerSize, leafCache) is { Count: > 1 } spillPieces
+                            && Collect(spill, spillPieces, whole.Size, spillMembers, spillStores, definitions, uses, pointerSize, leafCache);
+                Debug?.Invoke($"spilled chunk {load}: {split}");
+
+                // the others go back to what they were; the ones split stay whole
+                foreach (var (other, original) in originals)
+                    if (!split || !spillMembers.Contains((LocalVariable)other.Operands[0]))
+                        other.SetOperand(1, original);
+
+                if (split)
+                {
+                    foreach (var member in spillMembers)
+                        done.Add(member);
+                    Rewrite(method, spillMembers, spillStores, Pieces(whole, pointerSize, leafCache)!, definitions);
+                    changed = true;
+                }
+
+                continue;
+            }
+
+            // a chunk starts at a wide load, or at a packed operation on wide reads ([a]:8 - [b]:8)
+            if (load is { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate, ScalarSingle: false, Operands: [LocalVariable result, ..] }
+                && !done.Contains(result)
+                && load.Operands.Skip(1).OfType<MemoryOperand>().FirstOrDefault(m => m is { Base: LocalVariable, Index: null, Size: 8 or 16 }) is { } read
+                && Pieces(read, pointerSize, leafCache) is { Count: > 1 } readPieces && Elementwise(readPieces))
+            {
+                var operationMembers = new List<LocalVariable>();
+                var operationStores = new List<Instruction>();
+                if (Collect(result, readPieces, read.Size, operationMembers, operationStores, definitions, uses, pointerSize, leafCache))
+                {
+                    foreach (var member in operationMembers)
+                        done.Add(member);
+                    Rewrite(method, operationMembers, operationStores, readPieces, definitions);
+                    changed = true;
+                }
+
+                continue;
+            }
+
             if (load is not { OpCode: OpCode.Move, Operands: [LocalVariable loaded, MemoryOperand { Base: LocalVariable, Index: null, Size: 8 or 16 } memory] }
                 || done.Contains(loaded)
                 || Pieces(memory, pointerSize, leafCache) is not { Count: > 1 } pieces)
@@ -54,7 +115,9 @@ public static class WideChunkSplitter
             var members = new List<LocalVariable>();
             var stores = new List<Instruction>();
             if (!Collect(loaded, pieces, memory.Size, members, stores, definitions, uses, pointerSize, leafCache))
+            {
                 continue;
+            }
 
             foreach (var member in members)
                 done.Add(member);
@@ -472,6 +535,19 @@ public static class WideChunkSplitter
         return pieces.Count > 0 ? pieces : null;
     }
 
+    // the chunk a spilled chunk's first field read was (of its own memory, or of the field it resolved to)
+    private static MemoryOperand? Whole(Instruction load) => load.Operands[1] switch
+    {
+        MemoryOperand { Size: 0, Base: LocalVariable, Index: null } first => new MemoryOperand(first.Base, null, first.Addend, 0, load.SpilledChunkSize),
+        FieldReference field => new MemoryOperand(field.Local, null, field.Offset, 0, load.SpilledChunkSize),
+        _ => null,
+    };
+
+    // packed arithmetic works per field when the fields are all floats or all ints
+    private static bool Elementwise(List<Piece> pieces) =>
+        pieces.All(p => p.Size == 4 && p.Type is { Namespace: "System", Name: "Single" })
+        || pieces.All(p => p.Size == 4 && p.Type is { Namespace: "System", Name: "Int32" });
+
     private static bool SameLayout(List<Piece> a, List<Piece> b) =>
         a.Count == b.Count && a.Zip(b, (x, y) => x.Offset == y.Offset && x.Size == y.Size).All(same => same);
 
@@ -488,15 +564,29 @@ public static class WideChunkSplitter
             if (members.Contains(member))
                 continue;
 
+            if (_addressTaken?.Contains(member) == true)
+            {
+                Debug?.Invoke($"chunk from {start}: {member} has its address taken");
+                return false;
+            }
+
             // a member is one of: the wide load, a phi of wide loads/members, a copy of a member
             if (!definitions.TryGetValue(member, out var definition))
+            {
+                Debug?.Invoke($"chunk from {start}: {member} has no definition");
                 return false;
+            }
 
             switch (definition)
             {
                 case { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Base: LocalVariable, Index: null } memory] }
                     when memory.Size == size && Pieces(memory, pointerSize, cache) is { } layout && SameLayout(layout, pieces):
                     break;
+                // (a chunk at the start of a struct field, already resolved to that field)
+                case { OpCode: OpCode.Move, Operands: [_, FieldReference { Field.FieldType.IsValueType: true } field] }
+                    when definition.SpilledChunkSize == size && Pieces(new MemoryOperand(field.Local, null, field.Offset, 0, size), pointerSize, cache) is { } fieldLayout && SameLayout(fieldLayout, pieces):
+                    break;
+
                 case { OpCode: OpCode.Phi }:
                     for (var input = 1; input < definition.Operands.Count; input++)
                     {
@@ -508,7 +598,27 @@ public static class WideChunkSplitter
                 case { OpCode: OpCode.Move, Operands: [_, LocalVariable copied] }:
                     pending.Push(copied);
                     break;
+                // a packed operation on the pieces (subps/addps/xorps: one per field)
+                case { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate, ScalarSingle: false } when Elementwise(pieces):
+                    for (var operand = 1; operand < definition.Operands.Count; operand++)
+                    {
+                        switch (definition.Operands[operand])
+                        {
+                            case LocalVariable input:
+                                pending.Push(input);
+                                break;
+                            case MemoryOperand { Base: LocalVariable, Index: null } input when input.Size == size && Pieces(input, pointerSize, cache) is { } layout && SameLayout(layout, pieces):
+                                break;
+                            case Immediate { Value: 0 }:
+                                break;
+                            default:
+                                Debug?.Invoke($"chunk from {start}: operation {definition}");
+                                return false;
+                        }
+                    }
+                    break;
                 default:
+                    Debug?.Invoke($"chunk from {start}: member defined by {definition}");
                     return false;
             }
 
@@ -533,10 +643,15 @@ public static class WideChunkSplitter
                     case { OpCode: OpCode.Move, Operands: [LocalVariable copy, LocalVariable copied] } when ReferenceEquals(copied, member):
                         pending.Push(copy);
                         break;
+                    case { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate, ScalarSingle: false, Operands: [LocalVariable result, ..] }
+                        when Elementwise(pieces) && !ReferenceEquals(result, member):
+                        pending.Push(result);
+                        break;
                     // only its first float read
                     case { ScalarSingle: true } when pieces[0].Size == 4 && use.OpCode is not (OpCode.Phi or OpCode.VectorShuffle):
                         break;
                     default:
+                        Debug?.Invoke($"chunk from {start}: {member} used by {use}");
                         return false;
                 }
             }
@@ -575,7 +690,11 @@ public static class WideChunkSplitter
 
             switch (definition)
             {
-                case { OpCode: OpCode.Move, Operands: [_, MemoryOperand memory] }:
+                case { OpCode: OpCode.Move, Operands: [_, FieldReference or MemoryOperand] }:
+                    definition.SpilledChunkSize = 0;
+                    var memory = definition.Operands[1] is FieldReference resolved
+                        ? new MemoryOperand(resolved.Local, null, resolved.Offset, 0, 0)
+                        : (MemoryOperand)definition.Operands[1];
                     for (var k = 1; k < pieces.Count; k++)
                         added.Add(new Instruction(definition.Index, OpCode.Move, pieceLocals[member][k],
                             new MemoryOperand(memory.Base, null, memory.Addend + pieces[k].Offset, 0, pieces[k].Size)));
@@ -594,6 +713,27 @@ public static class WideChunkSplitter
                     for (var k = 1; k < pieces.Count; k++)
                         added.Add(new Instruction(definition.Index, OpCode.Move, pieceLocals[member][k], pieceLocals[copied][k]));
                     break;
+                case { OpCode: OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Negate }:
+                {
+                    IOperand PieceOf(IOperand operand, int k) => operand switch
+                    {
+                        LocalVariable input => pieceLocals[input][k],
+                        MemoryOperand input => new MemoryOperand(input.Base, null, input.Addend + pieces[k].Offset, 0, pieces[k].Size),
+                        _ => operand,
+                    };
+
+                    var operands = definition.Operands.ToList();
+                    for (var k = 1; k < pieces.Count; k++)
+                    {
+                        var pieceOperands = new List<IOperand> { pieceLocals[member][k] };
+                        pieceOperands.AddRange(operands.Skip(1).Select(o => PieceOf(o, k)));
+                        added.Add(new Instruction(definition.Index, definition.OpCode, pieceOperands));
+                    }
+
+                    for (var operand = 1; operand < operands.Count; operand++)
+                        definition.SetOperand(operand, PieceOf(operands[operand], 0));
+                    break;
+                }
             }
 
             block.Instructions.InsertRange(index + 1, added);
