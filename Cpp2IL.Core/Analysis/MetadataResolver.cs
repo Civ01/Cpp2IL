@@ -1030,7 +1030,7 @@ public static class MetadataResolver
         {
             if (instruction is not { OpCode: OpCode.Move, Operands: [LocalVariable methodLocal, MemoryOperand { Index: null, Scale: 0 } read] }
                 || read.Base is not LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: { } owner } }
-                || owner.IsValueType || owner is GenericParameterTypeAnalysisContext)
+                || owner.IsValueType)
                 continue;
 
             var methodOffset = read.Addend - vtableOffset - pointerSize;
@@ -1099,6 +1099,12 @@ public static class MetadataResolver
 
     private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)
     {
+        // a T constrained to a class has that class's vtable (and its overrides of it, which a virtual call reaches)
+        if (type is GenericParameterTypeAnalysisContext parameter)
+            return parameter.ConstraintTypes.FirstOrDefault(c => !c.IsInterface && !c.IsValueType) is { } constraint
+                ? ResolveVTableSlot(appContext, constraint, slot)
+                : null;
+
         var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType.Definition ?? type.Definition;
 
         if (definition == null || slot >= definition.VtableCount)
@@ -1110,7 +1116,9 @@ public static class MetadataResolver
         // an abstract method has no implementation, try to resolve it
         for (var declarer = type; declarer != null; declarer = declarer.BaseType)
         {
-            if (declarer.Methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
+            // a generic base instance's methods are those of its definition (the call is still the right method)
+            var declaring = (declarer as GenericInstanceTypeAnalysisContext)?.GenericType ?? declarer;
+            if (declaring.Methods.FirstOrDefault(m => m.Definition?.slot == slot) is { } declaration)
                 return declaration;
         }
 

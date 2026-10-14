@@ -25,9 +25,11 @@ public static class WideLoadSplitter
             if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable { Register.Name: var target }, LocalVariable vector] }
                 && !target.StartsWith("xmm") && vector.Register.Name.StartsWith("xmm")
                 && definitions.TryGetValue(vector, out var vectorLoad)
-                && vectorLoad is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Index: null, Scale: 0, Size: >= 8 } vectorSource] })
+                && vectorLoad is { OpCode: OpCode.Move, Operands: [_, MemoryOperand { Size: >= 8 } vectorSource] }
+                && (vectorSource is { Index: null, Scale: 0 } || vectorSource.Scale >= 2))
             {
-                instruction.SetOperand(1, new MemoryOperand(vectorSource.Base, null, vectorSource.Addend, 0, 0));
+                // (an array element's too, indexed by a scaled index: [arr + i*8]:16, the struct element, then its first field)
+                instruction.SetOperand(1, new MemoryOperand(vectorSource.Base, vectorSource.Index, vectorSource.Addend, vectorSource.Scale, 0));
                 continue;
             }
 
