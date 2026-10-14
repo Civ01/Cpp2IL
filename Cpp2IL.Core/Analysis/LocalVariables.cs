@@ -583,7 +583,17 @@ public static class LocalVariables
 
                 if (instruction.Operands[i] is AddressOf { Target: LocalVariable referenced }
                     && calledMethod.Parameters[parameterIndex].ParameterType is ByRefTypeAnalysisContext { ElementType: { } referencedType })
-                    changed |= SetTypeIfUnknown(referenced, referencedType);
+                {
+                    // (a bool or other small value guessed to be an int from the 0 it starts as, or a byte test of it: what
+                    // the out/ref parameter takes it as is what it is)
+                    if (referenced.Type is { Namespace: "System", Name: "Int32" or "Int64" } && referencedType is { Namespace: "System", Name: "Boolean" or "Byte" or "SByte" or "Int16" or "UInt16" or "Char" })
+                    {
+                        referenced.Type = referencedType;
+                        changed = true;
+                    }
+                    else
+                        changed |= SetTypeIfUnknown(referenced, referencedType);
+                }
 
                 // a struct passed by value travels as a pointer to a copy (win64), which is a local of that struct type
                 else if (instruction.Operands[i] is AddressOf { Target: LocalVariable copy }
