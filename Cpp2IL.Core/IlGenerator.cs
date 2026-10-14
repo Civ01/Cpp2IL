@@ -536,7 +536,7 @@ public static class IlGenerator
                     var isStaticStore = LoadFieldContainer(field, method, locals);
 
                     LoadOperand(instruction.Operands[1], method, locals, writeLine, field.Field.FieldType);
-                    instructions.Add(isStaticStore ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
+                    StoreField(field, isStaticStore, method);
                     break;
                 }
 
@@ -1223,12 +1223,21 @@ public static class IlGenerator
                 foreach (var link in field.Chain)
                 {
                     if (first && link.IsStatic)
-                        instructions.Add(CilOpCodes.Ldsfld, link.ToFieldDescriptor());
+                    {
+                        if (Accessor(link, true, method) is { } staticGetter)
+                            instructions.Add(CilOpCodes.Call, staticGetter.ToMethodDescriptor());
+                        else
+                            instructions.Add(CilOpCodes.Ldsfld, link.ToFieldDescriptor());
+                    }
                     else
                     {
                         if (first)
                             LoadLocal(field.Local, method, locals);
-                        instructions.Add(CilOpCodes.Ldfld, link.ToFieldDescriptor());
+                        // an auto-property's getter, inlined: the property
+                        if (Accessor(link, true, method) is { } getter)
+                            instructions.Add(getter.IsVirtual ? CilOpCodes.Callvirt : CilOpCodes.Call, getter.ToMethodDescriptor());
+                        else
+                            instructions.Add(CilOpCodes.Ldfld, link.ToFieldDescriptor());
                     }
 
                     first = false;
@@ -1484,6 +1493,58 @@ public static class IlGenerator
         return false;
     }
 
+    // the store of a field reference's innermost field, its container (and the value) already pushed: through an
+    // auto-property's setter if it's the backing field of one, directly on the object
+    private static void StoreField(FieldReference field, bool isStaticStore, MethodDefinition method)
+    {
+        var instructions = method.CilMethodBody!.Instructions;
+        if (field.Path.Count == 0 && Accessor(field.Field, false, method) is { } setter)
+        {
+            instructions.Add(!setter.IsStatic && setter.IsVirtual ? CilOpCodes.Callvirt : CilOpCodes.Call, setter.ToMethodDescriptor());
+            return;
+        }
+
+        instructions.Add(isStaticStore ? CilOpCodes.Stsfld : CilOpCodes.Stfld, field.Field.ToFieldDescriptor());
+    }
+
+    /// <summary>
+    /// IL2CPP inlines an auto-property's accessors into a plain read or write of its backing field
+    /// (<c>&lt;Name&gt;k__BackingField</c>), which is what the property is. The getter (or setter) to use instead, when
+    /// there is one, outside that accessor itself, for a class's or a static property (a struct's needs its address).
+    /// </summary>
+    private static MethodAnalysisContext? Accessor(FieldAnalysisContext field, bool getter, MethodDefinition current)
+    {
+        var baseField = field is ConcreteGenericFieldAnalysisContext concrete ? concrete.BaseFieldContext : field;
+        var name = baseField.Name;
+        if (!name.StartsWith("<") || !name.EndsWith(">k__BackingField"))
+            return null;
+
+        var owner = baseField.DeclaringType;
+        if (!baseField.IsStatic && owner.IsValueType)
+            return null;
+
+        var propertyName = name[1..name.IndexOf('>')];
+        var property = owner.Properties.FirstOrDefault(p => p.Name == propertyName);
+        var accessor = getter ? property?.Getter : property?.Setter;
+        if (accessor == null || accessor.IsStatic != baseField.IsStatic || accessor.Parameters.Count != (getter ? 0 : 1)
+            || accessor.GetExtraData<MethodDefinition>("AsmResolverMethod") is not { } accessorDefinition || ReferenceEquals(accessorDefinition, current))
+            return null;
+
+        if (field is ConcreteGenericFieldAnalysisContext { DeclaringType: GenericInstanceTypeAnalysisContext instance })
+        {
+            try
+            {
+                return new ConcreteGenericMethodAnalysisContext(accessor, instance.GenericArguments, []);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        return owner.GenericParameters.Count > 0 ? null : accessor;
+    }
+
     private static void StoreLocal(LocalVariable local, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals)
     {
         var instructions = method.CilMethodBody!.Instructions;
@@ -1587,7 +1648,7 @@ public static class IlGenerator
 
                 if (field.Field.IsStatic && field.Path.Count == 0)
                 {
-                    instructions.Add(CilOpCodes.Stsfld, fieldDescriptor);
+                    StoreField(field, true, method);
                     break;
                 }
 
@@ -1599,7 +1660,7 @@ public static class IlGenerator
                 instructions.Add(CilOpCodes.Stloc, scratch);
                 var isStaticStore = LoadFieldContainer(field, method, locals);
                 instructions.Add(CilOpCodes.Ldloc, scratch);
-                instructions.Add(isStaticStore ? CilOpCodes.Stsfld : CilOpCodes.Stfld, fieldDescriptor);
+                StoreField(field, isStaticStore, method);
                 break;
 
             case ArrayAccess arrayAccess:
