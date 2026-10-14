@@ -194,6 +194,7 @@ public static class MetadataResolver
     public static bool ResolveFieldOffsets(MethodAnalysisContext method, bool allowTrailingPadding)
     {
         var changed = false;
+        Dictionary<LocalVariable, List<TypeAnalysisContext>>? checkedTypes = null;
 
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
@@ -269,7 +270,29 @@ public static class MetadataResolver
                 }
                 else
                 {
-                    if (FindFieldChain(genericOwner?.GenericType ?? owner, staticOwner != null, memory.Addend, memory.Size, pointerSize, allowTrailingPadding) is not { } chain)
+                    var chain = FindFieldChain(genericOwner?.GenericType ?? owner, staticOwner != null, memory.Addend, memory.Size, pointerSize, allowTrailingPadding);
+
+                    // not a field of what the local is typed as, but it was checked to be something more derived (x is Var<T>, then
+                    // x's own fields read rather than the cast's): a field of that
+                    if (chain == null && staticOwner == null && !owner.IsValueType)
+                    {
+                        checkedTypes ??= CheckedTypes(method);
+                        foreach (var derived in checkedTypes.GetValueOrDefault(local) ?? [])
+                        {
+                            if (!IsInHierarchy((derived as GenericInstanceTypeAnalysisContext)?.GenericType ?? derived, owner) || ReferenceEquals(derived, owner))
+                                continue;
+
+                            chain = derived is GenericInstanceTypeAnalysisContext derivedInstance
+                                ? GenericInstanceFieldLayout.FindFieldChain(derivedInstance, memory.Addend, memory.Size, pointerSize)
+                                : derived.GenericParameters.Count > 0
+                                    ? GenericInstanceFieldLayout.FindFieldChainOpen(derived, memory.Addend, memory.Size, pointerSize)
+                                    : FindFieldChain(derived, false, memory.Addend, memory.Size, pointerSize, allowTrailingPadding);
+                            if (chain != null)
+                                break;
+                        }
+                    }
+
+                    if (chain == null)
                         continue;
 
                     field = chain[^1];
@@ -297,6 +320,51 @@ public static class MetadataResolver
         }
 
         return changed;
+    }
+
+    // The types each local (or a copy of it) is checked against with isinst
+    private static Dictionary<LocalVariable, List<TypeAnalysisContext>> CheckedTypes(MethodAnalysisContext method)
+    {
+        // copies are one value
+        var parent = new Dictionary<LocalVariable, LocalVariable>();
+        LocalVariable Find(LocalVariable local)
+        {
+            while (parent.TryGetValue(local, out var up) && !ReferenceEquals(up, local))
+                local = up;
+            return local;
+        }
+
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable to, LocalVariable from] })
+                parent[Find(to)] = Find(from);
+
+        var byRoot = new Dictionary<LocalVariable, List<TypeAnalysisContext>>();
+        foreach (var instruction in method.ControlFlowGraph.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.IsInst, Operands: [LocalVariable result, var klass, LocalVariable checkedLocal, ..] })
+                continue;
+
+            var target = klass switch
+            {
+                RuntimeClassTypeAnalysisContext { RepresentedType: var represented } => represented,
+                LocalVariable { Type: RuntimeClassTypeAnalysisContext { RepresentedType: var represented } } => represented,
+                _ => result.Type
+            };
+            if (target == null)
+                continue;
+
+            var root = Find(checkedLocal);
+            if (!byRoot.TryGetValue(root, out var list))
+                byRoot[root] = list = [];
+            if (!list.Contains(target))
+                list.Add(target);
+        }
+
+        var result2 = new Dictionary<LocalVariable, List<TypeAnalysisContext>>();
+        foreach (var local in method.ControlFlowGraph.Instructions.SelectMany(i => i.Operands).OfType<LocalVariable>().Distinct())
+            if (byRoot.TryGetValue(Find(local), out var types))
+                result2[local] = types;
+        return result2;
     }
 
     /// <summary>
@@ -1095,6 +1163,56 @@ public static class MetadataResolver
         call.OpCode = resolved.IsVoid ? OpCode.CallVoid : OpCode.Call;
         call.SetOperands(operands);
         return true;
+    }
+
+    /// <summary>
+    /// A call into shared generic code resolves to the shared instantiation (List&lt;object&gt;.GetEnumerator for a List&lt;T&gt;'s),
+    /// whose types say object for every type parameter. Called on a receiver whose type is the same generic over its real
+    /// arguments, it is that instantiation's method, which returns (and takes) the real types.
+    /// </summary>
+    public static bool InstantiateOnReceivers(MethodAnalysisContext method)
+    {
+        var changed = false;
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+        {
+            if (instruction is not { OpCode: OpCode.Call or OpCode.CallVoid, Operands: [ConcreteGenericMethodAnalysisContext { IsStatic: false } called, ..] }
+                || called.TypeGenericParameters.Count == 0 || called.TypeGenericParameters.Any(a => a.FullName != "System.Object"))
+                continue;
+
+            var receiverAt = instruction.OpCode == OpCode.CallVoid ? 1 : 2;
+            if (receiverAt >= instruction.Operands.Count)
+                continue;
+
+            var receiverType = instruction.Operands[receiverAt] switch
+            {
+                LocalVariable { Type: { } localType } => localType,
+                AddressOf { Target: LocalVariable { Type: { } addressedType } } => addressedType,
+                FieldReference field => field.Field.FieldType,
+                _ => null
+            };
+            if (receiverType is ByRefTypeAnalysisContext { ElementType: { } referent })
+                receiverType = referent;
+
+            if (receiverType is not GenericInstanceTypeAnalysisContext real || called.BaseMethodContext.DeclaringType is not { } declaring
+                || !ReferenceEquals(real.GenericType, (declaring as GenericInstanceTypeAnalysisContext)?.GenericType ?? declaring)
+                || real.GenericArguments.Count != called.TypeGenericParameters.Count || real.GenericArguments.All(a => a.FullName == "System.Object"))
+                continue;
+
+            ConcreteGenericMethodAnalysisContext instantiated;
+            try
+            {
+                instantiated = new ConcreteGenericMethodAnalysisContext(called.BaseMethodContext, real.GenericArguments, called.MethodGenericParameters);
+            }
+            catch
+            {
+                continue;
+            }
+
+            instruction.SetOperand(0, instantiated);
+            changed = true;
+        }
+
+        return changed;
     }
 
     private static MethodAnalysisContext? ResolveVTableSlot(ApplicationAnalysisContext appContext, TypeAnalysisContext type, int slot)

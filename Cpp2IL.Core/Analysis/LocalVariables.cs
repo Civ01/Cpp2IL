@@ -422,6 +422,7 @@ public static class LocalVariables
             changed |= MetadataResolver.ResolveCallsViaMethodInfo(method);
             changed |= MetadataResolver.ResolveAmbiguousCalls(method);
             changed |= MetadataResolver.ResolveVirtualCalls(method);
+            changed |= MetadataResolver.InstantiateOnReceivers(method);
             changed |= PropagateFromCallParameters(method);
             changed |= MetadataResolver.ResolveFieldOffsets(method);
             changed |= MetadataResolver.ResolveFieldAddresses(method);
@@ -691,12 +692,28 @@ public static class LocalVariables
             return true;
         }
 
-        if (local.TypeReplacements >= MaxTypeReplacements || !IsStrictlyMoreDerived(type, local.Type))
+        if (local.TypeReplacements >= MaxTypeReplacements || !IsStrictlyMoreDerived(type, local.Type) && !RefinesShared(type, local.Type))
             return false;
 
         local.Type = type;
         local.TypeReplacements++;
         return true;
+    }
+
+    // Shared generic code sees its type parameters as object (List<object>.Enumerator for a List<T>'s): the same generic
+    // over the real arguments, or for object a T constrained to a class, is what it really is
+    internal static bool RefinesShared(TypeAnalysisContext candidate, TypeAnalysisContext current)
+    {
+        if (candidate is ByRefTypeAnalysisContext { ElementType: { } candidateElement } && current is ByRefTypeAnalysisContext { ElementType: { } currentElement })
+            return RefinesShared(candidateElement, currentElement);
+
+        if (candidate is GenericInstanceTypeAnalysisContext refined && current is GenericInstanceTypeAnalysisContext shared)
+            return ReferenceEquals(refined.GenericType, shared.GenericType) && refined.GenericArguments.Count == shared.GenericArguments.Count
+                   && shared.GenericArguments.All(a => a.FullName == "System.Object")
+                   && refined.GenericArguments.Any(a => a.FullName != "System.Object");
+
+        return current.FullName == "System.Object" && candidate is GenericParameterTypeAnalysisContext parameter
+               && parameter.ConstraintTypes.Any(c => !c.IsInterface && !c.IsValueType);
     }
 
     // For a definition that's ground truth (a field load): it also overrides a type a use guessed that isn't even
