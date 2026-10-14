@@ -183,7 +183,12 @@ public static class StackStructRecovery
                && (isWrite || !held.Contains(instruction));
         // A slot several structs take turns in: each access is the struct whose fill reaches it
         var webs = new Dictionary<Slot, Dictionary<(Instruction, int), Instance?>>();
-        foreach (var slot in accepted.Where(s => s.Instances.Count > 1))
+        // (and a slot of one struct that's also used for something bigger: a Color built there and copied out before
+        // the Vector3 argument goes in, which would otherwise reject the slot)
+        bool Outgrown(Slot slot) => slot.Instances.Count == 1 && graph.Instructions.Any(i => i.Operands.Any(o =>
+            o is StackOffset access && access.Offset < slot.End && access.Offset + Math.Max(access.Size, 1) > slot.Start
+            && (access.Offset < slot.Start || access.Offset + Math.Max(access.Size, 1) > slot.End)));
+        foreach (var slot in accepted.Where(s => s.Instances.Count > 1 || Outgrown(s)))
             if (Webs(graph, slot) is { } owners)
                 webs[slot] = owners;
             else
