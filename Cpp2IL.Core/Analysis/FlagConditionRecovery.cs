@@ -59,7 +59,35 @@ public static class FlagConditionRecovery
                 definition.SetOperands(definition.Operands[0], op0!, op1!);
             }
         }
+
+        // A zero flag kept as a value rather than branched on (cmp a,b / setne cl: bool changed = a != b) is the
+        // comparison itself, not a test of the difference: ZF := (a - b) == 0 is ZF := a == b
+        foreach (var instruction in cfg.Instructions)
+            if (instruction is { OpCode: OpCode.CheckEqual, Operands: [LocalVariable, LocalVariable difference, Immediate { Value: 0 }] }
+                && Def(difference, defOf) is { OpCode: OpCode.Subtract, Operands: [_, var left, var right] })
+                instruction.SetOperands(instruction.Operands[0], left, right);
+
+        // setne after it: (a == b) == 0 is a != b
+        foreach (var instruction in cfg.Instructions)
+            if (instruction is { OpCode: OpCode.CheckEqual, Operands: [LocalVariable, LocalVariable tested, Immediate { Value: 0 }] }
+                && Def(tested, defOf) is { Operands: [_, var a, var b] } comparison
+                && Negated(comparison.OpCode) is { } negated)
+            {
+                instruction.OpCode = negated;
+                instruction.SetOperands(instruction.Operands[0], a, b);
+            }
     }
+
+    private static OpCode? Negated(OpCode relational) => relational switch
+    {
+        OpCode.CheckEqual => OpCode.CheckNotEqual,
+        OpCode.CheckNotEqual => OpCode.CheckEqual,
+        OpCode.CheckLess => OpCode.CheckGreaterOrEqual,
+        OpCode.CheckGreaterOrEqual => OpCode.CheckLess,
+        OpCode.CheckGreater => OpCode.CheckLessOrEqual,
+        OpCode.CheckLessOrEqual => OpCode.CheckGreater,
+        _ => null,
+    };
 
     private static bool IsZero(IOperand? operand, Dictionary<LocalVariable, Instruction> defOf)
     {
