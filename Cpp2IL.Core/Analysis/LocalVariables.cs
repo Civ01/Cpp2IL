@@ -443,12 +443,46 @@ public static class LocalVariables
         var changed = false;
         var pointerSize = method.AppContext.Binary.PointerSizeBytes;
 
+        // what an untyped local holds the address of a struct local for: lea rcx,[rsp+40h] / add rcx,8 is &sm.builder
+        Dictionary<LocalVariable, LocalVariable>? addressesOf = null;
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
+            if (instruction is { OpCode: OpCode.Add, Operands: [LocalVariable structDestination, LocalVariable { Type: null } or AddressOf { Target: LocalVariable } , Immediate { Value: > 0 and < 0x10000 } structOffset] })
+            {
+                addressesOf ??= method.ControlFlowGraph.Instructions
+                    .Where(i => i is { OpCode: OpCode.Move, Operands: [LocalVariable, AddressOf { Target: LocalVariable { Type: { IsValueType: true } } }] })
+                    .GroupBy(i => (LocalVariable)i.Operands[0]).Where(g => g.Count() == 1)
+                    .ToDictionary(g => g.Key, g => (LocalVariable)((AddressOf)g.First().Operands[1]).Target);
+
+                var structLocal = instruction.Operands[1] switch
+                {
+                    AddressOf { Target: LocalVariable direct } => direct,
+                    LocalVariable pointer when addressesOf.TryGetValue(pointer, out var pointed) => pointed,
+                    _ => null,
+                };
+
+                if (structLocal is { Type: { IsValueType: true } structType } && structType is not (GenericInstanceTypeAnalysisContext or PointerTypeAnalysisContext or ByRefTypeAnalysisContext)
+                    && structType.GenericParameters.Count == 0
+                    && MetadataResolver.FindFieldChain(structType, false, structOffset.Value, 0, pointerSize) is { } structChain
+                    && structChain.FindIndex(f => f.BackingData?.FieldOffset is not null && StackStructRecovery.IsStruct(f.FieldType)) is var at and >= 0)
+                {
+                    var structField = structChain[at];
+                    instruction.OpCode = OpCode.Move;
+                    instruction.SetOperands(structDestination, new AddressOf(new FieldReference(structField, structLocal, (int)structOffset.Value) { Path = structChain.GetRange(0, at) }));
+                    structDestination.Type = structField.FieldType.MakeByReferenceType();
+                    changed = true;
+                }
+
+                continue;
+            }
+
             if (instruction is not { OpCode: OpCode.Add, Operands: [LocalVariable destination, LocalVariable { Type: { } baseType } baseLocal, Immediate { Value: > 0 and < 0x10000 } offset] })
                 continue;
 
-            var owner = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element : baseType;
+            var owner = baseType is ByRefTypeAnalysisContext { ElementType: { } element } ? element
+                : baseType is PointerTypeAnalysisContext { ElementType: { IsValueType: true } pointee } ? pointee
+                : baseType;
             if (owner is GenericInstanceTypeAnalysisContext || owner.GenericParameters.Count > 0 || owner is RuntimeClassTypeAnalysisContext or StaticFieldStorageTypeAnalysisContext
                 || owner.FullName is "System.Int32" or "System.Int64" or "System.IntPtr" or "System.Object")
                 continue;
