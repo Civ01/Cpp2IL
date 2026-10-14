@@ -43,7 +43,7 @@ public static class DeadCodeEliminator
                 if (instruction.OpCode == OpCode.Nop)
                     continue;
 
-                if (IsRemovable(instruction.OpCode) && !instruction.KeepAlive && instruction.Destination is LocalVariable destination)
+                if ((IsRemovable(instruction.OpCode) || instruction is { OpCode: OpCode.IsInst, Checked: false }) && !instruction.KeepAlive && instruction.Destination is LocalVariable destination)
                 {
                     if (!definitions.TryGetValue(destination, out var list))
                         definitions[destination] = list = [];

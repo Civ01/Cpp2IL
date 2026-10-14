@@ -91,7 +91,7 @@ public static class SsaSimplifier
         return value;
     }
 
-    private static void ReplaceUses(Instruction instruction, Dictionary<LocalVariable, IOperand> resolved)
+    internal static void ReplaceUses(Instruction instruction, Dictionary<LocalVariable, IOperand> resolved)
     {
         // The single definition position (a Move/Call destination local) must not be rewritten - only
         // reads are forwarded. In SSA the local being eliminated never appears as a use of itself, so
