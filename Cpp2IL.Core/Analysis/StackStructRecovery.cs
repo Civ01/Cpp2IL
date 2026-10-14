@@ -161,6 +161,13 @@ public static class StackStructRecovery
         slots = slots.OrderBy(r => r.Start).ToList();
         Debug?.Invoke("slots: " + string.Join(", ", slots.Select(r => $"{r.Start:X}-{r.End:X} " + string.Join("|", r.Instances.Select(i => i.Type.ToString())))));
 
+        // a struct inside another's slot as one of its fields (an async state machine's builder, Start(ref builder)) is
+        // that field
+        slots = slots.Where(inner => !slots.Any(outer => !ReferenceEquals(outer, inner) && outer.Instances.Count == 1 && inner.Instances.Count == 1
+                                                          && outer.Start <= inner.Start && inner.End <= outer.End && outer.End - outer.Start > inner.End - inner.Start
+                                                          && IsFieldAt(outer.Instances[0].Type, inner.Start - outer.Start, inner.Instances[0].Type, app.Binary.PointerSizeBytes)))
+            .ToList();
+
         var accepted = new List<Slot>();
         for (var i = 0; i < slots.Count; i++)
         {
@@ -197,6 +204,7 @@ public static class StackStructRecovery
         // Which instance each access belongs to. An access straddling a slot boundary means our idea of the layout is
         // wrong, as does taking the address of the middle of one (we can't represent that yet)
         var assignments = new List<(Instruction Instruction, int Operand, Instance Instance, int Start)>();
+        var interiors = new List<(Instruction Instruction, Instance Instance, int Start, int Offset)>();
         var partlyOther = new HashSet<Slot>();
         foreach (var instruction in graph.Instructions)
         {
@@ -245,6 +253,15 @@ public static class StackStructRecovery
                         {
                             if (addressed.Offset > slot.Start)
                             {
+                                // the address of a field of the one struct there (lea rcx,[rsp+48h] for &sm.builder, or a
+                                // reference field's for the write barrier): the struct's address, then the field's offset added
+                                if (slot.Instances.Count == 1 && instruction is { OpCode: OpCode.Move, Operands: [Register, AddressOf] }
+                                    && FieldChainAt(slot.Instances[0].Type, addressed.Offset - slot.Start, app.Binary.PointerSizeBytes) is { Count: > 0 })
+                                {
+                                    interiors.Add((instruction, slot.Instances[0], slot.Start, addressed.Offset - slot.Start));
+                                    continue;
+                                }
+
                                 accepted.Remove(slot);
                                 continue;
                             }
@@ -297,6 +314,16 @@ public static class StackStructRecovery
 
         if (renamed.Count > 0)
             assignments = assignments.Select(a => renamed.TryGetValue(a.Instance, out var to) ? a with { Instance = to } : a).ToList();
+
+        foreach (var (instruction, instance, slotStart, offset) in interiors)
+        {
+            if (!accepted.Any(r => r.Start == slotStart) || graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(instruction)) is not { } block)
+                continue;
+
+            var holder = (Register)instruction.Operands[0];
+            instruction.SetOperand(1, new AddressOf(new Register(null, renamed.TryGetValue(instance, out var to) ? to.Name : instance.Name)));
+            block.Instructions.Insert(block.Instructions.IndexOf(instruction) + 1, new Instruction(instruction.Index, OpCode.Add, holder, holder, new Immediate(offset)));
+        }
 
         foreach (var (instruction, operandIndex, instance, slotStart) in assignments)
         {
@@ -1030,6 +1057,29 @@ public static class StackStructRecovery
         }
 
         return true;
+    }
+
+    private static List<FieldAnalysisContext>? FieldChainAt(TypeAnalysisContext type, int offset, int pointerSize)
+    {
+        try
+        {
+            return type is GenericInstanceTypeAnalysisContext generic
+                ? GenericInstanceFieldLayout.FindFieldChain(generic, offset, 0, pointerSize)
+                : MetadataResolver.FindFieldChain(type, false, offset, 0, pointerSize);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // whether a field of the type (or of its struct fields) of that type starts at that offset
+    private static bool IsFieldAt(TypeAnalysisContext outer, int offset, TypeAnalysisContext inner, int pointerSize)
+    {
+        if (FieldChainAt(outer, offset, pointerSize) is not { } chain)
+            return false;
+
+        return chain.Any(field => field.FieldType.FullName == inner.FullName);
     }
 
     private static readonly HashSet<string> PrimitiveNames =
