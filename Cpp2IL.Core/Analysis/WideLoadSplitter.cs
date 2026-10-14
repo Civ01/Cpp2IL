@@ -30,6 +30,9 @@ public static class WideLoadSplitter
             {
                 // (an array element's too, indexed by a scaled index: [arr + i*8]:16, the struct element, then its first field)
                 instruction.SetOperand(1, new MemoryOperand(vectorSource.Base, vectorSource.Index, vectorSource.Addend, vectorSource.Scale, 0));
+                // (an 8 byte spill to the stack may be x and y of a Vector3 kept for later, which chunk splitting tries for)
+                if (target.StartsWith("stack_") && vectorSource.Size == 8)
+                    instruction.SpilledChunkSize = 8;
                 continue;
             }
 
