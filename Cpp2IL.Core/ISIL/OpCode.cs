@@ -142,5 +142,10 @@ public enum OpCode
     /// Op 1 := lanes of the 128-bit vectors op 2 and op 3, as selected per result lane by op 4 (4 bits per lane, lane 0
     /// lowest: 0-3 = that lane of op 2, 4-7 = lane (n - 4) of op 3, 8 = zero). Lowered by VectorLaneRecovery.
     /// </summary>
-    VectorShuffle
+    VectorShuffle,
+
+    /// <summary>
+    /// Op 1 := the exception being caught, at the start of a catch block.
+    /// </summary>
+    CatchException
 }
