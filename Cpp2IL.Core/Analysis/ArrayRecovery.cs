@@ -24,11 +24,22 @@ public static class ArrayRecovery
 
     public static void Run(MethodAnalysisContext method)
     {
+        PutArrayFirst(method);
         RecoverElementCopies(method);
         RecoverAccesses(method);
         RecoverStructElementFields(method);
         RecoverStructElementAddresses(method);
         GroupInitialisers(method.ControlFlowGraph!);
+    }
+
+    // [offset + 20h + arr]: a byte offset kept in the loop (i * 56) is what's in the base register, and the array the index
+    // register, unscaled. The array goes first, as everything below expects it there.
+    private static void PutArrayFirst(MethodAnalysisContext method)
+    {
+        foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            for (var i = 0; i < instruction.Operands.Count; i++)
+                if (instruction.Operands[i] is MemoryOperand { Base: LocalVariable { Type: not SzArrayTypeAnalysisContext } offset, Index: LocalVariable { Type: SzArrayTypeAnalysisContext } array, Scale: 0 or 1 } memory)
+                    instruction.SetOperand(i, new MemoryOperand(array, offset, memory.Addend, 1, memory.Size));
     }
 
     private static void RecoverAccesses(MethodAnalysisContext method)
@@ -108,10 +119,24 @@ public static class ArrayRecovery
                     long fieldOffset;
                     if (address.Root != null)
                     {
-                        if (address.Multiplier != elementSize || offset < 0 || offset >= elementSize)
+                        if (address.Multiplier != elementSize)
                             continue;
-                        index = address.Root;
-                        fieldOffset = offset;
+
+                        // an element some way off the root (arr[arr.Length - 1]): the index is computed first
+                        var shift = (long)Math.Floor((double)offset / elementSize);
+                        fieldOffset = offset - shift * elementSize;
+                        if (shift == 0)
+                            index = address.Root;
+                        else
+                        {
+                            var shifted = new LocalVariable($"index{method.Locals.Count}", new Register(null, $"INDEX_{method.Locals.Count}", 0), method.AppContext.SystemTypes.SystemInt32Type);
+                            method.Locals.Add(shifted);
+                            block.Instructions.Insert(at, shift < 0
+                                ? new Instruction(instruction.Index, OpCode.Subtract, shifted, address.Root, new Immediate(-shift))
+                                : new Instruction(instruction.Index, OpCode.Add, shifted, address.Root, new Immediate(shift)));
+                            at++;
+                            index = shifted;
+                        }
                     }
                     else
                     {
@@ -374,6 +399,10 @@ public static class ArrayRecovery
         if (!elementType.IsValueType)
             return pointerSize;
 
+        // an enum is its underlying type
+        if (elementType.IsEnumType)
+            return elementType.Fields.FirstOrDefault(f => !f.IsStatic) is { } underlying ? ElementSize(underlying.FieldType, pointerSize) : 4;
+
         return elementType.FullName switch
         {
             "System.Boolean" or "System.Byte" or "System.SByte" => 1,
@@ -488,6 +517,10 @@ public static class ArrayRecovery
             case FieldReference field:
                 return new Affine(field, 1, 0);
 
+            // an array's length, as in arr[arr.Length - 1]
+            case ArrayLength length:
+                return new Affine(length, 1, 0);
+
             case LocalVariable local:
             {
                 if (!definitions.TryGetValue(local, out var definition) || definition == null)
@@ -537,6 +570,7 @@ public static class ArrayRecovery
     private static bool SameRoot(IOperand a, IOperand b) => (a, b) switch
     {
         (FieldReference x, FieldReference y) => x.Field == y.Field && ReferenceEquals(x.Local, y.Local) && x.Path.SequenceEqual(y.Path),
+        (ArrayLength x, ArrayLength y) => ReferenceEquals(x.Array, y.Array),
         _ => ReferenceEquals(a, b),
     };
 
