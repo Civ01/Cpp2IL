@@ -73,6 +73,7 @@ public static class Simplifier
         {
             var changed = false;
             var definitionCounts = CountDefinitions();
+            var addressTaken = AddressTakenLocals();
 
             var visited = new HashSet<Block>();
             var queue = new Queue<Block>(_graph.Blocks.Count);
@@ -93,7 +94,7 @@ public static class Simplifier
                     var instruction = block.Instructions[i];
 
                     // If it's move and it moves something to local, replace and remove it
-                    if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local)
+                    if (instruction.OpCode == OpCode.Move && instruction.Operands[0] is LocalVariable local && !addressTaken.Contains(local))
                     {
                         if (IsLocalUsedAfterInstruction(block, i + 1, local, out var usedByMemory))
                         {
@@ -135,6 +136,7 @@ public static class Simplifier
         private void InlineLocals()
         {
             var definitionCounts = CountDefinitions();
+            var addressTaken = AddressTakenLocals();
 
             var visited = new HashSet<Block>();
             var queue = new Queue<Block>(_method.ControlFlowGraph!.Blocks.Count);
@@ -155,7 +157,8 @@ public static class Simplifier
                     var instruction = block.Instructions[i];
 
                     // If it's move and it moves local to local, replace and remove it
-                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] })
+                    // (not into a struct whose address is handed out: what it's changed to through that isn't seen here)
+                    if (instruction is { OpCode: OpCode.Move, Operands: [LocalVariable local, LocalVariable source] } && !addressTaken.Contains(local))
                     {
                         // A local with several definitions is not in SSA form, so its value at a join
                         // depends on the path taken; don't carry this definition across that join.

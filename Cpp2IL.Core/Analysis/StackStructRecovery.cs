@@ -181,6 +181,14 @@ public static class StackStructRecovery
             => holding.TryGetValue(slot, out var held)
                && !slot.Instances.Any(i => i.Roots.Any(r => ReferenceEquals(r.Call, instruction) || ReferenceEquals(r.Definition, instruction)))
                && (isWrite || !held.Contains(instruction));
+        // A slot several structs take turns in: each access is the struct whose fill reaches it
+        var webs = new Dictionary<Slot, Dictionary<(Instruction, int), Instance?>>();
+        foreach (var slot in accepted.Where(s => s.Instances.Count > 1))
+            if (Webs(graph, slot) is { } owners)
+                webs[slot] = owners;
+            else
+                Debug?.Invoke($"no webs for {slot.Start:X}");
+
         // Which instance each access belongs to. An access straddling a slot boundary means our idea of the layout is
         // wrong, as does taking the address of the middle of one (we can't represent that yet)
         var assignments = new List<(Instruction Instruction, int Operand, Instance Instance, int Start)>();
@@ -196,6 +204,16 @@ public static class StackStructRecovery
                         var accessEnd = access.Offset + (access.Size > 0 ? access.Size : 1);
                         foreach (var slot in accepted.Where(r => access.Offset < r.End && accessEnd > r.Start).ToList())
                         {
+                            if (webs.TryGetValue(slot, out var owners))
+                            {
+                                // not any struct's: a spill sharing the slot, left as it is
+                                if (owners.GetValueOrDefault((instruction, operandIndex)) is not { } owned)
+                                    partlyOther.Add(slot);
+                                else
+                                    assignments.Add((instruction, operandIndex, owned, slot.Start));
+                                continue;
+                            }
+
                             var isWrite = operandIndex == 0 && instruction.OpCode == OpCode.Move;
                             if (NotTheStruct(slot, instruction, isWrite))
                             {
@@ -226,6 +244,15 @@ public static class StackStructRecovery
                                 continue;
                             }
 
+                            if (webs.TryGetValue(slot, out var owners))
+                            {
+                                if (owners.GetValueOrDefault((instruction, operandIndex)) is not { } owned)
+                                    partlyOther.Add(slot);
+                                else
+                                    assignments.Add((instruction, operandIndex, owned, slot.Start));
+                                continue;
+                            }
+
                             if (slot.Instances.Count == 1)
                             {
                                 assignments.Add((instruction, operandIndex, slot.Instances[0], slot.Start));
@@ -233,6 +260,10 @@ public static class StackStructRecovery
                             }
 
                             var owner = slot.Instances.FirstOrDefault(i => i.Roots.Any(r => r.Definition == instruction));
+                            // an address nothing uses (handed to a call to an empty method, since removed) is no one's
+                            if (owner == null && IsDeadTake(graph, instruction))
+                                continue;
+
                             if (owner == null)
                             {
                                 Debug?.Invoke($"reject {slot.Start:X}: unowned address {instruction}");
@@ -660,6 +691,342 @@ public static class StackStructRecovery
         return next ?? previous;
     }
 
+    private sealed class Event(Instruction instruction, int operand, int start, int end, bool use, bool def)
+    {
+        public readonly Instruction Instruction = instruction;
+        public readonly int Operand = operand;
+        public readonly int Start = start, End = end;
+        public readonly bool Use = use, Def = def;
+        public Instance? Owner;
+        public int Parent = -1;
+    }
+
+    /// <summary>
+    /// MSVC gives structs whose lifetimes don't overlap the same stack slot (one enumerator after another, a returned
+    /// struct, then an argument being built), and uses it for spills in between. Which struct an access is to follows
+    /// from which writes reach it: reaching definitions over the slot's bytes, where a read joins every write of its bytes
+    /// reaching it, and a call handed the slot as a struct reads (and maybe writes) all of it. Each group so joined is one
+    /// value; the struct is the one a call takes it as. A group with none is a spill (null); one with two different structs
+    /// means we can't tell (no answer at all).
+    /// </summary>
+    private static Dictionary<(Instruction, int), Instance?>? Webs(ISILControlFlowGraph graph, Slot slot)
+    {
+        bool Overlaps(int start, int end) => start < slot.End && end > slot.Start;
+
+        // what the roots are: an address taken for a call, or a fill of the slot itself (a spilled return, a copy in)
+        var rootsAt = new Dictionary<Instruction, List<(Root Root, Instance Instance)>>();
+        foreach (var instance in slot.Instances)
+            foreach (var root in instance.Roots)
+            {
+                foreach (var at in new[] { root.Call, root.Definition }.Distinct())
+                {
+                    if (!rootsAt.TryGetValue(at, out var list))
+                        rootsAt[at] = list = [];
+                    list.Add((root, instance));
+                }
+            }
+
+        bool FillsSlot(Instruction instruction)
+            => instruction is { Destination: StackOffset written, Operands: [StackOffset, ..] } && Overlaps(written.Offset, written.Offset + Math.Max(written.Size, 1));
+
+        var events = new List<Event>();
+        var perBlock = new Dictionary<Block, List<int>>();
+        var rootEvents = new Dictionary<Root, List<int>>();
+
+        int Add(Block block, Event e, Root? root = null, Instance? owner = null)
+        {
+            e.Owner = owner;
+            events.Add(e);
+            perBlock[block].Add(events.Count - 1);
+            if (root != null)
+            {
+                if (!rootEvents.TryGetValue(root, out var list))
+                    rootEvents[root] = list = [];
+                list.Add(events.Count - 1);
+            }
+
+            return events.Count - 1;
+        }
+
+        foreach (var block in graph.Blocks)
+        {
+            perBlock[block] = [];
+            // an address handed to a call is read by it, not where it's taken (lea rdx,[rsp+50h] / movaps [rsp+50h],xmm0
+            // / call: filled in between)
+            var atCall = new Dictionary<Instruction, List<Event>>();
+            foreach (var instruction in block.Instructions)
+            {
+                rootsAt.TryGetValue(instruction, out var roots);
+                if (atCall.Remove(instruction, out var deferred))
+                    foreach (var e in deferred)
+                        Add(block, e);
+
+                // reads first
+                for (var i = 0; i < instruction.Operands.Count; i++)
+                {
+                    switch (instruction.Operands[i])
+                    {
+                        case StackOffset read when !(i == 0 && instruction.Destination is StackOffset):
+                        {
+                            var end = read.Offset + Math.Max(read.Size, 1);
+                            if (Overlaps(read.Offset, end))
+                                Add(block, new Event(instruction, i, read.Offset, end, true, false));
+                            break;
+                        }
+                        case AddressOf { Target: StackOffset addressed } when Overlaps(addressed.Offset, addressed.Offset + 1):
+                        {
+                            var owner = roots?.FirstOrDefault(r => ReferenceEquals(r.Root.Definition, instruction));
+                            if (owner is { Root: { } root, Instance: { } instance })
+                                Add(block, new Event(instruction, i, instance.Start, instance.End, false, false), root, instance);
+                            else if (!IsDeadTake(graph, instruction))
+                            {
+                                // taken for something we don't know of: it may read any of it, or what's written there for it
+                                // since the call before (mov [rsp+40h],r12d / lea rdx,[rsp+40h] / call: those bytes)
+                                var at = block.Instructions.IndexOf(instruction);
+                                var call = block.Instructions.Skip(at + 1).FirstOrDefault(x => x.IsCall || x.OpCode == OpCode.IndirectCall);
+                                var since = block.Instructions.FindLastIndex(at, x => x.IsCall || x.OpCode == OpCode.IndirectCall) + 1;
+                                var built = call == null ? [] : block.Instructions.Skip(since).TakeWhile(x => x != call)
+                                    .Select(x => x.Destination as StackOffset?).Where(w => w is { } written && Overlaps(written.Offset, written.Offset + Math.Max(written.Size, 1)))
+                                    .Select(w => w!.Value).ToList();
+                                var e = built.Count == 0
+                                    ? new Event(instruction, i, slot.Start, slot.End, true, false)
+                                    : new Event(instruction, i, Math.Max(slot.Start, built.Min(w => w.Offset)), Math.Min(slot.End, built.Max(w => w.Offset + Math.Max(w.Size, 1))), true, false);
+                                if (call != null)
+                                {
+                                    if (!atCall.TryGetValue(call, out var list))
+                                        atCall[call] = list = [];
+                                    list.Add(e);
+                                }
+                                else
+                                    Add(block, e);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // a call handed the slot reads it, then fills it if it's a ref/out argument or the return buffer
+                if (roots != null)
+                    foreach (var (root, instance) in roots.Where(r => ReferenceEquals(r.Root.Call, instruction) && !FillsSlot(r.Root.Definition)))
+                        if (root.CalleeReads)
+                            Add(block, new Event(instruction, -1, instance.Start, instance.End, true, false), root, instance);
+
+                if (instruction.Destination is StackOffset written && instruction.Operands.Count > 0 && instruction.Operands[0] is StackOffset)
+                {
+                    var end = written.Offset + Math.Max(written.Size, 1);
+                    if (Overlaps(written.Offset, end))
+                    {
+                        var owner = roots?.FirstOrDefault(r => ReferenceEquals(r.Root.Definition, instruction));
+                        Add(block, new Event(instruction, 0, written.Offset, end, false, true), owner?.Root, owner?.Instance);
+                    }
+                }
+
+                if (roots != null)
+                    foreach (var (root, instance) in roots.Where(r => ReferenceEquals(r.Root.Call, instruction) && !FillsSlot(r.Root.Definition)))
+                        if (root.CalleeWrites)
+                            Add(block, new Event(instruction, -2, instance.Start, instance.End, false, true), root, instance);
+            }
+        }
+
+        // what's there on entry, in an incoming argument's home (in a local's, nothing yet: reading that is no one value)
+        if (slot.Start >= 0)
+        {
+            perBlock[graph.EntryBlock].Insert(0, events.Count);
+            events.Add(new Event(new Instruction(-1, OpCode.Nop), -3, slot.Start, slot.End, false, true));
+        }
+
+        int Find(int x)
+        {
+            while (events[x].Parent >= 0)
+                x = events[x].Parent;
+            return x;
+        }
+
+        void Union(int a, int b)
+        {
+            a = Find(a);
+            b = Find(b);
+            if (a != b)
+                events[a].Parent = b;
+        }
+
+        foreach (var list in rootEvents.Values)
+            for (var i = 1; i < list.Count; i++)
+                Union(list[0], list[i]);
+
+        // reaching definitions, per piece of the slot (between any two places an access starts or ends): a write replaces
+        // what reached the pieces it covers
+        var bounds = events.SelectMany(e => new[] { Math.Max(e.Start, slot.Start), Math.Min(e.End, slot.End) }).Distinct().OrderBy(x => x).ToList();
+        var pieces = bounds.Count - 1;
+        if (pieces <= 0)
+            return null;
+
+        (int First, int Last) PiecesOf(Event e)
+            => (bounds.IndexOf(Math.Max(e.Start, slot.Start)), bounds.IndexOf(Math.Min(e.End, slot.End)) - 1);
+
+        HashSet<int>[] Merge(Block block, Dictionary<Block, HashSet<int>[]> outs)
+        {
+            var merged = new HashSet<int>[pieces];
+            for (var k = 0; k < pieces; k++)
+                merged[k] = [];
+            foreach (var predecessor in block.Predecessors)
+                if (outs.TryGetValue(predecessor, out var state))
+                    for (var k = 0; k < pieces; k++)
+                        merged[k].UnionWith(state[k]);
+            return merged;
+        }
+
+        void Transfer(Block block, HashSet<int>[] reaching, bool join)
+        {
+            foreach (var index in perBlock[block])
+            {
+                var e = events[index];
+                var (first, last) = PiecesOf(e);
+                if (e.Use && join)
+                    for (var k = first; k <= last; k++)
+                        foreach (var def in reaching[k])
+                            Union(index, def);
+
+                if (e.Def)
+                    for (var k = first; k <= last; k++)
+                        reaching[k] = [index];
+            }
+        }
+
+        var outs = new Dictionary<Block, HashSet<int>[]>();
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var block in graph.Blocks)
+            {
+                var reaching = Merge(block, outs);
+                Transfer(block, reaching, false);
+                if (!outs.TryGetValue(block, out var previous) || Enumerable.Range(0, pieces).Any(k => !previous[k].SetEquals(reaching[k])))
+                {
+                    outs[block] = reaching;
+                    changed = true;
+                }
+            }
+        }
+
+        foreach (var block in graph.Blocks)
+            Transfer(block, Merge(block, outs), true);
+
+        // the struct of each group: one type only (several uses of the same type, joined, are one value)
+        var owners = new Dictionary<int, Instance>();
+        for (var i = 0; i < events.Count; i++)
+        {
+            if (events[i].Owner is not { } owner)
+                continue;
+
+            var set = Find(i);
+            if (owners.TryGetValue(set, out var existing))
+            {
+                if (!ReferenceEquals(existing.Type, owner.Type) && existing.Type.FullName != owner.Type.FullName)
+                {
+                    Debug?.Invoke($"web of {slot.Start:X} mixes {existing.Type} and {owner.Type} at {events[i].Instruction}: "
+                                  + string.Join(" | ", Enumerable.Range(0, events.Count).Where(k => Find(k) == set).Select(k => $"{events[k].Instruction.Index}{(events[k].Use ? "u" : "")}{(events[k].Def ? "d" : "")}{events[k].Operand}[{events[k].Start - slot.Start:X}-{events[k].End - slot.Start:X}]{events[k].Owner?.Type.Name}")));
+                    return null;
+                }
+
+                if (owner.Roots[0].Call.Index < existing.Roots[0].Call.Index)
+                    owners[set] = owner;
+            }
+            else
+                owners[set] = owner;
+        }
+
+        // a slot only ever one struct: what else is kept there between its uses is another of the same (a struct
+        // argument's slot then holding what came back), unless it's only ever filled for us and so may be any spill
+        var single = slot.Instances.Select(i => i.Type.FullName).Distinct().Count() == 1 && !slot.Instances.SelectMany(i => i.Roots).All(r => r is { CalleeReads: false, CalleeWrites: true })
+            ? slot.Instances[0] : null;
+
+        // one variable per group: the struct's own name for the first, then fresh ones
+        var fresh = new Dictionary<int, Instance>();
+        var named = new HashSet<Instance>();
+        var counter = 0;
+        var groups = Enumerable.Range(0, events.Count).GroupBy(Find).ToDictionary(g => g.Key, g => g.Select(i => events[i]).ToList());
+        foreach (var (set, members) in groups.OrderBy(g => g.Value.Min(e => e.Instruction.Index)))
+        {
+            var template = owners.GetValueOrDefault(set);
+            var spill = template == null;
+            // (one only ever written is dead, and left for dead code elimination)
+            // (one whose address is handed to something we couldn't tell the parameters of may be any struct)
+            template ??= !members.Any(e => e.Use) || members.Any(e => e.Operand >= 0 && e.Instruction.Operands[e.Operand] is AddressOf) ? null : single;
+            if (template == null)
+                continue;
+
+            // a part of the slot outside the struct it's joined to: the layout is wrong (or, for a spill, it's not one)
+            if (members.Any(e => e.Start < template.Start || e.End > template.End))
+            {
+                if (spill)
+                    continue;
+                Debug?.Invoke($"web of {slot.Start:X}: {members.First(e => e.Start < template.Start || e.End > template.End).Instruction} outside {template.Type}");
+                return null;
+            }
+
+            var roots = rootEvents.Where(r => Find(r.Value[0]) == set).Select(r => r.Key).ToList();
+            var name = named.Add(template) && !spill ? template.Name : $"{StackAnalyzer.NameForSlot(new StackOffset(slot.Start))}_w{counter++}";
+            fresh[set] = template with { Name = name, Roots = roots };
+        }
+
+        var result = new Dictionary<(Instruction, int), Instance?>();
+        for (var i = 0; i < events.Count; i++)
+            if (events[i].Operand >= 0)
+                result[(events[i].Instruction, events[i].Operand)] = fresh.GetValueOrDefault(Find(i));
+
+        // the slot's structs are now these (roots no use reached keep theirs)
+        var used = fresh.Values.ToList();
+        foreach (var instance in slot.Instances)
+            if (!used.Any(u => u.Name == instance.Name))
+                used.Add(instance with { Roots = instance.Roots.Where(r => !used.Any(u => u.Roots.Contains(r))).ToList() });
+        slot.Instances.Clear();
+        slot.Instances.AddRange(used.Where(u => u.Roots.Count > 0 || fresh.ContainsValue(u)));
+
+        return result;
+    }
+
+    // The register an address is taken into is never read before it's overwritten (or clobbered by a call)
+    private static bool IsDeadTake(ISILControlFlowGraph graph, Instruction take)
+    {
+        if (take is not { OpCode: OpCode.Move, Operands: [Register holder, AddressOf] })
+            return false;
+
+        var start = graph.Blocks.FirstOrDefault(b => b.Instructions.Contains(take));
+        if (start == null)
+            return false;
+
+        bool Reads(Instruction instruction)
+            => instruction.Operands.Skip(instruction.Destination is Register ? 1 : 0).Any(o => o is Register r && r.Name == holder.Name
+                                                                                          || o is MemoryOperand m && (m.Base is Register b && b.Name == holder.Name || m.Index is Register x && x.Name == holder.Name))
+               || instruction.Destination is MemoryOperand { } written && (written.Base is Register wb && wb.Name == holder.Name || written.Index is Register wx && wx.Name == holder.Name);
+
+        var visited = new HashSet<Block>();
+        var pending = new Stack<(Block Block, int From)>();
+        pending.Push((start, start.Instructions.IndexOf(take) + 1));
+        while (pending.Count > 0)
+        {
+            var (block, from) = pending.Pop();
+            var ended = false;
+            for (var i = from; i < block.Instructions.Count && !ended; i++)
+            {
+                var instruction = block.Instructions[i];
+                if (Reads(instruction) || instruction.OpCode is OpCode.IndirectJump)
+                    return false;
+                ended = instruction.Destination is Register written && written.Name == holder.Name
+                        || instruction.IsCall && Volatile.Contains(holder.Name);
+            }
+
+            if (ended)
+                continue;
+            foreach (var successor in block.Successors)
+                if (visited.Add(successor))
+                    pending.Push((successor, 0));
+        }
+
+        return true;
+    }
+
     private static readonly HashSet<string> PrimitiveNames =
         ["Boolean", "Char", "SByte", "Byte", "Int16", "UInt16", "Int32", "UInt32", "Int64", "UInt64", "Single", "Double", "IntPtr", "UIntPtr"];
 
@@ -766,20 +1133,64 @@ public static class StackStructRecovery
             : argument is AddressOf { Target: StackOffset direct } ? (direct.Offset, block.Instructions[callIndex])
             : null;
 
-    // Walks back from the call to the last write of the register in this block, and returns the stack
-    // slot whose address it holds, if that's what it was set to.
+    // Walks back from the call to the last write of the register (through copies of it, and into the blocks before when
+    // every path there agrees), and returns the stack slot whose address it holds, if that's what it was set to.
     private static (int Offset, Instruction Definition)? AddressedSlot(Block block, int callIndex, string registerName)
     {
-        for (var i = callIndex - 1; i >= 0; i--)
+        for (var depth = 0; depth < 4; depth++)
         {
-            var instruction = block.Instructions[i];
-
-            if (instruction.Destination is not Register { } written || written.Name != registerName)
-                continue;
-
-            return instruction is { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: StackOffset slot }] } ? (slot.Offset, instruction) : null;
+            var write = WriteReaching(block, callIndex, registerName);
+            switch (write?.Instruction)
+            {
+                case { OpCode: OpCode.Move, Operands: [_, AddressOf { Target: StackOffset slot }] } take:
+                    return (slot.Offset, take);
+                case { OpCode: OpCode.Move, Operands: [_, Register { } copied] }:
+                    (block, callIndex, registerName) = (write.Value.Block, write.Value.Block.Instructions.IndexOf(write.Value.Instruction), copied.Name);
+                    continue;
+                default:
+                    return null;
+            }
         }
 
         return null;
+    }
+
+    private static readonly HashSet<string> Volatile = ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"];
+
+    // The write of a register reaching a point: within the block, else the same one along every path into it. A call
+    // in between clobbers the volatile registers.
+    private static (Block Block, Instruction Instruction)? WriteReaching(Block block, int before, string register, int depth = 0, HashSet<Block>? visited = null)
+    {
+        for (var i = before - 1; i >= 0; i--)
+        {
+            var instruction = block.Instructions[i];
+            if (instruction.Destination is Register { } written && written.Name == register)
+                return (block, instruction);
+            if (instruction.IsCall && Volatile.Contains(register))
+                return null;
+        }
+
+        visited ??= [];
+        if (depth > 8 || !visited.Add(block) || block.Predecessors.Count == 0)
+            return null;
+
+        (Block Block, Instruction Instruction)? found = null;
+        foreach (var predecessor in block.Predecessors)
+        {
+            if (visited.Contains(predecessor))
+            {
+                // a loop back edge: whatever reaches the loop (unless a call in the loop may have clobbered it)
+                if (Volatile.Contains(register))
+                    return null;
+                continue;
+            }
+
+            var write = WriteReaching(predecessor, predecessor.Instructions.Count, register, depth + 1, visited);
+            if (write == null || found != null && found.Value.Instruction != write.Value.Instruction)
+                return null;
+            found = write;
+        }
+
+        return found;
     }
 }

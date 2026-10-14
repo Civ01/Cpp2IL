@@ -18,11 +18,25 @@ public static class SsaSimplifier
         // local is defined at most once, so there is never a conflicting entry for the same key.
         var forwarded = new Dictionary<LocalVariable, IOperand>();
 
+        // A struct held in a stack slot is memory, not an SSA value: written more than once, and changed by what its
+        // address is handed to (an enumerator's MoveNext), so a copy into it is not its value from then on
+        var memory = new HashSet<LocalVariable>();
+        var defined = new HashSet<LocalVariable>();
+        foreach (var instruction in cfg.Instructions)
+        {
+            if (instruction.Destination is LocalVariable written && !defined.Add(written))
+                memory.Add(written);
+            foreach (var operand in instruction.Operands)
+                if (operand is AddressOf { Target: LocalVariable addressed })
+                    memory.Add(addressed);
+        }
+
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
                 if (instruction.OpCode == OpCode.Move
                     && instruction.Operands[0] is LocalVariable dest
                     && !parameterLocals.Contains(dest)
+                    && !memory.Contains(dest)
                     && IsForwardable(instruction.Operands[1])
                     && !IsNumericConversion(dest, instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
