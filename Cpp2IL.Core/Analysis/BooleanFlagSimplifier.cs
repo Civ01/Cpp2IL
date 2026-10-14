@@ -13,6 +13,34 @@ public static class BooleanFlagSimplifier
     {
         var booleanType = method.AppContext.SystemTypes.SystemBooleanType;
 
+        bool IsBool(IOperand operand) => operand is LocalVariable { Type: { } type } && type == booleanType;
+        bool IsInteger(LocalVariable local) => local.Type is { Namespace: "System", Name: "Int32" or "UInt32" or "Int64" or "UInt64" or "Byte" };
+
+        // mov eax,eax (and eax,0FFFFFFFFh) or and al,1 on a bool is the bool; and/or/xor of two bools is a bool
+        for (var changed = true; changed;)
+        {
+            changed = false;
+            foreach (var instruction in method.ControlFlowGraph!.Instructions)
+            {
+                if (instruction is not { OpCode: OpCode.And or OpCode.Or or OpCode.Xor, Operands: [LocalVariable destination, var left, var right] }
+                    || !IsInteger(destination) && destination.Type != null)
+                    continue;
+
+                if (instruction.OpCode == OpCode.And && IsBool(left) && right is Immediate { Value: 1 or 0xFF or 0xFFFFFFFF })
+                {
+                    instruction.OpCode = OpCode.Move;
+                    instruction.SetOperands(destination, left);
+                    destination.Type = booleanType;
+                    changed = true;
+                }
+                else if (IsBool(left) && IsBool(right))
+                {
+                    destination.Type = booleanType;
+                    changed = true;
+                }
+            }
+        }
+
         foreach (var instruction in method.ControlFlowGraph!.Instructions)
         {
             if (instruction.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual) || instruction.Operands.Count < 3)
