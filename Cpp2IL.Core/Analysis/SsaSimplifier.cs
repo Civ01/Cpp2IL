@@ -31,6 +31,12 @@ public static class SsaSimplifier
                     memory.Add(addressed);
         }
 
+        var phis = new Dictionary<LocalVariable, Instruction>();
+        foreach (var block in cfg.Blocks)
+            foreach (var instruction in block.Instructions)
+                if (instruction is { OpCode: OpCode.Phi, Operands: [LocalVariable phiDestination, ..] })
+                    phis[phiDestination] = instruction;
+
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
                 if (instruction.OpCode == OpCode.Move
@@ -40,6 +46,16 @@ public static class SsaSimplifier
                     && IsForwardable(instruction.Operands[1])
                     && !IsNumericConversion(dest, instruction.Operands[1]))
                     forwarded[dest] = instruction.Operands[1];
+                // a phi of one value (as where a catch rejoins with what every call in the try passed it unchanged) is that value
+                else if (instruction.OpCode == OpCode.Phi
+                         && instruction.Operands[0] is LocalVariable merged
+                         && !parameterLocals.Contains(merged)
+                         && !memory.Contains(merged)
+                         && TrivialPhiValue(merged, phis) is { } only
+                         && IsForwardable(only)
+                         && !(only is LocalVariable onlyLocal && memory.Contains(onlyLocal))
+                         && !IsNumericConversion(merged, only))
+                    forwarded[merged] = only;
 
         if (forwarded.Count == 0)
             return;
@@ -60,7 +76,7 @@ public static class SsaSimplifier
         var reads = CollectReadLocals(cfg);
         foreach (var block in cfg.Blocks)
             foreach (var instruction in block.Instructions)
-                if (instruction.OpCode == OpCode.Move
+                if (instruction.OpCode is OpCode.Move or OpCode.Phi
                     && instruction.Operands[0] is LocalVariable dest
                     && forwarded.ContainsKey(dest)
                     && !reads.Contains(dest))
@@ -201,6 +217,41 @@ public static class SsaSimplifier
 
     // Pure values that are safe to duplicate across uses: other locals (copies) and constants. Memory
     // and field loads are excluded so a load is never re-executed; they are handled post-SSA instead.
+    // The one value a phi merges, if there is just one: looking through the phis it merges (round a loop, and through
+    // the other phis of the same loop), everything they bring in from outside is the same value
+    private static IOperand? TrivialPhiValue(LocalVariable merged, Dictionary<LocalVariable, Instruction> phis)
+    {
+        IOperand? value = null;
+        var seen = new HashSet<LocalVariable> { merged };
+        var pending = new Stack<LocalVariable>();
+        pending.Push(merged);
+        while (pending.Count > 0)
+        {
+            var phi = phis[pending.Pop()];
+            for (var i = 1; i < phi.Operands.Count; i++)
+            {
+                var operand = phi.Operands[i];
+                if (operand is LocalVariable local && phis.ContainsKey(local))
+                {
+                    if (seen.Add(local))
+                    {
+                        if (seen.Count > 64)
+                            return null;
+                        pending.Push(local);
+                    }
+
+                    continue;
+                }
+
+                if (value != null && !Equals(value, operand))
+                    return null;
+                value = operand;
+            }
+        }
+
+        return value;
+    }
+
     private static bool IsForwardable(IOperand value) =>
         value switch
         {

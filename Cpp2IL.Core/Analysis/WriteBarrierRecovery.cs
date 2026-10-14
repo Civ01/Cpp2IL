@@ -38,8 +38,8 @@ public static class WriteBarrierRecovery
             if (!IsBarrierGuard(guard, flagAddress, definitions))
                 continue;
 
-            var first = guard.Successors[0];
-            var second = guard.Successors[1];
+            var first = guard.NormalSuccessors[0];
+            var second = guard.NormalSuccessors[1];
 
             var candidate = TryCollectRegion(cfg, guard, first, second, definitions)
                             ?? TryCollectRegion(cfg, guard, second, first, definitions);
@@ -158,7 +158,7 @@ public static class WriteBarrierRecovery
 
     private static bool IsBarrierGuard(Block block, ulong flagAddress, Dictionary<LocalVariable, ISIL.Instruction> definitions)
     {
-        if (block.BlockType != BlockType.TwoWay || block.Successors.Count != 2
+        if (block.BlockType != BlockType.TwoWay || block.NormalSuccessors.Count != 2
             || block.Instructions.Count == 0 || block.Instructions[^1].OpCode != OpCode.ConditionalJump)
             return false;
 

@@ -123,9 +123,9 @@ public class ISILControlFlowGraph
             // (A reachable block can have an unreachable predecessor; leaving that reference
             // behind makes later passes such as dominator computation throw.)
             foreach (var successor in block.Successors)
-                successor.Predecessors.Remove(block);
+                successor.Predecessors.RemoveAll(p => p == block);
             foreach (var predecessor in block.Predecessors)
-                predecessor.Successors.Remove(block);
+                predecessor.Successors.RemoveAll(s => s == block);
 
             block.Successors.Clear();
             block.Predecessors.Clear();
@@ -201,6 +201,10 @@ public class ISILControlFlowGraph
 
             if (block.Instructions.Count == 0)
             {
+                // nothing in it can throw any more (the call that could has gone)
+                foreach (var catchEntry in block.Successors.Where(s => s.IsCatchEntry).ToList())
+                    RemoveEdge(block, catchEntry);
+
                 // jumps into the removed block must be retargeted, which needs an unambiguous successor
                 if (block.Successors.Count != 1 && HasJumpOperandTo(block))
                     continue;
@@ -240,6 +244,19 @@ public class ISILControlFlowGraph
 
         foreach (var block in toRemove)
             Blocks.Remove(block);
+    }
+
+    /// <summary>Removes the edge, and the phi operands for it.</summary>
+    public static void RemoveEdge(Block from, Block to)
+    {
+        from.Successors.Remove(to);
+        var index = to.Predecessors.IndexOf(from);
+        if (index < 0)
+            return;
+
+        foreach (var phi in to.Instructions.Where(i => i.OpCode == OpCode.Phi && i.Operands.Count > index + 1))
+            phi.RemoveOperandAt(index + 1);
+        to.Predecessors.RemoveAt(index);
     }
 
     private bool HasJumpOperandTo(Block block) =>
@@ -287,18 +304,29 @@ public class ISILControlFlowGraph
             var block = Blocks[i];
             if (block.BlockType != BlockType.Call) continue;
 
-            if (block.Successors.Count != 1)
+            // a call that can throw also leads to the catch funclets, which stay successors of the merged block
+            var catches = block.Successors.Where(s => s.IsCatchEntry).ToList();
+            if (block.Successors.Count - catches.Count != 1)
                 continue;
 
-            var nextBlock = block.Successors[0];
+            var nextBlock = block.Successors.First(s => !s.IsCatchEntry);
 
             // make sure that the next block only has one predecessor (this)
-            if (nextBlock.Predecessors.Count != 1 || nextBlock.Predecessors[0] != block)
+            if (nextBlock.Predecessors.Count != 1 || nextBlock.Predecessors[0] != block || nextBlock.IsCatchEntry)
                 continue;
+
+            // a catch both lead to is reached from the merged block once, with what the later one passes it
+            foreach (var shared in catches.Where(nextBlock.Successors.Contains))
+            {
+                var index = shared.Predecessors.IndexOf(block);
+                shared.Predecessors.RemoveAt(index);
+                foreach (var phi in shared.Instructions.Where(p => p.OpCode == OpCode.Phi && p.Operands.Count > index + 1))
+                    phi.RemoveOperandAt(index + 1);
+            }
 
             // merge instructions
             block.Instructions.AddRange(nextBlock.Instructions);
-            block.Successors = nextBlock.Successors;
+            block.Successors = nextBlock.Successors.Concat(catches.Where(c => !nextBlock.Successors.Contains(c))).ToList();
 
             // fix up successors predecessors
             foreach (var successor in nextBlock.Successors)
@@ -396,6 +424,18 @@ public class ISILControlFlowGraph
 
                     break;
 
+                // a rethrow out of a catch funclet: the path ends here
+                case OpCode.Throw:
+                    currentBlock.AddInstruction(instructions[i]);
+                    currentBlock.CalculateBlockType();
+                    if (!isLast)
+                    {
+                        currentBlock = new Block() { ID = idCounter++ };
+                        AddBlock(currentBlock);
+                    }
+
+                    break;
+
                 default:
                     currentBlock.AddInstruction(instructions[i]);
                     if (isLast)
@@ -417,7 +457,7 @@ public class ISILControlFlowGraph
         // Connect blocks without successors to exit
         foreach (var block in Blocks)
         {
-            if (block.Successors.Count == 0 && block != EntryBlock && block != ExitBlock)
+            if (block.Successors.Count == 0 && block != EntryBlock && block != ExitBlock && block.Instructions is not [.., { OpCode: OpCode.Throw }])
                 AddDirectedEdge(block, ExitBlock);
         }
 
@@ -480,6 +520,19 @@ public class ISILControlFlowGraph
         return null;
     }
 
+    /// <summary>The block that starts with the given instruction, splitting the one it's in if need be.</summary>
+    public Block? BlockStartingAt(Instruction instruction)
+    {
+        foreach (var block in Blocks)
+        {
+            var index = block.Instructions.IndexOf(instruction);
+            if (index >= 0)
+                return SplitAndCreate(block, index);
+        }
+
+        return null;
+    }
+
     private Block SplitAndCreate(Block target, int index)
     {
         if (index < 0 || index >= target.Instructions.Count)
@@ -528,7 +581,7 @@ public class ISILControlFlowGraph
         return newBlock;
     }
 
-    private void AddDirectedEdge(Block from, Block to)
+    internal void AddDirectedEdge(Block from, Block to)
     {
         from.Successors.Add(to);
         to.Predecessors.Add(from);

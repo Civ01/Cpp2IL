@@ -276,10 +276,10 @@ public static class ArrayRecovery
                     if (index >= current.Instructions.Count)
                     {
                         // only a straight-line run can be regrouped without changing what runs when
-                        if (current.Successors.Count != 1 || current.Successors[0].Predecessors.Count != 1)
+                        if (current.NormalSuccessors.Count != 1 || current.NormalSuccessors[0].Predecessors.Count != 1)
                             break;
 
-                        current = current.Successors[0];
+                        current = current.NormalSuccessors[0];
                         index = 0;
                         continue;
                     }

@@ -281,9 +281,12 @@ public class StackAnalyzer
                 }
             }
 
+            // a call that throws does so with the frame as it was at the call
+            var atCall = block.Instructions.Count > 0 ? _instructionState[block.Instructions[^1]] : currentState;
+
             // Tail calls clear stack
             if (block.BlockType == BlockType.TailCall)
-                currentState.Size = 0;
+                currentState = new StackState { Size = 0 };
 
             _outGoingState[block] = currentState;
 
@@ -295,19 +298,21 @@ public class StackAnalyzer
             // Visit successors
             foreach (var successor in block.Successors)
             {
+                var passed = successor.IsCatchEntry ? atCall : currentState;
+
                 // Already visited
                 if (_inComingState.TryGetValue(successor, out var existingState))
                 {
-                    if (existingState.Size != currentState.Size)
+                    if (existingState.Size != passed.Size)
                     {
-                        _inComingState[successor] = currentState.Copy();
+                        _inComingState[successor] = passed.Copy();
                         blockLevelState.Push((successor, visitedBlockCount + 1));
                     }
                 }
                 else
                 {
                     // Set incoming delta and add to queue
-                    _inComingState[successor] = currentState.Copy();
+                    _inComingState[successor] = passed.Copy();
                     blockLevelState.Push((successor, visitedBlockCount + 1));
                 }
             }

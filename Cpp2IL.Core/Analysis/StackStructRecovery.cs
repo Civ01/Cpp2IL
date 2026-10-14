@@ -80,7 +80,7 @@ public static class StackStructRecovery
 
             // a small struct comes back in rax; spilled straight to the stack, that slot is the struct
             if (!resolver.ReturnsViaHiddenBuffer(callee) && IsStruct(callee.ReturnType) && TypeSizes.UnboxedSize(callee.ReturnType, 8) is 1 or 2 or 4 or 8
-                && block.Successors is [var after] && after.Predecessors.Count == 1
+                && block.NormalSuccessors is [var after] && after.Predecessors.Count == 1
                 && after.Instructions.TakeWhile(i => !(i.Destination is Register { Name: "rax" })).FirstOrDefault(i => i is { OpCode: OpCode.Move, Operands: [StackOffset, Register { Name: "rax" }] }) is { } spill
                 && ((StackOffset)spill.Operands[0]).Offset < 0) // not the home of an incoming parameter, which MSVC reuses as scratch
                 AddRoot(after, call, (((StackOffset)spill.Operands[0]).Offset, spill), callee.ReturnType, false, true);
@@ -352,7 +352,7 @@ public static class StackStructRecovery
             if (accepted.SelectMany(r => r.Instances).FirstOrDefault(i => i.Roots.Contains(root) && ReferenceEquals(i.Type, root.Type)) is not { } instance)
                 continue;
 
-            var successors = block.Successors.Distinct().ToList();
+            var successors = block.NormalSuccessors.Distinct().ToList();
             if (successors is not [{ } next] || next == graph.ExitBlock || next.Predecessors.Distinct().Count() != 1)
                 continue;
 
@@ -532,7 +532,7 @@ public static class StackStructRecovery
                         live.Remove(volatileRegister);
             }
 
-            block = block.Successors.Distinct().ToList() is [{ } next] && next.Predecessors.Distinct().Count() == 1 ? next : null;
+            block = block.NormalSuccessors.Distinct().ToList() is [{ } next] && next.Predecessors.Distinct().Count() == 1 ? next : null;
         }
     }
 

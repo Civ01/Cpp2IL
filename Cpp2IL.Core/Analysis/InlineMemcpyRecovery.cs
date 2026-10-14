@@ -699,7 +699,7 @@ public static class InlineMemcpyRecovery
                 ApplyToBlock(current, state);
                 outStates[current] = state;
 
-                var next = current.Successors.Count == 1 ? current.Successors[0] : null;
+                var next = current.NormalSuccessors is [var only] ? only : null;
                 if (next == null || next.Predecessors.Distinct().Count() != 1 || current.BlockType is BlockType.Call or BlockType.TailCall)
                     break;
 

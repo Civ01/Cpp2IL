@@ -54,6 +54,10 @@ public static class IlGenerator
         {
             if (instruction.Operands.Count > 0 && instruction.Operands[0] is Block target)
             {
+                // an empty block only passes control on
+                for (var hops = 0; hops < 16 && target.Instructions.Count == 0 && target.NormalSuccessors is [var onward] && onward != context.ControlFlowGraph.ExitBlock; hops++)
+                    target = onward;
+
                 if (target.Instructions.Count > 0)
                     instruction.SetOperand(0, target.Instructions[0]);
             }
@@ -254,7 +258,9 @@ public static class IlGenerator
             if (lastInstruction.OpCode == OpCode.ConditionalJump)
             {
                 var trueTarget = TryResolveJumpTargetBlock(lastInstruction, context.ControlFlowGraph);
-                var falseSuccessor = block.Successors.FirstOrDefault(s => s != trueTarget && s != context.ControlFlowGraph.ExitBlock);
+                var falseSuccessor = block.Successors.FirstOrDefault(s => s != trueTarget && s != context.ControlFlowGraph.ExitBlock && !s.IsCatchEntry)
+                                     // both ways lead to the same place (what was between them went)
+                                     ?? (trueTarget != null && block.Successors.Contains(trueTarget) ? trueTarget : null);
                 if (falseSuccessor == null) return;
                 var bridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
                 definition.CilMethodBody!.Instructions.Add(bridge);
@@ -263,7 +269,7 @@ public static class IlGenerator
 
             else if (lastInstruction.OpCode != OpCode.Jump && lastInstruction.OpCode != OpCode.Return && lastInstruction.OpCode != OpCode.IndirectJump)
             {
-                var successor = block.Successors.FirstOrDefault(s => s != context.ControlFlowGraph.ExitBlock);
+                var successor = block.Successors.FirstOrDefault(s => s != context.ControlFlowGraph.ExitBlock && !s.IsCatchEntry);
                 if (successor == null) return;
                 var bridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
                 definition.CilMethodBody!.Instructions.Add(bridge);
@@ -483,7 +489,7 @@ public static class IlGenerator
         if (!visited.Add(block))
             return null;
 
-        foreach (var successor in block.Successors)
+        foreach (var successor in block.Successors.Where(s => !s.IsCatchEntry))
         {
             var resolved = ResolveBlockEntryInstruction(successor, blockEntryMap, visited);
             if (resolved != null)
@@ -669,6 +675,12 @@ public static class IlGenerator
                     instructions.Add(CilOpCodes.Ldnull);
 
                 instructions.Add(CilOpCodes.Throw);
+                break;
+
+            // until catch blocks are emitted as handler regions, nothing branches to this one; give it a placeholder
+            case OpCode.CatchException:
+                instructions.Add(CilOpCodes.Ldnull);
+                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
 
             case OpCode.Phi:

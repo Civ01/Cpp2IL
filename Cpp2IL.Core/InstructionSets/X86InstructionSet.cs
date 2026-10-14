@@ -12,7 +12,7 @@ using LibCpp2IL.BinaryStructures;
 namespace Cpp2IL.Core.InstructionSets;
 
 // This is honestly an X64InstructionSet by all means. Everything here screams "I AM X64".
-public class X86InstructionSet : Cpp2IlInstructionSet
+public partial class X86InstructionSet : Cpp2IlInstructionSet
 {
     private static readonly MasmFormatter Formatter = new();
     private static readonly StringOutput Output = new();
@@ -158,6 +158,8 @@ public class X86InstructionSet : Cpp2IlInstructionSet
             else
                 instructions.Add(new ISIL.Instruction(index, ISIL.OpCode.Return, new ISIL.Register(null, "rax")));
         }
+
+        AppendCatchFunclets(context, instructions, addresses);
 
         // fix branches
         for (var i = 0; i < instructions.Count; i++)
@@ -306,7 +308,7 @@ public class X86InstructionSet : Cpp2IlInstructionSet
         ISIL.Instruction Add(ulong address, ISIL.OpCode opCode, params List<ISIL.IOperand> operands)
         {
             addresses.Add(address);
-            var newInstruction = new ISIL.Instruction(instructions.Count, opCode, operands);
+            var newInstruction = new ISIL.Instruction(instructions.Count, opCode, operands) { Address = address };
             instructions.Add(newInstruction);
             return newInstruction;
         }

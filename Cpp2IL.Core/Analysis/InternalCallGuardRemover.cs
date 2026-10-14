@@ -63,11 +63,11 @@ public static class InternalCallGuardRemover
 
         var guard = resolveBlock.Predecessors[0];
 
-        if (guard is not { BlockType: BlockType.TwoWay, Successors.Count: 2 }
+        if (guard is not { BlockType: BlockType.TwoWay, NormalSuccessors.Count: 2 }
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
             return RewriteInPlace(cfg, resolve, pointer);
 
-        var merge = guard.Successors[0] == resolveBlock ? guard.Successors[1] : guard.Successors[0];
+        var merge = guard.NormalSuccessors[0] == resolveBlock ? guard.NormalSuccessors[1] : guard.NormalSuccessors[0];
 
         if (merge == resolveBlock || merge == cfg.EntryBlock || merge == cfg.ExitBlock)
             return RewriteInPlace(cfg, resolve, pointer);
