@@ -491,6 +491,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         DeadCodeEliminator.Run(this);
         DebugPassCallback?.Invoke(this, "DeadCodeEliminator.Run");
 
+        // x as T, then throw InvalidCastException if that's null: (T)x
+        CheckedCastRecovery.Run(this);
+        DebugPassCallback?.Invoke(this, "CheckedCastRecovery.Run");
+
         // Copy/constant propagation belongs in SSA, where one definition dominates all uses and phis
         // make joins explicit, so forwarding a value is an unconditional global substitution.
         SsaSimplifier.Run(this);

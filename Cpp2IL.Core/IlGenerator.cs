@@ -654,7 +654,7 @@ public static class IlGenerator
 
                 LoadOperand(instruction.Operands[2], method, locals, writeLine, context.AppContext.SystemTypes.SystemObjectType);
                 if (checkedType != null)
-                    instructions.Add(CilOpCodes.Isinst, checkedType.ToTypeSignature().ToTypeDefOrRef());
+                    instructions.Add(instruction.Checked ? CilOpCodes.Castclass : CilOpCodes.Isinst, checkedType.ToTypeSignature().ToTypeDefOrRef());
                 StoreToOperand(instruction.Operands[0], method, locals, writeLine);
                 break;
             }

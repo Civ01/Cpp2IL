@@ -44,6 +44,9 @@ public class Instruction : IOperand
     /// <summary>A conditional jump that came from an unsigned condition (ja/jae/jb/jbe), lowered with the signed flag logic.</summary>
     public bool Unsigned;
 
+    /// <summary>An <see cref="OpCode.IsInst"/> that throws InvalidCastException rather than giving null: IL's castclass.</summary>
+    public bool Checked;
+
     /// <summary>Kept by dead code elimination even if nothing reads it yet (a later pass may, then clears this).</summary>
     public bool KeepAlive;
 
