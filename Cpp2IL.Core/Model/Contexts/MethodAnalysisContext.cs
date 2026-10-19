@@ -83,6 +83,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// <summary>The method's C++ exception handling tables, and the catch funclets lifted onto its end (x86-64 PE only).</summary>
     public LibCpp2IL.PE.CxxExceptionInfo? ExceptionInfo;
     public List<InstructionSets.CatchHandler>? CatchHandlers;
+    public List<Analysis.CatchRegion>? CatchRegions;
 
     /// <summary>
     /// Switches found by <see cref="Analysis.SwitchChainRecovery"/>, for IL generation to emit as an IL switch.
@@ -413,6 +414,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         SsaForm.Build(this);
         DebugPassCallback?.Invoke(this, "SsaForm.Build");
         LocalVariables.CreateAll(this);
+        CatchRecovery.SeedExceptionTypes(this);
         DebugPassCallback?.Invoke(this, "LocalVariables.CreateAll");
 
         // Fold the explicit per-comparison flag arithmetic back into single relational comparisons,
@@ -552,6 +554,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Late, as few passes know about addresses of fields
         LocalVariables.ResolveFieldAddresses(this);
+
+        // addresses of struct locals used where they're needed, as the C# compiler does
+        AddressForwarding.Run(this);
         DebugPassCallback?.Invoke(this, "ConstantBranchFolder.Run");
 
         // Near-last, as it depends on the final block layout
@@ -560,6 +565,8 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // A struct's slot used as scratch before the struct is built in it
         DeadFieldStoreEliminator.Run(this);
+        DeadFieldStoreEliminator.DropPristineZeroing(this);
+        DeadFieldStoreEliminator.MergeFieldZeroing(this);
 
         // Inlined List<T>.Add back to the call
         InlinedListAddRecovery.Run(this);
@@ -575,9 +582,6 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         // full generic sharing's expansion of boxing a T, and branches left doing nothing
         SharedGenericCleanup.Run(this);
         DebugPassCallback?.Invoke(this, "SharedGenericCleanup.Run");
-
-        // the IL has no handler regions yet for the catch code to go in, so it goes now, with what only it read
-        ExceptionEdges.DetachForIl(this);
 
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
@@ -595,6 +599,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         // Last, as it depends on the final block layout
         ForeachRecovery.Run(this);
+
+        // the try/catch regions the catch funclets make, around the final blocks (and the foreach regions)
+        Analysis.CatchRegions.Build(this);
         DebugPassCallback?.Invoke(this, "ForeachRecovery.Run");
     }
 
@@ -606,6 +613,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ControlFlowGraph = null;
         ForeachRegions = null;
         CatchHandlers = null;
+        CatchRegions = null;
         SwitchTables = null;
         DominatorInfo = null;
     }

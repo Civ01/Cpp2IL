@@ -62,8 +62,9 @@ public static class StackStructRecovery
             // shared generic code is told which instantiation it's running as by the MethodInfo it's passed, which also
             // picks between folded instantiations
             var passed = PassedMethodInfo(app, resolver, block, callee);
-            if (passed != null && candidates.Any(c => c.Name == passed.Name && c.Parameters.Count == passed.Parameters.Count && c.IsStatic == passed.IsStatic))
-                callee = passed;
+            var named = passed != null && candidates.Any(c => c.Name == passed.Name && c.Parameters.Count == passed.Parameters.Count && c.IsStatic == passed.IsStatic);
+            if (named)
+                callee = passed!;
             // folded duplicates are fine as long as they agree on where structs go (the receiver only matters when it is a
             // struct itself)
             else if (candidates.Count > 1 && !candidates.All(c => SameLayout(c, callee)
@@ -73,10 +74,19 @@ public static class StackStructRecovery
             // Only trust the operand layout if it's the managed one for this callee (not the raw unmanaged register dump)
             var expected = resolver.ResolveForManaged(callee);
             var argBase = call.OpCode == OpCode.CallVoid ? 1 : 2;
-            if (call.Operands.Count != argBase + expected.Length)
-                continue;
-
             var last = block.Instructions.Count - 1;
+            if (call.Operands.Count != argBase + expected.Length)
+            {
+                // (the operands were laid out for another of the folded methods, but the MethodInfo says which it is: where
+                // the struct it returns goes is still known)
+                if (named && resolver.ReturnsViaHiddenBuffer(callee) && AddressedSlot(block, last, "rcx") is { } namedBuffer)
+                {
+                    AddRoot(block, call, namedBuffer, callee.ReturnType, false, true);
+                    if (call.OpCode == OpCode.Call && call.Operands[1] is Register && roots.Count > 0 && roots[^1].Call == call)
+                        bufferCalls.Add((block, call, roots[^1]));
+                }
+                continue;
+            }
 
             // a small struct comes back in rax; spilled straight to the stack, that slot is the struct
             if (!resolver.ReturnsViaHiddenBuffer(callee) && IsStruct(callee.ReturnType) && TypeSizes.UnboxedSize(callee.ReturnType, 8) is 1 or 2 or 4 or 8
@@ -147,7 +157,8 @@ public static class StackStructRecovery
         var slots = new List<Slot>();
         foreach (var group in roots.GroupBy(r => r.Offset))
         {
-            var types = group.Select(r => r.Type).Distinct().ToList();
+            // (equal generic instances may be different contexts)
+            var types = group.Select(r => r.Type).DistinctBy(t => t.FullName).ToList();
             var instances = types.Count == 1
                 ? [new Instance(StackAnalyzer.NameForSlot(new StackOffset(group.Key)), types[0], group.Key, group.Key + (int)TypeSizes.UnboxedSize(types[0], 8), group.ToList())]
                 : PerUse(group.Key, group.OrderBy(r => r.Call.Index).ToList());
@@ -195,8 +206,12 @@ public static class StackStructRecovery
         bool Outgrown(Slot slot) => slot.Instances.Count == 1 && graph.Instructions.Any(i => i.Operands.Any(o =>
             o is StackOffset access && access.Offset < slot.End && access.Offset + Math.Max(access.Size, 1) > slot.Start
             && (access.Offset < slot.Start || access.Offset + Math.Max(access.Size, 1) > slot.End)));
-        foreach (var slot in accepted.Where(s => s.Instances.Count > 1 || Outgrown(s)))
-            if (Webs(graph, slot) is { } owners)
+        // (and one a catch writes to: MSVC keeps the exception in whatever slot is free at the time, which may be a struct's)
+        var funclet = method.CatchHandlers?.SelectMany(h => h.Instructions).ToHashSet() ?? [];
+        bool WrittenByCatch(Slot slot) => funclet.Count > 0 && graph.Blocks.SelectMany(b => b.Instructions).Any(i =>
+            funclet.Contains(i) && i.Destination is StackOffset access && access.Offset < slot.End && access.Offset + Math.Max(access.Size, 1) > slot.Start);
+        foreach (var slot in accepted.Where(s => s.Instances.Count > 1 || Outgrown(s) || WrittenByCatch(s)))
+            if (Webs(graph, slot, funclet) is { } owners)
                 webs[slot] = owners;
             else
                 Debug?.Invoke($"no webs for {slot.Start:X}");
@@ -349,7 +364,7 @@ public static class StackStructRecovery
         // Model it as a copy of the returned value into the slot, right after the call.
         foreach (var (block, call, root) in bufferCalls)
         {
-            if (accepted.SelectMany(r => r.Instances).FirstOrDefault(i => i.Roots.Contains(root) && ReferenceEquals(i.Type, root.Type)) is not { } instance)
+            if (accepted.SelectMany(r => r.Instances).FirstOrDefault(i => i.Roots.Contains(root) && i.Type.FullName == root.Type.FullName) is not { } instance)
                 continue;
 
             var successors = block.NormalSuccessors.Distinct().ToList();
@@ -678,7 +693,7 @@ public static class StackStructRecovery
         var instances = new List<Instance>();
         foreach (var root in ordered)
         {
-            if (instances.Count > 0 && ReferenceEquals(instances[^1].Type, root.Type))
+            if (instances.Count > 0 && instances[^1].Type.FullName == root.Type.FullName)
             {
                 instances[^1].Roots.Add(root);
                 continue;
@@ -741,7 +756,7 @@ public static class StackStructRecovery
     /// value; the struct is the one a call takes it as. A group with none is a spill (null); one with two different structs
     /// means we can't tell (no answer at all).
     /// </summary>
-    private static Dictionary<(Instruction, int), Instance?>? Webs(ISILControlFlowGraph graph, Slot slot)
+    private static Dictionary<(Instruction, int), Instance?>? Webs(ISILControlFlowGraph graph, Slot slot, HashSet<Instruction>? foreignWrites = null)
     {
         bool Overlaps(int start, int end) => start < slot.End && end > slot.Start;
 
@@ -984,7 +999,9 @@ public static class StackStructRecovery
             var spill = template == null;
             // (one only ever written is dead, and left for dead code elimination)
             // (one whose address is handed to something we couldn't tell the parameters of may be any struct)
-            template ??= !members.Any(e => e.Use) || members.Any(e => e.Operand >= 0 && e.Instruction.Operands[e.Operand] is AddressOf) ? null : single;
+            // (one a catch wrote is the exception, not the struct)
+            template ??= !members.Any(e => e.Use) || members.Any(e => e.Operand >= 0 && e.Instruction.Operands[e.Operand] is AddressOf)
+                                                  || foreignWrites != null && members.Any(e => e.Def && foreignWrites.Contains(e.Instruction)) ? null : single;
             if (template == null)
                 continue;
 

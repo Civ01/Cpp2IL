@@ -38,6 +38,14 @@ public enum NativeHelperKind
     ReturnsFirstArgument,
     /// <summary>(obj, FieldInfo*) -> the address of that field of obj: shared generic code reading a field whose offset depends on T.</summary>
     FieldAddress,
+
+    /// <summary>
+    /// IL2CPP's ExceptionSupportStack (the exceptions a method's catches and finallies are handling, in a local array with its
+    /// count after it): push(stack, exception), pop(stack) -> the exception popped, and top(stack) -> the exception on top.
+    /// </summary>
+    ExceptionStackPush,
+    ExceptionStackPop,
+    ExceptionStackTop,
 }
 
 /// <summary>
@@ -100,6 +108,24 @@ public static class NativeHelpers
             && first is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RAX, Op1Register: Register.RCX }
             && body.Take(4).Any(i => i is { Mnemonic: Mnemonic.Cmp, Op0Register: Register.R8, Op1Kind: OpKind.Immediate8to64 or OpKind.Immediate32to64 }))
             return NativeHelperKind.Memcpy;
+
+        // movsxd rax,[rcx+8] / mov [rcx+rax*8],rdx / inc [rcx+8]: ExceptionSupportStack::push
+        if (body.Count >= 4 && first is { Mnemonic: Mnemonic.Movsxd, Op0Register: Register.RAX, MemoryBase: Register.RCX, MemoryDisplacement64: 8 }
+            && body[1] is { Mnemonic: Mnemonic.Mov, Op0Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryIndex: Register.RAX, MemoryIndexScale: 8, MemoryDisplacement64: 0, Op1Register: Register.RDX }
+            && body[2] is { Mnemonic: Mnemonic.Inc, Op0Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryDisplacement64: 8 } && body[3].Mnemonic == Mnemonic.Ret)
+            return NativeHelperKind.ExceptionStackPush;
+
+        // movsxd rax,[rcx+8] / mov rax,[rcx+rax*8-8]: top
+        if (body.Count >= 3 && first is { Mnemonic: Mnemonic.Movsxd, Op0Register: Register.RAX, MemoryBase: Register.RCX, MemoryDisplacement64: 8 }
+            && body[1] is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RAX, MemoryBase: Register.RCX, MemoryIndex: Register.RAX, MemoryIndexScale: 8 } && body[2].Mnemonic == Mnemonic.Ret)
+            return NativeHelperKind.ExceptionStackTop;
+
+        // movsxd rdx,[rcx+8] / lea eax,[rdx-1] / mov [rcx+8],eax / mov rax,[rcx+rdx*8-8]: pop
+        if (body.Count >= 5 && first is { Mnemonic: Mnemonic.Movsxd, Op0Register: Register.RDX, MemoryBase: Register.RCX, MemoryDisplacement64: 8 }
+            && body[1] is { Mnemonic: Mnemonic.Lea, Op0Register: Register.EAX }
+            && body[2] is { Mnemonic: Mnemonic.Mov, Op0Kind: OpKind.Memory, MemoryBase: Register.RCX, MemoryDisplacement64: 8 }
+            && body[3] is { Mnemonic: Mnemonic.Mov, Op0Register: Register.RAX, MemoryBase: Register.RCX, MemoryIndex: Register.RDX, MemoryIndexScale: 8 } && body[4].Mnemonic == Mnemonic.Ret)
+            return NativeHelperKind.ExceptionStackPop;
 
         // A thunk to vm::Object::IsInst, which null-checks the object then reads its klass
         if (first.Mnemonic == Mnemonic.Jmp && first.Op0Kind is OpKind.NearBranch64 && LooksLikeIsInst(app, first.NearBranchTarget))

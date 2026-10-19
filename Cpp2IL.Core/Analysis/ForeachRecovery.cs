@@ -12,7 +12,9 @@ namespace Cpp2IL.Core.Analysis;
 /// enumerators inlines away altogether). <see cref="Blocks"/> are the try region: the loop and whatever only it leads
 /// to (a return from inside the loop), entered only at <see cref="Header"/>, from <see cref="Before"/>.
 /// </summary>
-public sealed record ForeachRegion(LocalVariable Enumerator, Block Before, Block Header, List<Block> Blocks);
+/// <see cref="AsDisposable"/>: the enumerator's type isn't disposable itself (IEnumerator), so the finally disposes of it
+/// only if it turns out to be (<c>(enumerator as IDisposable)?.Dispose()</c>).
+public sealed record ForeachRegion(LocalVariable Enumerator, Block Before, Block Header, List<Block> Blocks, bool AsDisposable = false);
 
 /// <summary>
 /// Puts foreach loops over struct enumerators back into the shape a C# compiler gives them, so that the decompiler
@@ -53,7 +55,7 @@ public static class ForeachRecovery
 
         // inner loops first: an outer one waits until those inside it are done with
         var candidates = graph.Blocks.Where(b => b.Instructions.FirstOrDefault(i => i.OpCode != OpCode.Nop) is
-            { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "MoveNext" }, _, AddressOf { Target: LocalVariable }, ..] }).ToList();
+            { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "MoveNext" }, _, AddressOf { Target: LocalVariable } or LocalVariable, ..] }).ToList();
         var pending = candidates.ToHashSet();
         for (var progress = true; progress && pending.Count > 0;)
         {
@@ -80,10 +82,17 @@ public static class ForeachRecovery
     {
         deferred = false;
         // the condition: just enumerator.MoveNext(), maybe negated, and the branch on it
+        // (a struct enumerator is called through its address, a class or interface one directly)
         var real = header.Instructions.Where(i => i.OpCode != OpCode.Nop).ToList();
-        if (real is not [{ OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "MoveNext", Parameters.Count: 0 }, LocalVariable moved, AddressOf { Target: LocalVariable enumerator }, ..] }, .. var rest]
-            || enumerator.Type is not { IsValueType: true } enumeratorType
-            || enumeratorType.Methods.Concat((enumeratorType as GenericInstanceTypeAnalysisContext)?.GenericType.Methods ?? []).All(m => m.Name != "Dispose"))
+        if (real is not [{ OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "MoveNext", Parameters.Count: 0 }, LocalVariable moved, var receiverOperand, ..] }, .. var rest]
+            || ReceiverOf(receiverOperand) is not { } enumerator
+            || enumerator.Type is not { } enumeratorType
+            || (receiverOperand is AddressOf) != enumeratorType.IsValueType)
+            return null;
+        var byRef = enumeratorType.IsValueType;
+        // one that isn't disposable has to be an interface or open class, which the finally tests for IDisposable
+        var asDisposable = !IsDisposable(enumeratorType);
+        if (asDisposable && (byRef || enumeratorType.IsSealed))
             return null;
 
         Instruction jumpInstruction;
@@ -173,22 +182,53 @@ public static class ForeachRecovery
 
         var currentCalls = new List<Instruction>();
         var disposals = new List<Instruction>();
+        var guards = new List<(Block Block, Instruction Test)>();
         var foreign = new List<Instruction>();
+        var casts = new List<Instruction>();
         foreach (var (block, instruction) in uses)
         {
             if (chain.Contains(block))
                 continue; // the setup, below
             else if (block == header && instruction == real[0])
                 continue;
-            else if (region.Contains(block) && instruction is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "get_Current", Parameters.Count: 0 }, LocalVariable, AddressOf { Target: LocalVariable receiver }] }
-                     && receiver == enumerator)
+            else if (region.Contains(block) && instruction is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "get_Current", Parameters.Count: 0 }, LocalVariable, var currentReceiver] }
+                     && ReceiverOf(currentReceiver) == enumerator)
                 currentCalls.Add(instruction);
             else if (IsDispose(instruction, enumerator))
                 disposals.Add(instruction);
+            // (one that may not be: (enumerator as IDisposable)?.Dispose())
+            else if (asDisposable && !loop.Contains(block) && instruction is { OpCode: OpCode.IsInst, Operands: [LocalVariable, TypeAnalysisContext { FullName: "System.IDisposable" }, var cast] }
+                     && ReferenceEquals(cast, enumerator))
+                casts.Add(instruction);
+            // (a class one is disposed of if it's there: if (enumerator != null) enumerator.Dispose())
+            else if (!byRef && !loop.Contains(block) && instruction is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [LocalVariable, var tested, Immediate { Value: 0 }] }
+                     && ReferenceEquals(tested, enumerator))
+                guards.Add((block, instruction));
             else if (!loop.Contains(block))
                 foreign.Add(instruction);
             else
                 return Reject(header, $"enumerator used in the loop by {instruction}");
+        }
+
+        // the as IDisposable: what it gives is only tested for null and disposed of
+        if (asDisposable)
+        {
+            if (casts.Count == 0)
+                return Reject(header, "not disposable, and not tested for IDisposable");
+
+            foreach (var asCast in casts.Select(c => (LocalVariable)c.Operands[0]).Distinct())
+                foreach (var (block, instruction) in allInstructions.Where(x => x.Instruction.Operands.Any(o => Mentions(o, asCast))))
+                {
+                    if (casts.Contains(instruction))
+                        continue;
+                    if (IsDispose(instruction, asCast))
+                        disposals.Add(instruction);
+                    else if (!loop.Contains(block) && instruction is { OpCode: OpCode.CheckEqual or OpCode.CheckNotEqual, Operands: [LocalVariable, var tested, Immediate { Value: 0 }] }
+                             && ReferenceEquals(tested, asCast))
+                        guards.Add((block, instruction));
+                    else
+                        return Reject(header, $"enumerator as IDisposable used by {instruction}");
+                }
         }
 
         if (FindGetEnumerator(setup, enumerator) is not var (getEnumerator, copying))
@@ -235,18 +275,41 @@ public static class ForeachRecovery
         if (currentType is GenericParameterTypeAnalysisContext)
             return Reject(header, "Current is of an open type");
 
+        // each null test guards a dispose: it goes straight on to the way around it
+        var unguard = new List<(Block Guard, Instruction Test, Instruction Jump, Block Skip, Block Disposing)>();
+        foreach (var (guardBlock, test) in guards)
+        {
+            var disposing = guardBlock.NormalSuccessors.FirstOrDefault(s => s.Instructions.Any(disposals.Contains));
+            var skip = guardBlock.NormalSuccessors.FirstOrDefault(s => s != disposing);
+            if (guardBlock.Instructions is not [.., { OpCode: OpCode.ConditionalJump, Operands: [Block, LocalVariable condition] } jump] || !ReferenceEquals(condition, test.Operands[0])
+                || disposing == null || skip == null || guardBlock.NormalSuccessors.Distinct().Count() != 2)
+                return Reject(header, $"{test} doesn't guard the dispose");
+            unguard.Add((guardBlock, test, jump, skip, disposing));
+        }
+
         // ---- committed ----
 
         var own = new LocalVariable($"enumerator{counter}", new Register(null, $"ENUMERATOR_{counter}", 0), enumeratorType);
         method.Locals.Add(own);
-        real[0].SetOperand(2, new AddressOf(own));
+        IOperand ownReceiver = byRef ? new AddressOf(own) : own;
+        real[0].SetOperand(2, ownReceiver);
         foreach (var call in currentCalls)
-            call.SetOperand(2, new AddressOf(own));
+            call.SetOperand(2, ownReceiver);
 
-        foreach (var disposal in disposals)
+        foreach (var disposal in disposals.Concat(casts))
         {
             disposal.OpCode = OpCode.Nop;
             disposal.SetOperands();
+        }
+
+        foreach (var (guardBlock, test, jump, skip, disposing) in unguard)
+        {
+            test.OpCode = OpCode.Nop;
+            test.SetOperands();
+            jump.OpCode = OpCode.Jump;
+            jump.SetOperands(skip);
+            ISILControlFlowGraph.RemoveEdge(guardBlock, disposing);
+            guardBlock.CalculateBlockType();
         }
 
         // nothing left of the old one but its zero init: that goes too
@@ -288,7 +351,7 @@ public static class ForeachRecovery
             call.SetOperands(destination, current);
         }
 
-        body.Instructions.Insert(0, new Instruction(body.Instructions.FirstOrDefault()?.Index ?? 0, OpCode.Call, getCurrent, current, new AddressOf(own)));
+        body.Instructions.Insert(0, new Instruction(body.Instructions.FirstOrDefault()?.Index ?? 0, OpCode.Call, getCurrent, current, byRef ? new AddressOf(own) : own));
 
         foreach (var instruction in copying.Concat(unneeded))
         {
@@ -305,7 +368,7 @@ public static class ForeachRecovery
         var ordered = graph.Blocks.Where(region.Contains).ToList();
         ordered.Remove(header);
         ordered.Insert(0, header);
-        return new ForeachRegion(own, before, header, ordered);
+        return new ForeachRegion(own, before, header, ordered, asDisposable);
     }
 
     // The local a memory or field operand is part of
@@ -317,8 +380,29 @@ public static class ForeachRecovery
     };
 
     private static bool IsDispose(Instruction instruction, LocalVariable enumerator)
-        => instruction is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: "Dispose", Parameters.Count: 0 }, AddressOf { Target: LocalVariable disposed }, ..] }
-           && disposed == enumerator;
+        => instruction is { OpCode: OpCode.CallVoid, Operands: [MethodAnalysisContext { Name: "Dispose", Parameters.Count: 0 }, var disposed, ..] } && ReceiverOf(disposed) == enumerator
+           // (through the interface the call may not be known to return nothing)
+           || instruction is { OpCode: OpCode.Call, Operands: [MethodAnalysisContext { Name: "Dispose", Parameters.Count: 0 }, LocalVariable or Register, var disposedToo, ..] } && ReceiverOf(disposedToo) == enumerator;
+
+    // the enumerator a call is made on: a struct one by its address, a class or interface one itself
+    private static LocalVariable? ReceiverOf(IOperand operand) => operand switch
+    {
+        AddressOf { Target: LocalVariable byAddress } => byAddress,
+        LocalVariable direct => direct,
+        _ => null,
+    };
+
+    // a foreach disposes of its enumerator if it can be disposed of (IEnumerator<T> is IDisposable, IEnumerator isn't)
+    private static bool IsDisposable(TypeAnalysisContext type)
+    {
+        var definition = (type as GenericInstanceTypeAnalysisContext)?.GenericType ?? type;
+        if (definition.FullName is "System.IDisposable" or "System.Collections.Generic.IEnumerator`1" || definition.Methods.Any(m => m.Name == "Dispose"))
+            return true;
+        for (var current = definition; current != null; current = current.BaseType)
+            if (current.InterfaceContexts.Any(i => i.FullName is "System.IDisposable" || i.FullName.StartsWith("System.Collections.Generic.IEnumerator`1")))
+                return true;
+        return false;
+    }
 
     // The GetEnumerator() call the enumerator is the result of, and the copies that got it there: straight into it,
     // through temporaries (the return buffer, rax pointing at it), or a piece at a time from the buffer

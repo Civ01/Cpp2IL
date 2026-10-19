@@ -25,6 +25,20 @@ namespace Cpp2IL.Core.Analysis;
 /// </summary>
 public static class CatchRecovery
 {
+    /// <summary>
+    /// What a catch is handed is an exception, before anything else is known of it: typed so from the start, calls on it
+    /// (its virtual methods, through its class's vtable) resolve like any other's. <see cref="Run"/> narrows it to the type caught.
+    /// </summary>
+    public static void SeedExceptionTypes(MethodAnalysisContext method)
+    {
+        if (method is not { CatchHandlers.Count: > 0, ControlFlowGraph: { } cfg })
+            return;
+
+        foreach (var instruction in cfg.Blocks.SelectMany(b => b.Instructions))
+            if (instruction is { OpCode: OpCode.CatchException, Operands: [LocalVariable { Type: null } caught, ..] })
+                caught.Type = method.AppContext.SystemTypes.SystemExceptionType;
+    }
+
     public static void Run(MethodAnalysisContext method)
     {
         if (method is not { CatchHandlers: { Count: > 0 } handlers, ControlFlowGraph: { } cfg })
@@ -51,6 +65,15 @@ public static class CatchRecovery
             return operand;
         }
 
+        // the class tested against: typeof(T), or a local holding T's runtime class
+        static TypeAnalysisContext? CaughtType(IOperand operand) => operand switch
+        {
+            RuntimeClassTypeAnalysisContext runtimeClass => runtimeClass.RepresentedType,
+            TypeAnalysisContext type => type,
+            LocalVariable { Type: RuntimeClassTypeAnalysisContext runtimeClass } => runtimeClass.RepresentedType,
+            _ => null,
+        };
+
         foreach (var handler in handlers)
         {
             var catches = instructions.Where(i => i.OpCode == OpCode.CatchException && handler.Instructions.Contains(i)).ToList();
@@ -70,31 +93,39 @@ public static class CatchRecovery
                 other.SetOperands();
             }
 
-            foreach (var test in instructions.Where(i => handler.Instructions.Contains(i)).ToList())
+            // result = class_is_assignable_from(typeof(T), exception->klass), one per C# catch clause
+            var tests = new List<(Instruction Test, LocalVariable Result, TypeAnalysisContext Caught)>();
+            foreach (var test in instructions.Where(i => handler.Instructions.Contains(i)))
             {
-                // result = class_is_assignable_from(typeof(T), exception->klass)
                 if (test is not { OpCode: OpCode.Call, Operands: [Immediate, LocalVariable result, var classArgument, var klassArgument, ..] }
-                    || Through(classArgument) is not TypeAnalysisContext caught
+                    || CaughtType(Through(classArgument)) is not { } caught
                     || Through(klassArgument) is not MemoryOperand { Base: LocalVariable klassOf, Index: null, Addend: 0 }
                     || !ReferenceEquals(klassOf, exception)
-                    || !uses.TryGetValue(result, out var resultUses) || resultUses.Any(u => u.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)))
+                    || !uses.TryGetValue(result, out var resultUses)
+                    // (tested against 0; the copy into xmm0 the lifter makes after every call, in case the result is a float, doesn't count)
+                    || resultUses.Any(u => u.OpCode is not (OpCode.CheckEqual or OpCode.CheckNotEqual)
+                                           && !(u is { OpCode: OpCode.Move, Destination: LocalVariable { Register.Name: var copyRegister } } && copyRegister.StartsWith("xmm"))))
                     continue;
 
-                first.SetOperands(exception, caught); // keep the caught type with the exception, for the handler region to come
+                tests.Add((test, result, caught));
+            }
 
-                if (caught.FullName is "System.Exception" or "System.Object")
-                {
-                    // always true: assignable is 1
-                    test.OpCode = OpCode.Move;
-                    test.SetOperands(result, new Immediate(1));
-                }
-                else
-                {
-                    // exception as T, tested against null the same way
-                    test.OpCode = OpCode.IsInst;
-                    test.SetOperands(result, caught, exception);
-                    result.Type = caught;
-                }
+            if (tests is [var only])
+            {
+                // the handler catches just that type, so the test always holds
+                first.SetOperands(exception, only.Caught);
+                exception.Type = only.Caught;
+                only.Test.OpCode = OpCode.Move;
+                only.Test.SetOperands(only.Result, new Immediate(1));
+                continue;
+            }
+
+            // several catch clauses: the handler takes any exception, and tests which clause it's for (rethrowing the rest)
+            foreach (var (test, result, caught) in tests)
+            {
+                test.OpCode = OpCode.IsInst;
+                test.SetOperands(result, caught, exception);
+                result.Type = caught;
             }
         }
     }
