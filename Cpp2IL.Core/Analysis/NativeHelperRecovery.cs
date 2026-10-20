@@ -48,6 +48,23 @@ public static class NativeHelperRecovery
                     block.BlockType = BlockType.Fall;
                     break;
 
+                // the stack of exceptions being handled: a catch or finally handles one at a time, so its only element (an
+                // array of one at the start of the slot, as the inlined pushes and reads of it see it) is the exception
+                case NativeHelperKind.ExceptionStackPush or NativeHelperKind.ExceptionStackPop or NativeHelperKind.ExceptionStackTop:
+                {
+                    if (AddressedSlot(block, callIndex, "rcx") is not { } stack)
+                        break;
+
+                    var element = new StackOffset(stack, 8);
+                    if (kind == NativeHelperKind.ExceptionStackPush)
+                        call.SetOperands(element, new Register(null, "rdx"));
+                    else
+                        call.SetOperands(new Register(null, "rax"), element);
+                    call.OpCode = OpCode.Move;
+                    block.BlockType = BlockType.Fall;
+                    break;
+                }
+
                 case NativeHelperKind.Memset:
                 {
                     if (RegisterConstant(block, callIndex, "rdx") is not 0

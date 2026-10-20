@@ -148,8 +148,76 @@ public static class IlGenerator
         // IL starts executing at the first block emitted, which isn't necessarily where the method starts (a pass may
         // have replaced the start with a block that sits later in the list, like a collapsed copy loop): jump there
         var cfg = context.ControlFlowGraph!;
-        var firstEmitted = cfg.Blocks.FirstOrDefault(b => b != cfg.EntryBlock && b != cfg.ExitBlock && b.Instructions.Count > 0);
+
+        // Regions are emitted contiguously, each part in one piece with its entry first: a foreach's try (best straight after
+        // the GetEnumerator() before it), and a try/catch's try then its catch (where its first block comes). One inside
+        // another goes inside its part the same way.
+        var regions = new List<EmitRegion>();
+        foreach (var loop in context.ForeachRegions ?? [])
+            regions.Add(new EmitRegion(loop, null, [(loop.Blocks.ToHashSet(), null, loop.Blocks)]));
+        foreach (var catchRegion in context.CatchRegions ?? [])
+            regions.Add(new EmitRegion(null, catchRegion, [(catchRegion.Try, catchRegion.TryEntry, null), (catchRegion.Handler, catchRegion.HandlerEntry, null)]));
+
+        bool InPart(EmitRegion inner, (EmitRegion Region, int Part) scope) => inner != scope.Region && inner.Blocks.All(scope.Region.Parts[scope.Part].Blocks.Contains);
+        bool InsideRegion(EmitRegion inner, EmitRegion outer) => Enumerable.Range(0, outer.Parts.Count).Any(p => InPart(inner, (outer, p)));
+        List<EmitRegion> ChildrenOf((EmitRegion Region, int Part)? scope) => regions
+            .Where(c => (scope == null || InPart(c, scope.Value)) && !regions.Any(m => m != c && (scope == null || m != scope.Value.Region) && InsideRegion(c, m)
+                                                                                     && (scope == null || InPart(m, scope.Value))))
+            .ToList();
+
+        // how often each local is mentioned, for putting single-use values where they're used
+        var mentions = new Dictionary<LocalVariable, int>();
+        foreach (var operand in cfg.Blocks.SelectMany(b => b.Instructions).SelectMany(i => i.Operands))
+            foreach (var mentioned in MentionedLocals(operand))
+                mentions[mentioned] = mentions.GetValueOrDefault(mentioned) + 1;
+
+        var emissionOrder = new List<(Block Block, List<(EmitRegion, int)> Within)>();
+        var emitted = new HashSet<EmitRegion>();
+        void Order(IEnumerable<Block> blocks, (EmitRegion Region, int Part)? scope, List<(EmitRegion, int)> within)
+        {
+            var children = ChildrenOf(scope);
+            var childOf = new Dictionary<Block, EmitRegion>();
+            foreach (var child in children)
+                foreach (var block in child.Blocks)
+                    childOf[block] = child;
+
+            foreach (var block in blocks)
+            {
+                if (childOf.TryGetValue(block, out var owner))
+                {
+                    // a try/catch goes where its first block would
+                    if (owner.Catch != null && emitted.Add(owner))
+                        OrderRegion(owner, within);
+                    continue;
+                }
+
+                emissionOrder.Add((block, within));
+                foreach (var child in children.Where(c => c.Foreach?.Before == block && emitted.Add(c)))
+                    OrderRegion(child, within);
+            }
+
+            // (one whose place never came up still has to go somewhere)
+            foreach (var child in children.Where(emitted.Add))
+                OrderRegion(child, within);
+        }
+
+        void OrderRegion(EmitRegion region, List<(EmitRegion, int)> within)
+        {
+            for (var part = 0; part < region.Parts.Count; part++)
+            {
+                var (blocks, entry, ordered) = region.Parts[part];
+                var order = ordered ?? context.ControlFlowGraph!.Blocks.Where(blocks.Contains).OrderBy(b => b == entry ? 0 : 1).ToList();
+                Order(order, (region, part), [..within, (region, part)]);
+            }
+        }
+
+        Order(context.ControlFlowGraph!.Blocks, null, []);
+
+        // (in the order they're emitted, which regions change; an empty block only passes control on)
+        var firstEmitted = emissionOrder.Select(e => e.Block).FirstOrDefault(b => b != cfg.EntryBlock && b != cfg.ExitBlock && b.Instructions.Count > 0);
         var realStart = cfg.EntryBlock.Successors.FirstOrDefault(s => s != cfg.ExitBlock);
+        for (var hops = 0; hops < 16 && realStart is { Instructions.Count: 0 } && realStart.NormalSuccessors is [var onward] && onward != cfg.ExitBlock; hops++)
+            realStart = onward;
         if (realStart != null && firstEmitted != null && realStart != firstEmitted)
         {
             var startBridge = new CilInstruction(CilOpCodes.Br, new CilInstructionLabel());
@@ -157,34 +225,7 @@ public static class IlGenerator
             pendingBlockBranchFixups.Add((startBridge, realStart));
         }
 
-        // a foreach's try region has to be contiguous, and is best straight after the GetEnumerator() before it; one
-        // inside another goes inside its region the same way
-        var regions = context.ForeachRegions ?? [];
-        var regionSets = regions.ToDictionary(r => r, r => r.Blocks.ToHashSet());
-        bool Encloses(Analysis.ForeachRegion outer, Analysis.ForeachRegion inner) => outer != inner && inner.Blocks.All(regionSets[outer].Contains);
-        List<Analysis.ForeachRegion> ChildrenOf(Analysis.ForeachRegion? scope) => regions
-            .Where(c => c != scope && (scope == null || Encloses(scope, c)) && !regions.Any(m => m != scope && Encloses(m, c) && (scope == null || Encloses(scope, m))))
-            .ToList();
-
-        var emissionOrder = new List<(Block Block, List<Analysis.ForeachRegion> Within)>();
-        void Order(IEnumerable<Block> blocks, Analysis.ForeachRegion? scope, List<Analysis.ForeachRegion> within)
-        {
-            var children = ChildrenOf(scope);
-            var inChildren = children.SelectMany(c => c.Blocks).ToHashSet();
-            foreach (var block in blocks)
-            {
-                if (inChildren.Contains(block))
-                    continue;
-
-                emissionOrder.Add((block, within));
-                foreach (var child in children.Where(c => c.Before == block))
-                    Order(child.Blocks, child, [..within, child]);
-            }
-        }
-
-        Order(context.ControlFlowGraph!.Blocks, null, []);
-
-        var regionIl = regions.ToDictionary(r => r, _ => new List<CilInstruction>());
+        var regionIl = regions.SelectMany(r => Enumerable.Range(0, r.Parts.Count).Select(p => (r, p))).ToDictionary(k => k, _ => new List<CilInstruction>());
 
         // a switch is emitted from its first compare; the rest of its compares aren't reached any more
         var switches = (context.SwitchTables ?? []).ToDictionary(t => t.First);
@@ -244,10 +285,31 @@ public static class IlGenerator
                 return;
             }
 
+            var il = definition.CilMethodBody!.Instructions;
+            (Instruction Instruction, int Start)? previous = null;
             foreach (var instruction in block.Instructions)
             {
-                var generated = GenerateInstructions(instruction, context, definition, locals, writeLine);
-                instructionMap.Add(instruction, generated);
+                var start = il.Count;
+                GenerateInstructions(instruction, context, definition, locals, writeLine);
+                StoresInSourceOrder(il, start);
+
+                // what the previous instruction worked out only for this one goes where this one uses it
+                if (previous is { } prior && InlineIntoNext(il, prior.Instruction, prior.Start, start, instruction, locals, mentions))
+                {
+                    start = prior.Start;
+                    var combined = il.Skip(start).ToList();
+                    instructionMap[prior.Instruction] = combined;
+                    // (and what was inlined into that before: a branch to it lands where all of it now starts)
+                    foreach (var earlier in block.Instructions.TakeWhile(i => i != instruction))
+                        if (instructionMap.TryGetValue(earlier, out var earlierIl) && earlierIl.Count > 0 && IndexOf(il, earlierIl[0]) > start)
+                            instructionMap[earlier] = combined;
+                    if (blockEntryMap.TryGetValue(block, out var entry) && IndexOf(il, entry) > start)
+                        blockEntryMap[block] = il[start];
+                }
+
+                var generated = il.Skip(start).ToList();
+                instructionMap[instruction] = generated;
+                previous = (instruction, start);
 
                 if (!blockEntryMap.ContainsKey(block) && generated.Count > 0)
                     blockEntryMap[block] = generated[0];
@@ -341,10 +403,12 @@ public static class IlGenerator
         }
 
         // innermost first, as what wrapping one adds is part of those around it
-        foreach (var region in regions.OrderBy(r => r.Blocks.Count))
+        foreach (var region in regions.Where(emitted.Contains).OrderBy(r => r.Blocks.Count()))
         {
-            var added = WrapForeach(context, definition, locals, region, regionIl[region]);
-            foreach (var outer in regions.Where(o => Encloses(o, region)))
+            var added = region.Foreach != null
+                ? WrapForeach(context, definition, locals, region.Foreach, regionIl[(region, 0)])
+                : WrapCatch(context, definition, locals, region.Catch!, regionIl[(region, 0)], regionIl[(region, 1)]);
+            foreach (var outer in regionIl.Keys.Where(k => InPart(region, k)))
                 regionIl[outer].AddRange(added);
         }
 
@@ -357,6 +421,312 @@ public static class IlGenerator
             instructions.Add(CilOpCodes.Ldstr, Diagnostic("Warning: " + warning));
             instructions.Add(CilOpCodes.Call, writeLine);
         }
+    }
+
+    private static IEnumerable<LocalVariable> MentionedLocals(IOperand operand)
+    {
+        switch (operand)
+        {
+            case LocalVariable local:
+                yield return local;
+                break;
+            case MemoryOperand memory:
+                if (memory.Base is LocalVariable memoryBase)
+                    yield return memoryBase;
+                if (memory.Index is LocalVariable memoryIndex)
+                    yield return memoryIndex;
+                break;
+            case FieldReference { Local: { } owner }:
+                yield return owner;
+                break;
+            case AddressOf { Target: { } target }:
+                foreach (var inner in MentionedLocals(target))
+                    yield return inner;
+                break;
+            case ArrayAccess access:
+                yield return access.Array;
+                foreach (var inner in MentionedLocals(access.Index))
+                    yield return inner;
+                break;
+            case ArrayLength { Array: { } lengthArray }:
+                yield return lengthArray;
+                break;
+        }
+    }
+
+    // loads that only put a local, an argument, a constant or an address on the stack: nothing a call can change
+    private static bool IsPureLoad(CilInstruction instruction) => instruction.OpCode.Code switch
+    {
+        CilCode.Ldloc or CilCode.Ldloc_S or CilCode.Ldloc_0 or CilCode.Ldloc_1 or CilCode.Ldloc_2 or CilCode.Ldloc_3
+            or CilCode.Ldloca or CilCode.Ldloca_S or CilCode.Ldarg or CilCode.Ldarg_S or CilCode.Ldarg_0 or CilCode.Ldarg_1
+            or CilCode.Ldarg_2 or CilCode.Ldarg_3 or CilCode.Ldarga or CilCode.Ldarga_S or CilCode.Ldflda or CilCode.Ldsflda
+            or CilCode.Ldnull or CilCode.Ldstr or CilCode.Ldtoken or CilCode.Ldc_I4 or CilCode.Ldc_I4_S or CilCode.Ldc_I4_M1
+            or CilCode.Ldc_I4_0 or CilCode.Ldc_I4_1 or CilCode.Ldc_I4_2 or CilCode.Ldc_I4_3 or CilCode.Ldc_I4_4 or CilCode.Ldc_I4_5
+            or CilCode.Ldc_I4_6 or CilCode.Ldc_I4_7 or CilCode.Ldc_I4_8 or CilCode.Ldc_I8 or CilCode.Ldc_R4 or CilCode.Ldc_R8 => true,
+        _ => false,
+    };
+
+    private static bool IsStloc(CilInstruction instruction, CilLocalVariable local) => instruction.OpCode.Code is CilCode.Stloc or CilCode.Stloc_S && ReferenceEquals(instruction.Operand, local);
+
+    private static bool IsLdloc(CilInstruction instruction, CilLocalVariable local) => instruction.OpCode.Code is CilCode.Ldloc or CilCode.Ldloc_S && ReferenceEquals(instruction.Operand, local);
+
+    // what an instruction writes or hands out the address of, which a load can't be moved past
+    private static object? Disturbs(CilInstruction instruction) => instruction.OpCode.Code switch
+    {
+        CilCode.Stloc or CilCode.Stloc_S or CilCode.Ldloca or CilCode.Ldloca_S or CilCode.Starg or CilCode.Starg_S or CilCode.Ldarga or CilCode.Ldarga_S => instruction.Operand,
+        _ => null,
+    };
+
+    private static bool StraightLine(IEnumerable<CilInstruction> instructions) =>
+        instructions.All(i => i.OpCode.FlowControl is CilFlowControl.Next or CilFlowControl.Call or CilFlowControl.Meta);
+
+    // A store emitted as [value] stloc s; [object] ldloc s; stfld goes [object] [value] stfld, the order C# evaluates it
+    // in, when loading the object first changes nothing: it's only locals and addresses the value doesn't touch
+    private static void StoresInSourceOrder(CilInstructionCollection il, int start)
+    {
+        var end = il.Count;
+        if (end - start < 4 || il[end - 1].OpCode.Code is not (CilCode.Stfld or CilCode.Stelem or CilCode.Stobj or CilCode.Stind_Ref)
+            || il[end - 2].OpCode.Code is not (CilCode.Ldloc or CilCode.Ldloc_S) || il[end - 2].Operand is not CilLocalVariable scratch)
+            return;
+
+        var store = -1;
+        for (var i = end - 3; i >= start; i--)
+        {
+            if (IsStloc(il[i], scratch))
+            {
+                store = i;
+                break;
+            }
+        }
+
+        if (store < 0)
+            return;
+
+        var container = Enumerable.Range(store + 1, end - 2 - store - 1).Select(i => il[i]).ToList();
+        var value = Enumerable.Range(start, store - start).Select(i => il[i]).ToList();
+        var range = Enumerable.Range(start, end - start).Select(i => il[i]).ToList();
+        if (!container.All(IsPureLoad) || !StraightLine(value) || range.Count(i => ReferenceEquals(i.Operand, scratch)) != 2)
+            return;
+
+        var disturbed = value.Select(Disturbs).Where(d => d != null).ToHashSet();
+        if (container.Any(c => c.Operand != null && disturbed.Contains(c.Operand)))
+            return;
+
+        il.RemoveAt(end - 2);
+        for (var i = end - 3; i > store; i--)
+            il.RemoveAt(i);
+        il.RemoveAt(store);
+        il.InsertRange(start, container);
+    }
+
+    // [d] stloc x; [pure loads] ldloc x ... with x stored and read only there: [pure loads] [d] ..., keeping the value
+    // on the stack as a C# compiler does with an expression
+    private static bool InlineIntoNext(CilInstructionCollection il, Instruction definition, int definitionStart, int useStart, Instruction use,
+        Dictionary<LocalVariable, CilLocalVariable> locals, Dictionary<LocalVariable, int> mentions)
+    {
+        if (definition.Destination is not LocalVariable defined || !locals.TryGetValue(defined, out var local) || mentions.GetValueOrDefault(defined) != 2
+            || !ValueFitsLocal(definition, defined)
+            || !use.Operands.Any(o => MentionedLocals(o).Contains(defined)) || useStart - definitionStart < 2 || !IsStloc(il[useStart - 1], local))
+            return false;
+
+        var computed = Enumerable.Range(definitionStart, useStart - 1 - definitionStart).Select(i => il[i]).ToList();
+        if (!StraightLine(computed) || computed.Any(i => ReferenceEquals(i.Operand, local)))
+            return false;
+
+        var load = -1;
+        for (var i = useStart; i < il.Count; i++)
+        {
+            if (!ReferenceEquals(il[i].Operand, local))
+                continue;
+            if (load >= 0 || !IsLdloc(il[i], local))
+                return false;
+            load = i;
+        }
+
+        if (load < 0)
+            return false;
+
+        var before = Enumerable.Range(useStart, load - useStart).Select(i => il[i]).ToList();
+        var disturbed = computed.Select(Disturbs).Where(d => d != null).ToHashSet();
+        if (!before.All(IsPureLoad) || before.Any(b => b.Operand != null && disturbed.Contains(b.Operand)))
+            return false;
+
+        // take the computation out (with its store), and put it in place of the load
+        for (var i = useStart - 1; i >= definitionStart; i--)
+            il.RemoveAt(i);
+        load -= useStart - definitionStart;
+        il.RemoveAt(load);
+        il.InsertRange(load, computed);
+        return true;
+    }
+
+    // Whether the value an instruction computes already has the type of the local it's stored in: the store is what would
+    // convert it otherwise, so without it the value has to be used as it is
+    private static bool ValueFitsLocal(Instruction definition, LocalVariable local)
+    {
+        if (local.Type is not { } localType)
+            return false;
+
+        static bool Same(TypeAnalysisContext? a, TypeAnalysisContext b) => a != null && (ReferenceEquals(a, b) || a.FullName == b.FullName);
+        static bool Reference(TypeAnalysisContext? type) => type is { IsValueType: false } && type is not GenericParameterTypeAnalysisContext && type.FullName != "System.Void";
+        bool Fits(TypeAnalysisContext? type) => Same(type, localType) || Reference(type) && Reference(localType);
+
+        TypeAnalysisContext? TypeOf(IOperand operand) => operand switch
+        {
+            LocalVariable source => source.Type,
+            FieldReference field => field.Field.FieldType,
+            DefaultValue value => value.Type,
+            ArrayAccess { Array.Type: SzArrayTypeAnalysisContext array } => array.ElementType,
+            ArrayLength => null,
+            _ => null,
+        };
+
+        switch (definition.OpCode)
+        {
+            case OpCode.Call when definition.Operands[0] is MethodAnalysisContext callee:
+                return Fits(callee.ReturnType);
+            case OpCode.Move:
+                return definition.Operands[1] switch
+                {
+                    Immediate => localType.FullName is "System.Int32" or "System.Boolean",
+                    StringLiteral => localType.FullName == "System.String",
+                    var source => Fits(TypeOf(source)),
+                };
+            case OpCode.Newobj or OpCode.IsInst or OpCode.Box:
+                return Reference(localType);
+            case >= OpCode.CheckEqual and <= OpCode.CheckLessOrEqual:
+                return localType.FullName == "System.Boolean";
+            case OpCode.Add or OpCode.Subtract or OpCode.Multiply or OpCode.Divide or OpCode.Modulo or OpCode.And or OpCode.Or or OpCode.Xor
+                or OpCode.ShiftLeft or OpCode.ShiftRight or OpCode.Not or OpCode.Negate:
+                // every value it's computed from is of the local's type (or a constant)
+                return definition.Operands.Skip(1).All(o => o is Immediate || Same(TypeOf(o), localType));
+            default:
+                return false;
+        }
+    }
+
+    // A region to emit in one piece: a foreach (one part, its loop) or a try/catch (two: the try, then the catch)
+    private sealed class EmitRegion(Analysis.ForeachRegion? foreachRegion, Analysis.CatchRegion? catchRegion, List<(HashSet<Block> Blocks, Block? Entry, List<Block>? Ordered)> parts)
+    {
+        public Analysis.ForeachRegion? Foreach { get; } = foreachRegion;
+        public Analysis.CatchRegion? Catch { get; } = catchRegion;
+        public List<(HashSet<Block> Blocks, Block? Entry, List<Block>? Ordered)> Parts { get; } = parts;
+        public IEnumerable<Block> Blocks => Parts.SelectMany(p => p.Blocks);
+    }
+
+    // Puts a try/catch's code into try { ... } catch (T ex) { ... }: the catch starts by storing the exception it's handed,
+    // jumps out of either part become leaves (a conditional one through a leave right after the part), and returns from
+    // inside leave to a return after it
+    private static List<CilInstruction> WrapCatch(MethodAnalysisContext context, MethodDefinition method, Dictionary<LocalVariable, CilLocalVariable> locals,
+        Analysis.CatchRegion region, List<CilInstruction> tryIl, List<CilInstruction> handlerIl)
+    {
+        var body = method.CilMethodBody!;
+        if (tryIl.Count == 0 || handlerIl.Count == 0)
+            return [];
+
+        var returnPath = new List<CilInstruction>();
+        CilLocalVariable? returned = null;
+
+        // the jumps out of a part become leaves; the conditional ones go through a stub, returned to put after the part
+        (List<CilInstruction> Inserted, List<CilInstruction> Stubs) Protect(List<CilInstruction> il)
+        {
+            var inside = il.ToHashSet(ReferenceEqualityComparer.Instance);
+            var inserted = new List<CilInstruction>();
+            var stubs = new List<CilInstruction>();
+
+            CilInstruction Stub(CilInstruction target)
+            {
+                var stub = new CilInstruction(CilOpCodes.Leave, target.CreateLabel());
+                stubs.Add(stub);
+                return stub;
+            }
+
+            foreach (var instruction in il.ToList())
+            {
+                if (instruction.OpCode == CilOpCodes.Ret)
+                {
+                    if (returnPath.Count == 0)
+                    {
+                        if (!context.IsVoid)
+                        {
+                            returned = new CilLocalVariable(context.ReturnType.ToTypeSignature());
+                            body.LocalVariables.Add(returned);
+                            returnPath.Add(new CilInstruction(CilOpCodes.Ldloc, returned));
+                        }
+
+                        returnPath.Add(new CilInstruction(CilOpCodes.Ret));
+                    }
+
+                    if (returned != null)
+                    {
+                        // the value is on the stack: store it, and leave right after
+                        var leave = new CilInstruction(CilOpCodes.Leave, returnPath[0].CreateLabel());
+                        inserted.Add(leave);
+                        instruction.OpCode = CilOpCodes.Stloc;
+                        instruction.Operand = returned;
+                        body.Instructions.Insert(IndexOf(body.Instructions, instruction) + 1, leave);
+                    }
+                    else
+                    {
+                        instruction.OpCode = CilOpCodes.Leave;
+                        instruction.Operand = returnPath[0].CreateLabel();
+                    }
+
+                    continue;
+                }
+
+                if (instruction.OpCode == CilOpCodes.Switch && instruction.Operand is IList<ICilLabel> cases)
+                {
+                    for (var i = 0; i < cases.Count; i++)
+                        if (cases[i] is CilInstructionLabel { Instruction: { } caseTarget } && !inside.Contains(caseTarget))
+                            cases[i] = Stub(caseTarget).CreateLabel();
+                    continue;
+                }
+
+                if (instruction.Operand is not CilInstructionLabel { Instruction: { } target } || inside.Contains(target))
+                    continue;
+
+                if (instruction.OpCode == CilOpCodes.Br || instruction.OpCode == CilOpCodes.Leave)
+                    instruction.OpCode = CilOpCodes.Leave;
+                else if (instruction.OpCode.FlowControl == CilFlowControl.ConditionalBranch)
+                    instruction.Operand = Stub(target).CreateLabel();
+            }
+
+            return (inserted, stubs);
+        }
+
+        var (tryInserted, tryStubs) = Protect(tryIl);
+        var (handlerInserted, handlerStubs) = Protect(handlerIl);
+
+        // the try's stubs between it and the catch
+        var tryEnd = tryIl.Concat(tryInserted).Select(i => IndexOf(body.Instructions, i)).Max() + 1;
+        body.Instructions.InsertRange(tryEnd, tryStubs);
+
+        // the catch is handed the exception on the stack
+        var store = region.Exception != null && locals.TryGetValue(region.Exception, out var exceptionLocal)
+            ? new CilInstruction(CilOpCodes.Stloc, exceptionLocal)
+            : new CilInstruction(CilOpCodes.Pop);
+        body.Instructions.Insert(IndexOf(body.Instructions, handlerIl[0]), store);
+
+        var handlerEnd = handlerIl.Concat(handlerInserted).Select(i => IndexOf(body.Instructions, i)).Max() + 1;
+        body.Instructions.InsertRange(handlerEnd, handlerStubs.Concat(returnPath));
+
+        var afterHandler = handlerEnd + handlerStubs.Count;
+        if (afterHandler >= body.Instructions.Count)
+            body.Instructions.Add(CilOpCodes.Nop); // never reached, but the handler has to end before something
+
+        var tryStart = tryIl.Concat(tryInserted).OrderBy(i => IndexOf(body.Instructions, i)).First();
+        body.ExceptionHandlers.Add(new CilExceptionHandler
+        {
+            HandlerType = CilExceptionHandlerType.Exception,
+            TryStart = tryStart.CreateLabel(),
+            TryEnd = store.CreateLabel(),
+            HandlerStart = store.CreateLabel(),
+            HandlerEnd = body.Instructions[afterHandler].CreateLabel(),
+            ExceptionType = region.CatchType.ToTypeSignature().ToTypeDefOrRef(),
+        });
+
+        return [..tryInserted, ..tryStubs, store, ..handlerInserted, ..handlerStubs, ..returnPath];
     }
 
     // Puts a foreach loop's code into try { ... } finally { enumerator.Dispose(); }: jumps out of it become leaves (a
@@ -425,13 +795,43 @@ public static class IlGenerator
         var end = il.Concat(exits).Select(i => IndexOf(body.Instructions, i)).Max() + 1;
 
         var stubs = exits.Where(e => IndexOf(body.Instructions, e) < 0).ToList();
-        var handler = new List<CilInstruction>
+        // a struct enumerator is disposed of in place, a class or interface one if it's there
+        var endFinally = new CilInstruction(CilOpCodes.Endfinally);
+        List<CilInstruction> handler;
+        if (region.AsDisposable)
         {
-            new(CilOpCodes.Ldloca, enumerator),
-            new(CilOpCodes.Constrained, region.Enumerator.Type!.ToTypeSignature().ToTypeDefOrRef()),
-            new(CilOpCodes.Callvirt, dispose.ToMethodDescriptor()),
-            new(CilOpCodes.Endfinally),
-        };
+            // (enumerator as IDisposable)?.Dispose()
+            var disposableType = dispose.DeclaringType!.ToTypeSignature();
+            var disposable = new CilLocalVariable(disposableType);
+            body.LocalVariables.Add(disposable);
+            handler =
+            [
+                new(CilOpCodes.Ldloc, enumerator),
+                new(CilOpCodes.Isinst, disposableType.ToTypeDefOrRef()),
+                new(CilOpCodes.Stloc, disposable),
+                new(CilOpCodes.Ldloc, disposable),
+                new(CilOpCodes.Brfalse, endFinally.CreateLabel()),
+                new(CilOpCodes.Ldloc, disposable),
+                new(CilOpCodes.Callvirt, dispose.ToMethodDescriptor()),
+                endFinally,
+            ];
+        }
+        else handler = region.Enumerator.Type!.IsValueType
+            ? new List<CilInstruction>
+            {
+                new(CilOpCodes.Ldloca, enumerator),
+                new(CilOpCodes.Constrained, region.Enumerator.Type!.ToTypeSignature().ToTypeDefOrRef()),
+                new(CilOpCodes.Callvirt, dispose.ToMethodDescriptor()),
+                endFinally,
+            }
+            : new List<CilInstruction>
+            {
+                new(CilOpCodes.Ldloc, enumerator),
+                new(CilOpCodes.Brfalse, endFinally.CreateLabel()),
+                new(CilOpCodes.Ldloc, enumerator),
+                new(CilOpCodes.Callvirt, dispose.ToMethodDescriptor()),
+                endFinally,
+            };
 
         body.Instructions.InsertRange(end, stubs.Concat(handler).Concat(returnPath));
 
@@ -678,9 +1078,17 @@ public static class IlGenerator
                 break;
 
             // until catch blocks are emitted as handler regions, nothing branches to this one; give it a placeholder
+            // a handler region starts with the exception stored, so there's nothing left to do; a catch that didn't make it
+            // into one (it can't be reached) gets a placeholder
             case OpCode.CatchException:
-                instructions.Add(CilOpCodes.Ldnull);
-                StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                if (context.CatchRegions?.Any(r => ReferenceEquals(r.Exception, instruction.Operands[0])) != true)
+                {
+                    instructions.Add(CilOpCodes.Ldnull);
+                    StoreToOperand(instruction.Operands[0], method, locals, writeLine);
+                }
+                else
+                    instructions.Add(CilOpCodes.Nop);
+
                 break;
 
             case OpCode.Phi:

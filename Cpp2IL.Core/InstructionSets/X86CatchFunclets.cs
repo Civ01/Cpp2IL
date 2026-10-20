@@ -267,7 +267,10 @@ public partial class X86InstructionSet
                     continue;
 
                 var register = instruction.GetOpRegister(i);
-                if (register.GetFullRegister() is Register.RSP || register.GetFullRegister() == frame || wrappers.Contains(register.GetFullRegister()))
+                // (writing over the register that held the wrapper, like setting the return value, isn't using it)
+                var overwritten = i == 0 && instruction.Mnemonic is Mnemonic.Mov or Mnemonic.Lea or Mnemonic.Movzx or Mnemonic.Movsx or Mnemonic.Movsxd
+                                  && register.GetSize() >= 4;
+                if (register.GetFullRegister() is Register.RSP || register.GetFullRegister() == frame || wrappers.Contains(register.GetFullRegister()) && !overwritten)
                     return null;
 
                 rewritten.SetOpRegister(i, Rename(register, renames));

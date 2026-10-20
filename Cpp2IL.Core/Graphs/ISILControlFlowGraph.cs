@@ -581,6 +581,27 @@ public class ISILControlFlowGraph
         return newBlock;
     }
 
+    /// <summary>
+    /// A new block on the edge from one block to another (a jump on to the target), which only that edge goes through:
+    /// for code that must run on that way only. The target keeps its predecessors in the same order.
+    /// </summary>
+    public Block SplitEdge(Block from, Block to)
+    {
+        var middle = new Block { ID = idCounter++, BlockType = BlockType.OneWay };
+        middle.Instructions.Add(new Instruction(-1, OpCode.Jump, to));
+
+        from.Successors[from.Successors.IndexOf(to)] = middle;
+        to.Predecessors[to.Predecessors.IndexOf(from)] = middle;
+        middle.Predecessors.Add(from);
+        middle.Successors.Add(to);
+
+        if (from.Instructions.LastOrDefault() is { OpCode: OpCode.ConditionalJump or OpCode.Jump } jump && jump.Operands.Count > 0 && ReferenceEquals(jump.Operands[0], to))
+            jump.SetOperand(0, middle);
+
+        AddBlock(middle);
+        return middle;
+    }
+
     internal void AddDirectedEdge(Block from, Block to)
     {
         from.Successors.Add(to);

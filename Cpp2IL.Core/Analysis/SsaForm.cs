@@ -496,7 +496,7 @@ public class SsaForm
     {
         var cfg = method.ControlFlowGraph!;
 
-        foreach (var block in cfg.Blocks)
+        foreach (var block in cfg.Blocks.ToList())
         {
             var phiInstructions = block.Instructions
                 .Where(i => i.OpCode == OpCode.Phi)
@@ -525,7 +525,14 @@ public class SsaForm
                     moves.Add(new Instruction(-1, OpCode.Move, destination, source));
                 }
 
-                InsertBeforeTerminator(predecessor, moves);
+                // a catch is reached from the call that throws, before what comes after it in the block
+                if (block.IsCatchEntry && predecessor.Instructions.FindLastIndex(i => i.OpCode is OpCode.Call or OpCode.CallVoid or OpCode.IndirectCall) is var call and >= 0)
+                    predecessor.Instructions.InsertRange(call, moves);
+                // (a block that branches two ways would make them on both: they get a block of their own on this edge)
+                else if (moves.Count > 0 && predecessor.NormalSuccessors.Distinct().Count() > 1 && predecessor.Successors.Count(s => s == block) == 1)
+                    InsertBeforeTerminator(cfg.SplitEdge(predecessor, block), moves);
+                else
+                    InsertBeforeTerminator(predecessor, moves);
             }
 
             foreach (var phi in phiInstructions)
