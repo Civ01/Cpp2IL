@@ -96,20 +96,20 @@ public static class ForeachRecovery
         else
             return Reject(header, "condition is not just MoveNext()");
 
-        if (header.Successors.Distinct().Count() != 2)
+        if (header.NormalSuccessors.Distinct().Count() != 2)
             return Reject(header, "condition does not branch two ways");
 
         var jumpTarget = (Block)jumpInstruction.Operands[0];
-        var other = header.Successors.First(s => s != jumpTarget);
+        var other = header.NormalSuccessors.First(s => s != jumpTarget);
         var (body, exit) = jumpsOut ? (other, jumpTarget) : (jumpTarget, other);
         if (body == graph.ExitBlock || body.Predecessors.Distinct().Count() != 1)
             return Reject(header, "loop body has other entries");
 
         // the loop: what the body dominates and reaches, without going round, that gets back round (not an enclosing loop
         // that comes back to it from after it)
-        var notDominated = Reach(graph.EntryBlock, b => b.Successors, body);
-        var forward = Reach(body, b => b.Successors, header);
-        var backward = Reach(header, b => b.Predecessors, header, includeStart: false);
+        var notDominated = Reach(graph.EntryBlock, b => b.NormalSuccessors, body);
+        var forward = Reach(body, b => b.NormalSuccessors, header);
+        var backward = Reach(header, b => b.NormalPredecessors, header, includeStart: false);
         var region = new HashSet<Block>(forward.Where(b => backward.Contains(b) && !notDominated.Contains(b))) { header };
         if (!region.Contains(body))
             return Reject(header, "no loop back to the condition");
@@ -117,13 +117,13 @@ public static class ForeachRecovery
         var loop = region.ToHashSet();
 
         // and what's only reached from inside it without rejoining the code after it (a return from the loop)
-        var reachesExit = Reach(exit, b => b.Predecessors, null);
+        var reachesExit = Reach(exit, b => b.NormalPredecessors, null);
         for (var grown = true; grown;)
         {
             grown = false;
             foreach (var block in graph.Blocks)
             {
-                if (region.Contains(block) || block == graph.ExitBlock || block == graph.EntryBlock || reachesExit.Contains(block) || notDominated.Contains(block)
+                if (region.Contains(block) || block.IsCatchEntry || block == graph.ExitBlock || block == graph.EntryBlock || reachesExit.Contains(block) || notDominated.Contains(block)
                     || block.Predecessors.Count == 0 || !block.Predecessors.All(region.Contains))
                     continue;
 
@@ -151,7 +151,7 @@ public static class ForeachRecovery
         if (region.Any(b => b != header && !b.Predecessors.All(region.Contains)))
             return Reject(header, "loop entered other than at its condition");
         var outside = header.Predecessors.Where(p => !region.Contains(p)).Distinct().ToList();
-        if (outside is not [var before] || before == graph.EntryBlock || before.Successors.Distinct().Count() != 1
+        if (outside is not [var before] || before == graph.EntryBlock || before.NormalSuccessors.Distinct().Count() != 1
             || done.Any(r => r.Blocks.Contains(before) || r.Before == before))
             return Reject(header, "not entered from a single block before it");
 
@@ -165,7 +165,7 @@ public static class ForeachRecovery
         // the straight line of code leading into the loop, where the enumerator is set up
         var chain = new List<Block> { before };
         while (chain.Count < 8 && chain[^1].Predecessors.Distinct().ToList() is [var previous] && previous != graph.EntryBlock
-               && previous.Successors.Distinct().Count() == 1 && !region.Contains(previous) && !chain.Contains(previous)
+               && previous.NormalSuccessors.Distinct().Count() == 1 && !region.Contains(previous) && !chain.Contains(previous)
                && !done.Any(r => r.Blocks.Contains(previous) || r.Before == previous))
             chain.Add(previous);
         chain.Reverse();

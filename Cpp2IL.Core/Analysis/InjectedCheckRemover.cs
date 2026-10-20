@@ -136,7 +136,8 @@ public static class InjectedCheckRemover
 
             block.Successors.Clear();
             block.Successors.Add(cfg.ExitBlock);
-            cfg.ExitBlock.Predecessors.Add(block);
+            if (!cfg.ExitBlock.Predecessors.Contains(block))
+                cfg.ExitBlock.Predecessors.Add(block);
             changed = true;
         }
 

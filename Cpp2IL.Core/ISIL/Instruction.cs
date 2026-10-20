@@ -54,6 +54,9 @@ public class Instruction : IOperand
     /// <summary>Kept by dead code elimination even if nothing reads it yet (a later pass may, then clears this).</summary>
     public bool KeepAlive;
 
+    /// <summary>The native address this was lifted from, where known.</summary>
+    public ulong Address;
+
     /// <summary>A move out of a general register into a vector lane that reads its low / high 4 bytes (movq xmm,rax).</summary>
     public bool ReadsLowHalf, ReadsHighHalf;
 
@@ -140,6 +143,7 @@ public class Instruction : IOperand
             case OpCode.IsInst:
             case OpCode.Unbox:
             case OpCode.VectorShuffle:
+            case OpCode.CatchException:
                 if (newDestination != null)
                     SetOperand(0, newDestination);
                 return IsConstantValue(_operands[0]) ? null : _operands[0];
@@ -205,7 +209,7 @@ public class Instruction : IOperand
             _ => []
         };
 
-        if (OpCode == OpCode.Return && _operands.Count == 1)
+        if (OpCode is OpCode.Return or OpCode.Throw && _operands.Count == 1 && _operands[0] is Register or LocalVariable or MemoryOperand or StackOffset)
             sources.Add(_operands[0]);
 
         if (constantsOnly)

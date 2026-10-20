@@ -60,7 +60,7 @@ public static class MetadataInitGuardRemover
 
     private static bool TryRemoveRgctxGuard(ISILControlFlowGraph cfg, Block guard, long rgctxOffset)
     {
-        if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
+        if (guard.BlockType != BlockType.TwoWay || guard.NormalSuccessors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
             return false;
 
@@ -72,8 +72,8 @@ public static class MetadataInitGuardRemover
         if (!isRgctxGuard)
             return false;
 
-        var first = guard.Successors[0];
-        var second = guard.Successors[1];
+        var first = guard.NormalSuccessors[0];
+        var second = guard.NormalSuccessors[1];
 
         // treat region calls as init boilerplate, exactly as the class-init flag test does
         return TryExcise(cfg, guard, first, second, true)
@@ -124,7 +124,7 @@ public static class MetadataInitGuardRemover
 
     private static bool TryRemoveGuard(ISILControlFlowGraph cfg, Block guard, long initialisedFlagOffset)
     {
-        if (guard.BlockType != BlockType.TwoWay || guard.Successors.Count != 2
+        if (guard.BlockType != BlockType.TwoWay || guard.NormalSuccessors.Count != 2
             || guard.Instructions.Count == 0 || guard.Instructions[^1].OpCode != OpCode.ConditionalJump)
             return false;
 
@@ -135,8 +135,8 @@ public static class MetadataInitGuardRemover
             && flag.Addend == initialisedFlagOffset && IsOne(mask));
 
         // Either successor could be the init entry; the other is then the merge.
-        var first = guard.Successors[0];
-        var second = guard.Successors[1];
+        var first = guard.NormalSuccessors[0];
+        var second = guard.NormalSuccessors[1];
 
         // the per-method init flag byte the guard tests, if it tests one
         var guardFlag = guard.Instructions.Select(GuardFlagAddress).FirstOrDefault(a => a != null);

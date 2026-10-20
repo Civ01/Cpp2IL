@@ -318,9 +318,69 @@ public static class LocalVariables
                                         && ReferenceEquals(stepped, local) => true,
                 LocalVariable { Type: { FullName: "System.Int32" } } => true,
                 // the start value, set from a constant, maybe through copies (not typed yet, as this is what types it)
-                LocalVariable { Type: null } start => StartsSmall(start, 0),
+                LocalVariable { Type: null } start when StartsSmall(start, 0) => true,
+                // or a loop the counter goes round with more than one phi (a catch carrying on with the loop rejoins it)
+                LocalVariable { Type: null } => CounterWeb(local),
                 _ => false,
             });
+
+        // phis, copies and small steps of each other, coming in only from small constants and narrow loads (the copy of
+        // the counter MSVC keeps in the frame for a catch, read back there)
+        bool CounterWeb(LocalVariable counter)
+        {
+            var members = new HashSet<LocalVariable> { counter };
+            var pending = new Stack<LocalVariable>();
+            pending.Push(counter);
+            var stepped = false;
+            while (pending.Count > 0)
+            {
+                var member = pending.Pop();
+                if (pointers.Contains(member) || !definitions.TryGetValue(member, out var definition))
+                    return false;
+
+                IEnumerable<IOperand> inputs;
+                switch (definition)
+                {
+                    case { OpCode: OpCode.Phi }:
+                        inputs = definition.Operands.Skip(1);
+                        break;
+                    case { OpCode: OpCode.Add or OpCode.Subtract, Operands: [_, LocalVariable from, Immediate { Value: >= -0x10000 and <= 0x10000 }] }:
+                        stepped = true;
+                        inputs = [from];
+                        break;
+                    case { OpCode: OpCode.Move, Operands: [_, LocalVariable or Immediate { Value: >= int.MinValue and <= int.MaxValue }] }:
+                        inputs = [definition.Operands[1]];
+                        break;
+                    case { OpCode: OpCode.Move, Operands: [_, StackOffset { Size: >= 1 and <= 4 } or MemoryOperand { Size: >= 1 and <= 4 }] }:
+                        continue;
+                    default:
+                        return false;
+                }
+
+                foreach (var input in inputs)
+                {
+                    switch (input)
+                    {
+                        case Immediate { Value: >= int.MinValue and <= int.MaxValue }:
+                        case LocalVariable { Type: { FullName: "System.Int32" } }:
+                            continue;
+                        case LocalVariable { Type: null } next:
+                            if (members.Add(next))
+                            {
+                                if (members.Count > 32)
+                                    return false;
+                                pending.Push(next);
+                            }
+
+                            continue;
+                        default:
+                            return false;
+                    }
+                }
+            }
+
+            return stepped;
+        }
 
         bool StartsSmall(LocalVariable local, int depth) =>
             depth < 4 && definitions.TryGetValue(local, out var definition) && definition is { OpCode: OpCode.Move, Operands: [_, var from] }

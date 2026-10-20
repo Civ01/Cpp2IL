@@ -80,6 +80,10 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
     /// </summary>
     public List<Analysis.ForeachRegion>? ForeachRegions;
 
+    /// <summary>The method's C++ exception handling tables, and the catch funclets lifted onto its end (x86-64 PE only).</summary>
+    public LibCpp2IL.PE.CxxExceptionInfo? ExceptionInfo;
+    public List<InstructionSets.CatchHandler>? CatchHandlers;
+
     /// <summary>
     /// Switches found by <see cref="Analysis.SwitchChainRecovery"/>, for IL generation to emit as an IL switch.
     /// </summary>
@@ -390,6 +394,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
 
         DebugPassCallback?.Invoke(this, "Isil");
         ControlFlowGraph = new ISILControlFlowGraph(ConvertedIsil);
+        ExceptionEdges.Run(this);
 
         // Indirect jumps/calls should probably be resolved here before stack analysis
 
@@ -495,6 +500,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         PackedOperatorRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "PackedOperatorRecovery.Run");
 
+        // the type test in a catch funclet: e.ex is T
+        CatchRecovery.Run(this);
+
         // x as T, then throw InvalidCastException if that's null: (T)x
         CheckedCastRecovery.Run(this);
         DebugPassCallback?.Invoke(this, "CheckedCastRecovery.Run");
@@ -568,6 +576,9 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         SharedGenericCleanup.Run(this);
         DebugPassCallback?.Invoke(this, "SharedGenericCleanup.Run");
 
+        // the IL has no handler regions yet for the catch code to go in, so it goes now, with what only it read
+        ExceptionEdges.DetachForIl(this);
+
         // Every call that was going to resolve now has. Any argument registers it ended up
         // not using are just keeping their definitions alive, so drop them.
         CallArgumentTrimmer.Run(this);
@@ -594,6 +605,7 @@ public class MethodAnalysisContext : HasGenericParameters, IMethodInfoProvider, 
         ConvertedIsil = null;
         ControlFlowGraph = null;
         ForeachRegions = null;
+        CatchHandlers = null;
         SwitchTables = null;
         DominatorInfo = null;
     }

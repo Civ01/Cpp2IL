@@ -100,7 +100,7 @@ public static class VectorLaneRecovery
             }
 
             // an unknown low lane flowing somewhere we won't follow it
-            if (block.Successors.Any(successor => successor.Predecessors.Distinct().Count() != 1))
+            if (block.NormalSuccessors.Any(successor => successor.Predecessors.Distinct().Count() != 1))
             {
                 foreach (var lanes in state.Values.Where(lanes => lanes[0] == UnknownLow))
                 {

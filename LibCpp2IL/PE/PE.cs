@@ -70,6 +70,31 @@ public sealed class PE : Il2CppBinary
     }
 #pragma warning restore 8618
 
+    public ulong ImageBase => peImageBase;
+
+    internal byte[] RawBytes => raw;
+
+    public DataDirectory? GetDataDirectory(int index)
+    {
+        var directories = peOptionalHeader64?.DataDirectory ?? peOptionalHeader32?.DataDirectory;
+        return directories != null && index < directories.Length ? directories[index] : null;
+    }
+
+    private readonly Dictionary<ulong, CxxExceptionInfo?> _exceptionInfo = [];
+
+    /// <summary>
+    /// The MSVC C++ exception handling tables (__CxxFrameHandler4) of the function at the given address, or null if it has none.
+    /// </summary>
+    public CxxExceptionInfo? GetCxxExceptionInfo(ulong address)
+    {
+        lock (_exceptionInfo)
+        {
+            if (!_exceptionInfo.TryGetValue(address, out var info))
+                _exceptionInfo[address] = info = CxxExceptionInfoReader.Read(this, address);
+            return info;
+        }
+    }
+
     public override long MapVirtualAddressToRaw(ulong uiAddr, bool throwOnError = true)
     {
         if (uiAddr < peImageBase)

@@ -19,6 +19,15 @@ public class Block : ISIL.IOperand
     public int ID { get; set; } = -1;
 
     public bool Dirty { get; set; }
+
+    /// <summary>Where a catch funclet starts: what leads here is a call throwing, not a branch.</summary>
+    public bool IsCatchEntry;
+
+    /// <summary>The successors control flows to, leaving out the catch funclets a call in this block may throw to.</summary>
+    public List<Block> NormalSuccessors => Successors.Where(s => !s.IsCatchEntry).ToList();
+
+    /// <summary>The predecessors control flows from: none for a catch funclet's entry, which calls throw to.</summary>
+    public List<Block> NormalPredecessors => IsCatchEntry ? [] : Predecessors;
     public bool Visited = false;
 
     public override string ToString()
